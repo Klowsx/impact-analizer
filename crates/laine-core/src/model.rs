@@ -86,6 +86,23 @@ pub enum ContractChange {
         previous_type: String,
         new_type: String,
     },
+    RequestFieldAddedRequired {
+        endpoint: EndpointId,
+        field_path: String,
+        field_type: String,
+    },
+    RequestFieldTypeChanged {
+        endpoint: EndpointId,
+        field_path: String,
+        previous_type: String,
+        new_type: String,
+    },
+    RequiredParameterAdded {
+        endpoint: EndpointId,
+        location: String,
+        name: String,
+        param_type: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

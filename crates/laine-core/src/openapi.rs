@@ -12,10 +12,22 @@ pub struct FieldSchema {
     pub required: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterSchema {
+    pub param_type: String,
+    pub required: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EndpointContract {
     /// HTTP status code (e.g. "200") -> flattened field path (e.g. "fullName", "address.city") -> schema.
     pub responses: BTreeMap<String, BTreeMap<String, FieldSchema>>,
+    /// Flattened JSON request body field path -> schema.
+    #[serde(default)]
+    pub request_fields: BTreeMap<String, FieldSchema>,
+    /// Parameter keyed by `(location, name)` (e.g. `("query", "tenantId")`) -> schema.
+    #[serde(default)]
+    pub parameters: BTreeMap<(String, String), ParameterSchema>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -68,7 +80,8 @@ pub fn canonical_route_key(normalized_path: &str) -> String {
     }
 }
 
-/// Parses an OpenAPI 3.0/3.1 document (YAML or JSON) and extracts its endpoints and JSON response fields.
+/// Parses an OpenAPI 3.0/3.1 document (YAML or JSON) and extracts its endpoints,
+/// JSON response fields, JSON request body fields, and parameters.
 pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
     let root: Value = serde_yaml_ng::from_str(raw_spec)
         .map_err(|err| LaineError::OpenApiParse(err.to_string()))?;
@@ -81,18 +94,49 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
     let mut endpoints = BTreeMap::new();
 
     for (raw_path, path_item) in paths_obj {
-        let Some(path_map) = path_item.as_object() else {
+        let mut path_visited = HashSet::new();
+        let resolved_path_item = resolve_ref(&root, path_item, &mut path_visited);
+        let Some(path_map) = resolved_path_item.as_object() else {
             continue;
         };
 
         let normalized_path = normalize_openapi_path(raw_path);
+        let mut path_level_params = BTreeMap::new();
+        if let Some(params) = resolved_path_item
+            .get("parameters")
+            .and_then(Value::as_array)
+        {
+            collect_parameters(&root, params, &mut path_level_params);
+        }
 
         for (method_key, operation) in path_map {
             let Some(method) = HttpMethod::parse(method_key) else {
                 continue;
             };
 
-            let mut endpoint_contract = EndpointContract::default();
+            let mut endpoint_contract = EndpointContract {
+                parameters: path_level_params.clone(),
+                ..EndpointContract::default()
+            };
+
+            if let Some(params) = operation.get("parameters").and_then(Value::as_array) {
+                collect_parameters(&root, params, &mut endpoint_contract.parameters);
+            }
+
+            if let Some(request_body_val) = operation.get("requestBody") {
+                let mut visited = HashSet::new();
+                let resolved_body = resolve_ref(&root, request_body_val, &mut visited);
+
+                if let Some(schema) = extract_json_schema(resolved_body) {
+                    collect_schema_fields(
+                        &root,
+                        schema,
+                        "",
+                        &mut visited,
+                        &mut endpoint_contract.request_fields,
+                    );
+                }
+            }
 
             if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
                 for (status_code, response_val) in responses {
@@ -127,8 +171,8 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
 
 /// Compares `base` (before) against `head` (after) and returns breaking contract changes.
 ///
-/// Additive changes (new endpoints, new response fields) are considered backwards-compatible
-/// and are intentionally not reported as breaking changes.
+/// Additive backwards-compatible changes (new endpoints, new response fields, new optional
+/// request fields or optional parameters) are intentionally not reported as breaking changes.
 pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractChange> {
     let mut changes = Vec::new();
 
@@ -166,6 +210,52 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
                 }
             }
         }
+
+        for (field_path, head_field) in &head_endpoint.request_fields {
+            match base_endpoint.request_fields.get(field_path) {
+                None => {
+                    if head_field.required {
+                        changes.push(ContractChange::RequestFieldAddedRequired {
+                            endpoint: endpoint_id.clone(),
+                            field_path: field_path.clone(),
+                            field_type: head_field.field_type.clone(),
+                        });
+                    }
+                }
+                Some(base_field) => {
+                    if head_field.required && !base_field.required {
+                        changes.push(ContractChange::RequestFieldAddedRequired {
+                            endpoint: endpoint_id.clone(),
+                            field_path: field_path.clone(),
+                            field_type: head_field.field_type.clone(),
+                        });
+                    }
+                    if base_field.field_type != head_field.field_type {
+                        changes.push(ContractChange::RequestFieldTypeChanged {
+                            endpoint: endpoint_id.clone(),
+                            field_path: field_path.clone(),
+                            previous_type: base_field.field_type.clone(),
+                            new_type: head_field.field_type.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        for ((location, name), head_param) in &head_endpoint.parameters {
+            let was_required = base_endpoint
+                .parameters
+                .get(&(location.clone(), name.clone()))
+                .is_some_and(|p| p.required);
+            if head_param.required && !was_required {
+                changes.push(ContractChange::RequiredParameterAdded {
+                    endpoint: endpoint_id.clone(),
+                    location: location.clone(),
+                    name: name.clone(),
+                    param_type: head_param.param_type.clone(),
+                });
+            }
+        }
     }
 
     changes
@@ -173,7 +263,11 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
 
 /// Best-effort 1-based line lookup in the raw OpenAPI file for reporting producer evidence.
 pub fn find_field_line(raw_spec: &str, field_name: &str) -> usize {
-    let leaf = field_name.rsplit('.').next().unwrap_or(field_name);
+    let leaf = field_name
+        .rsplit('.')
+        .next()
+        .unwrap_or(field_name)
+        .trim_end_matches("[]");
     let yaml_key = format!("{leaf}:");
     let json_key = format!("\"{leaf}\"");
 
@@ -189,6 +283,77 @@ pub fn find_field_line(raw_spec: &str, field_name: &str) -> usize {
             }
         })
         .unwrap_or(1)
+}
+
+/// Best-effort 1-based line lookup for an OpenAPI parameter definition (`name: <param>`).
+pub fn find_parameter_line(raw_spec: &str, param_name: &str) -> usize {
+    let yaml_plain = format!("name: {param_name}");
+    let yaml_double = format!("name: \"{param_name}\"");
+    let yaml_single = format!("name: '{param_name}'");
+    let json_val = format!("\"name\": \"{param_name}\"");
+
+    raw_spec
+        .lines()
+        .enumerate()
+        .find_map(|(idx, line)| {
+            let trimmed = line.trim_start();
+            let normalized = trimmed
+                .strip_prefix("- ")
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            if normalized == yaml_plain
+                || normalized == yaml_double
+                || normalized == yaml_single
+                || normalized.starts_with(&json_val)
+            {
+                Some(idx + 1)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| find_field_line(raw_spec, param_name))
+}
+
+fn collect_parameters(
+    root: &Value,
+    params: &[Value],
+    out: &mut BTreeMap<(String, String), ParameterSchema>,
+) {
+    for param_val in params {
+        let mut visited = HashSet::new();
+        let resolved = resolve_ref(root, param_val, &mut visited);
+
+        let Some(location) = resolved.get("in").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(name) = resolved.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+
+        let required = location == "path"
+            || resolved
+                .get("required")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+
+        let param_type = resolved
+            .get("schema")
+            .or_else(|| extract_json_schema(resolved))
+            .map(|schema| {
+                let mut schema_visited = visited.clone();
+                let resolved_schema = resolve_ref(root, schema, &mut schema_visited);
+                extract_type_label(resolved_schema)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        out.insert(
+            (location.to_string(), name.to_string()),
+            ParameterSchema {
+                param_type,
+                required,
+            },
+        );
+    }
 }
 
 fn find_matching_endpoint<'a>(
@@ -259,6 +424,12 @@ fn collect_schema_fields(
         for sub in all_of {
             collect_schema_fields(root, sub, prefix, &mut local_visited, out);
         }
+        // Apply `required` constraints declared in any `allOf` branch to sibling-defined fields.
+        for sub in all_of {
+            let mut sub_visited = local_visited.clone();
+            let resolved_sub = resolve_ref(root, sub, &mut sub_visited);
+            apply_required_flags(resolved_sub, prefix, out);
+        }
     }
 
     let required_set: HashSet<&str> = resolved
@@ -279,13 +450,16 @@ fn collect_schema_fields(
             };
 
             let field_type = extract_type_label(resolved_prop);
-            out.insert(
-                full_path.clone(),
-                FieldSchema {
+            let is_required = required_set.contains(prop_name.as_str());
+            out.entry(full_path.clone())
+                .and_modify(|existing| {
+                    existing.field_type = field_type.clone();
+                    existing.required |= is_required;
+                })
+                .or_insert(FieldSchema {
                     field_type,
-                    required: required_set.contains(prop_name.as_str()),
-                },
-            );
+                    required: is_required,
+                });
 
             // Recurse into nested objects and arrays of objects.
             if resolved_prop.get("properties").is_some() || resolved_prop.get("allOf").is_some() {
@@ -302,6 +476,23 @@ fn collect_schema_fields(
             format!("{prefix}[]")
         };
         collect_schema_fields(root, items, &array_prefix, &mut local_visited, out);
+    }
+
+    apply_required_flags(resolved, prefix, out);
+}
+
+fn apply_required_flags(schema: &Value, prefix: &str, out: &mut BTreeMap<String, FieldSchema>) {
+    if let Some(arr) = schema.get("required").and_then(Value::as_array) {
+        for req_name in arr.iter().filter_map(Value::as_str) {
+            let full_path = if prefix.is_empty() {
+                req_name.to_string()
+            } else {
+                format!("{prefix}.{req_name}")
+            };
+            if let Some(field) = out.get_mut(&full_path) {
+                field.required = true;
+            }
+        }
     }
 }
 
@@ -471,5 +662,455 @@ components:
         assert!(line > 1);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn detects_new_required_request_field_and_optional_to_required_transition() {
+        let base_yaml = r#"
+openapi: 3.0.3
+paths:
+  /customers:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                nickname:
+                  type: string
+      responses:
+        '201':
+          description: created
+"#;
+
+        let head_yaml = r#"
+openapi: 3.0.3
+paths:
+  /customers:
+    post:
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, nickname, taxId]
+              properties:
+                email:
+                  type: string
+                nickname:
+                  type: string
+                taxId:
+                  type: string
+      responses:
+        '201':
+          description: created
+"#;
+
+        let base = extract_contract("customer-service", base_yaml).unwrap();
+        let head = extract_contract("customer-service", head_yaml).unwrap();
+        let changes = diff_contracts(&base, &head);
+
+        let endpoint = EndpointId {
+            service: "customer-service".into(),
+            method: HttpMethod::Post,
+            normalized_path: "/customers".into(),
+        };
+
+        assert_eq!(
+            changes,
+            vec![
+                ContractChange::RequestFieldAddedRequired {
+                    endpoint: endpoint.clone(),
+                    field_path: "nickname".into(),
+                    field_type: "string".into(),
+                },
+                ContractChange::RequestFieldAddedRequired {
+                    endpoint,
+                    field_path: "taxId".into(),
+                    field_type: "string".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_request_field_type_change_including_nested_objects() {
+        let base_yaml = r#"
+openapi: 3.0.3
+paths:
+  /orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount:
+                  type: integer
+                shipping:
+                  type: object
+                  properties:
+                    postalCode:
+                      type: integer
+      responses:
+        '200':
+          description: ok
+"#;
+
+        let head_yaml = r#"
+openapi: 3.0.3
+paths:
+  /orders:
+    post:
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount:
+                  type: string
+                shipping:
+                  type: object
+                  properties:
+                    postalCode:
+                      type: string
+      responses:
+        '200':
+          description: ok
+"#;
+
+        let base = extract_contract("order-service", base_yaml).unwrap();
+        let head = extract_contract("order-service", head_yaml).unwrap();
+        let changes = diff_contracts(&base, &head);
+
+        let endpoint = EndpointId {
+            service: "order-service".into(),
+            method: HttpMethod::Post,
+            normalized_path: "/orders".into(),
+        };
+
+        assert_eq!(
+            changes,
+            vec![
+                ContractChange::RequestFieldTypeChanged {
+                    endpoint: endpoint.clone(),
+                    field_path: "amount".into(),
+                    previous_type: "integer".into(),
+                    new_type: "string".into(),
+                },
+                ContractChange::RequestFieldTypeChanged {
+                    endpoint,
+                    field_path: "shipping.postalCode".into(),
+                    previous_type: "integer".into(),
+                    new_type: "string".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn detects_new_required_query_and_header_parameters_including_path_level_merge() {
+        let base_yaml = r#"
+openapi: 3.0.3
+paths:
+  /customers:
+    parameters:
+      - name: X-Trace-Id
+        in: header
+        required: false
+        schema:
+          type: string
+    get:
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: ok
+"#;
+
+        let head_yaml = r#"
+openapi: 3.0.3
+paths:
+  /customers:
+    parameters:
+      - name: X-Trace-Id
+        in: header
+        required: true
+        schema:
+          type: string
+      - name: X-Region
+        in: header
+        required: true
+        schema:
+          type: string
+    get:
+      parameters:
+        - name: X-Region
+          in: header
+          required: false
+          schema:
+            type: string
+        - name: tenantId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: ok
+"#;
+
+        let base = extract_contract("customer-service", base_yaml).unwrap();
+        let head = extract_contract("customer-service", head_yaml).unwrap();
+        let changes = diff_contracts(&base, &head);
+
+        let endpoint = EndpointId {
+            service: "customer-service".into(),
+            method: HttpMethod::Get,
+            normalized_path: "/customers".into(),
+        };
+
+        // Operation-level X-Region (required: false) overrides path-level (required: true).
+        assert_eq!(
+            changes,
+            vec![
+                ContractChange::RequiredParameterAdded {
+                    endpoint: endpoint.clone(),
+                    location: "header".into(),
+                    name: "X-Trace-Id".into(),
+                    param_type: "string".into(),
+                },
+                ContractChange::RequiredParameterAdded {
+                    endpoint: endpoint.clone(),
+                    location: "query".into(),
+                    name: "page".into(),
+                    param_type: "integer".into(),
+                },
+                ContractChange::RequiredParameterAdded {
+                    endpoint,
+                    location: "query".into(),
+                    name: "tenantId".into(),
+                    param_type: "string".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_refs_and_allof_in_request_body_and_parameters() {
+        let base_yaml = r#"
+openapi: 3.0.3
+paths:
+  /invoices:
+    post:
+      parameters:
+        - $ref: '#/components/parameters/OptionalTenant'
+      requestBody:
+        $ref: '#/components/requestBodies/CreateInvoice'
+      responses:
+        '201':
+          description: created
+components:
+  parameters:
+    OptionalTenant:
+      name: X-Tenant-Id
+      in: header
+      required: false
+      schema:
+        $ref: '#/components/schemas/TenantId'
+  requestBodies:
+    CreateInvoice:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InvoiceInput'
+  schemas:
+    TenantId:
+      type: string
+    BaseInvoice:
+      type: object
+      properties:
+        currency:
+          type: string
+        total:
+          type: number
+    InvoiceInput:
+      allOf:
+        - $ref: '#/components/schemas/BaseInvoice'
+        - type: object
+          required: [total]
+"#;
+
+        let head_yaml = r#"
+openapi: 3.0.3
+paths:
+  /invoices:
+    post:
+      parameters:
+        - $ref: '#/components/parameters/RequiredTenant'
+      requestBody:
+        $ref: '#/components/requestBodies/CreateInvoice'
+      responses:
+        '201':
+          description: created
+components:
+  parameters:
+    RequiredTenant:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema:
+        $ref: '#/components/schemas/TenantId'
+  requestBodies:
+    CreateInvoice:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/InvoiceInput'
+  schemas:
+    TenantId:
+      type: string
+    BaseInvoice:
+      type: object
+      properties:
+        currency:
+          type: string
+        total:
+          type: string
+    InvoiceInput:
+      allOf:
+        - $ref: '#/components/schemas/BaseInvoice'
+        - type: object
+          required: [currency, total]
+"#;
+
+        let base = extract_contract("billing-service", base_yaml).unwrap();
+        let head = extract_contract("billing-service", head_yaml).unwrap();
+        let changes = diff_contracts(&base, &head);
+
+        let endpoint = EndpointId {
+            service: "billing-service".into(),
+            method: HttpMethod::Post,
+            normalized_path: "/invoices".into(),
+        };
+
+        assert_eq!(
+            changes,
+            vec![
+                ContractChange::RequestFieldAddedRequired {
+                    endpoint: endpoint.clone(),
+                    field_path: "currency".into(),
+                    field_type: "string".into(),
+                },
+                ContractChange::RequestFieldTypeChanged {
+                    endpoint: endpoint.clone(),
+                    field_path: "total".into(),
+                    previous_type: "number".into(),
+                    new_type: "string".into(),
+                },
+                ContractChange::RequiredParameterAdded {
+                    endpoint,
+                    location: "header".into(),
+                    name: "X-Tenant-Id".into(),
+                    param_type: "string".into(),
+                },
+            ]
+        );
+
+        let param_line = find_parameter_line(head_yaml, "X-Tenant-Id");
+        assert!(param_line > 1);
+    }
+
+    #[test]
+    fn optional_request_fields_and_optional_parameters_are_backwards_compatible() {
+        let base_yaml = r#"
+openapi: 3.0.3
+paths:
+  /customers:
+    post:
+      parameters:
+        - name: X-Legacy
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+      responses:
+        '201':
+          description: created
+"#;
+
+        let head_yaml = r#"
+openapi: 3.0.3
+paths:
+  /customers:
+    post:
+      parameters:
+        - name: X-Legacy
+          in: header
+          required: false
+          schema:
+            type: string
+        - name: dryRun
+          in: query
+          required: false
+          schema:
+            type: boolean
+        - name: session
+          in: cookie
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                middleName:
+                  type: string
+                notes:
+                  type: string
+      responses:
+        '201':
+          description: created
+"#;
+
+        let base = extract_contract("customer-service", base_yaml).unwrap();
+        let head = extract_contract("customer-service", head_yaml).unwrap();
+        let changes = diff_contracts(&base, &head);
+
+        assert!(
+            changes.is_empty(),
+            "optional additions and relaxations must produce zero breaking changes, got: {changes:?}"
+        );
     }
 }

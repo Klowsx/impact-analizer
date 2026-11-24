@@ -326,15 +326,15 @@ El roadmap prioriza validar el **análisis cross-repo desde la Fase 1**, en luga
   - `shipping-service` (consume `GET /customers/:id` pero solo lee `address` — caso negativo).
 
 ### Fase 1 — Vertical Slice Cross-Repo (Core MVP)
-- [ ] Leer `laine.toml` y abrir los repositorios Git sin modificar el working directory.
-- [ ] Extraer y comparar contratos OpenAPI entre `--base` y `--head` (campos eliminados, endpoints eliminados, cambios de tipo incompatibles).
-- [ ] Implementar analizador TS/JS con `oxc_parser` + `oxc_semantic`:
+- [x] Leer `laine.toml` y abrir los repositorios Git sin modificar el working directory.
+- [x] Extraer y comparar contratos OpenAPI entre `--base` y `--head` (campos eliminados, endpoints eliminados, cambios de tipo incompatibles).
+- [x] Implementar analizador TS/JS con `oxc_parser` + `oxc_semantic`:
   - Detectar llamadas `fetch` y `axios.get/post/put/patch/delete`.
   - Normalizar URLs contra `base_urls` registrados (`/customers/${id}` → `/customers/:id`).
   - Marcar URLs no resolubles como `UnresolvedCall` (`UNKNOWN`).
   - Rastrear lecturas de campos (`customer.fullName`, `response.data.fullName`, desestructuración).
-- [ ] Construir el grafo en memoria con `petgraph` y cruzar cambios del productor con consumidores.
-- [ ] Emitir reporte en terminal y JSON versionado con evidencia exacta (`repo`, `commit`, `file`, `line`, `path`).
+- [x] Construir el grafo en memoria con `petgraph` y cruzar cambios del productor con consumidores.
+- [x] Emitir reporte en terminal y JSON versionado con evidencia exacta (`repo`, `commit`, `file`, `line`, `path`).
 
 **Resultado:** demostración real end-to-end funcionando en milisegundos sobre 4 repos Git independientes.
 
@@ -373,12 +373,12 @@ El roadmap prioriza validar el **análisis cross-repo desde la Fase 1**, en luga
 
 La Fase 1 se considera completa cuando todas estas pruebas pasan automáticamente (`cargo test`):
 
-- [ ] Detecta la eliminación de `fullName` en `GET /customers/:id` entre dos commits de `customer-service` sin modificar el working directory.
-- [ ] Reporta `billing-service` y `notification-service` como afectados `CONFIRMED` con archivo, línea, commit y ruta de dependencias.
-- [ ] **No** reporta `shipping-service` como afectado (consume el endpoint pero solo lee `address`).
-- [ ] Reporta llamadas con URL dinámica como `UNKNOWN` (no resueltas) sin falsos positivos.
-- [ ] Produce salida determinista idéntica en ejecuciones repetidas (verificada con golden tests en JSON).
-- [ ] El análisis completo de los 4 repositorios se ejecuta localmente sin requerir `node_modules` ni acceso a internet.
+- [x] Detecta la eliminación de `fullName` en `GET /customers/:id` entre dos commits de `customer-service` sin modificar el working directory.
+- [x] Reporta `billing-service` y `notification-service` como afectados `CONFIRMED` con archivo, línea, commit y ruta de dependencias.
+- [x] **No** reporta `shipping-service` como afectado (consume el endpoint pero solo lee `address`).
+- [x] Reporta llamadas con URL dinámica como `UNKNOWN` (no resueltas) sin falsos positivos.
+- [x] Produce salida determinista idéntica en ejecuciones repetidas (verificada con golden tests en JSON).
+- [x] El análisis completo de los 4 repositorios se ejecuta localmente sin requerir `node_modules` ni acceso a internet.
 
 ---
 

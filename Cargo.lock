@@ -342,10 +342,14 @@ dependencies = [
 name = "laine-ts"
 version = "0.1.0"
 dependencies = [
+ "laine-core",
  "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
  "oxc_parser",
  "oxc_semantic",
  "oxc_span",
+ "serde",
 ]
 
 [[package]]

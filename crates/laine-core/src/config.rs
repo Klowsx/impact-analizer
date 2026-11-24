@@ -24,6 +24,8 @@ pub struct WorkspaceConfig {
 pub enum RouteFramework {
     Express,
     Laravel,
+    FastApi,
+    Flask,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

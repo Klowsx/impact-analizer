@@ -90,6 +90,8 @@ enum RepoAction {
 enum CliRouteFramework {
     Express,
     Laravel,
+    FastApi,
+    Flask,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -188,6 +190,8 @@ fn main() -> ExitCode {
                 framework: match fw {
                     CliRouteFramework::Express => RouteFramework::Express,
                     CliRouteFramework::Laravel => RouteFramework::Laravel,
+                    CliRouteFramework::FastApi => RouteFramework::FastApi,
+                    CliRouteFramework::Flask => RouteFramework::Flask,
                 },
                 files: Vec::new(),
                 prefix: None,

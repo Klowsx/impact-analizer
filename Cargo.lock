@@ -346,6 +346,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "laine-core",
+ "laine-py",
  "laine-ts",
  "serde_json",
 ]
@@ -360,6 +361,14 @@ dependencies = [
  "serde_yaml_ng",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "laine-py"
+version = "0.1.0"
+dependencies = [
+ "laine-core",
+ "serde",
 ]
 
 [[package]]

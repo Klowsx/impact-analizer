@@ -1,0 +1,214 @@
+name: "Laine Impact Analysis"
+description: "Detect cross-repository breaking API contract changes with verifiable file/line evidence on Pull Requests"
+author: "Javier Hernandez"
+
+branding:
+  icon: "git-pull-request"
+  color: "orange"
+
+inputs:
+  config:
+    description: "Path to the laine.toml workspace configuration file"
+    required: false
+    default: "laine.toml"
+  repo:
+    description: "Target service repository name (matching [[services]] in laine.toml)"
+    required: true
+  base:
+    description: "Base Git revision (before change, e.g. origin/main or PR base SHA)"
+    required: true
+  head:
+    description: "Head Git revision (after change)"
+    required: false
+    default: "HEAD"
+  format:
+    description: "Output report format: markdown, terminal, or json"
+    required: false
+    default: "markdown"
+  comment-pr:
+    description: "Post or update a Pull Request comment with the impact report"
+    required: false
+    default: "true"
+  laine-version:
+    description: "Laine release tag to download (e.g. v0.1.0), or 'source' to use PATH / build from source with Cargo"
+    required: false
+    default: "source"
+
+outputs:
+  exit-code:
+    description: "Exit code returned by laine analyze (0 = compatible/pass, 2 = breaking change, 1 = error)"
+    value: ${{ steps.run-laine.outputs.exit-code }}
+  report-path:
+    description: "Filesystem path to the generated Laine report"
+    value: ${{ steps.run-laine.outputs.report-path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install or resolve Laine binary
+      id: install-laine
+      shell: bash
+      env:
+        LAINE_VERSION: ${{ inputs.laine-version }}
+        ACTION_PATH: ${{ github.action_path }}
+        RUNNER_OS: ${{ runner.os }}
+        RUNNER_ARCH: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+
+        if [ "${LAINE_VERSION}" = "source" ]; then
+          if command -v laine >/dev/null 2>&1; then
+            echo "Using pre-installed laine: $(command -v laine)"
+            exit 0
+          fi
+
+          if ! command -v cargo >/dev/null 2>&1; then
+            echo "::error::laine is not installed and cargo was not found on PATH. Either install Rust or specify a release tag in laine-version (e.g. v0.1.0)."
+            exit 1
+          fi
+
+          echo "Building laine from source at ${ACTION_PATH}..."
+          cargo build --release --manifest-path "${ACTION_PATH}/Cargo.toml" -p laine-cli --bin laine
+          echo "${ACTION_PATH}/target/release" >> "${GITHUB_PATH}"
+          exit 0
+        fi
+
+        case "${RUNNER_OS}:${RUNNER_ARCH}" in
+          Linux:X64)
+            TARGET="x86_64-unknown-linux-gnu"
+            EXT="tar.gz"
+            ;;
+          macOS:ARM64)
+            TARGET="aarch64-apple-darwin"
+            EXT="tar.gz"
+            ;;
+          Windows:X64)
+            TARGET="x86_64-pc-windows-msvc"
+            EXT="zip"
+            ;;
+          *)
+            echo "::error::Unsupported platform for prebuilt Laine binary: ${RUNNER_OS}/${RUNNER_ARCH}. Use laine-version: source instead."
+            exit 1
+            ;;
+        esac
+
+        ASSET="laine-${LAINE_VERSION}-${TARGET}.${EXT}"
+        BASE_URL="https://github.com/Klowsx/impact-analizer/releases/download/${LAINE_VERSION}"
+        BIN_DIR="${RUNNER_TEMP}/laine-bin"
+        ARCHIVE_PATH="${RUNNER_TEMP}/${ASSET}"
+
+        mkdir -p "${BIN_DIR}"
+        echo "Downloading ${BASE_URL}/${ASSET}..."
+        curl -fsSL --retry 3 "${BASE_URL}/${ASSET}" -o "${ARCHIVE_PATH}"
+
+        if [ "${EXT}" = "tar.gz" ]; then
+          tar -xzf "${ARCHIVE_PATH}" -C "${BIN_DIR}"
+          chmod +x "${BIN_DIR}/laine"
+        else
+          unzip -oq "${ARCHIVE_PATH}" -d "${BIN_DIR}"
+        fi
+
+        echo "${BIN_DIR}" >> "${GITHUB_PATH}"
+
+    - name: Run Laine impact analysis
+      id: run-laine
+      shell: bash
+      env:
+        LAINE_CONFIG: ${{ inputs.config }}
+        LAINE_REPO: ${{ inputs.repo }}
+        LAINE_BASE: ${{ inputs.base }}
+        LAINE_HEAD: ${{ inputs.head }}
+        LAINE_FORMAT: ${{ inputs.format }}
+      run: |
+        set -uo pipefail
+
+        REPORT_PATH="${RUNNER_TEMP}/laine-report.md"
+        set +e
+        laine analyze \
+          --config "${LAINE_CONFIG}" \
+          --repo "${LAINE_REPO}" \
+          --base "${LAINE_BASE}" \
+          --head "${LAINE_HEAD}" \
+          --format "${LAINE_FORMAT}" > "${REPORT_PATH}"
+        EXIT_CODE=$?
+        set -e
+
+        cat "${REPORT_PATH}"
+        echo "exit-code=${EXIT_CODE}" >> "${GITHUB_OUTPUT}"
+        echo "report-path=${REPORT_PATH}" >> "${GITHUB_OUTPUT}"
+
+    - name: Post or update Pull Request comment
+      if: ${{ inputs.comment-pr == 'true' && github.event_name == 'pull_request' }}
+      uses: actions/github-script@v7
+      env:
+        REPORT_PATH: ${{ steps.run-laine.outputs.report-path }}
+        LAINE_FORMAT: ${{ inputs.format }}
+        LAINE_EXIT_CODE: ${{ steps.run-laine.outputs.exit-code }}
+      with:
+        script: |
+          const fs = require("fs");
+          const marker = "<!-- laine-impact-report -->";
+          const reportPath = process.env.REPORT_PATH;
+          const format = process.env.LAINE_FORMAT || "markdown";
+          const exitCode = process.env.LAINE_EXIT_CODE || "0";
+
+          let raw = "";
+          if (reportPath && fs.existsSync(reportPath)) {
+            raw = fs.readFileSync(reportPath, "utf8").trim();
+          }
+
+          if (!raw) {
+            raw = `Laine exited with code \`${exitCode}\` and produced no report output.`;
+          } else if (format === "json") {
+            raw = "### Laine Cross-Repo Impact Analysis\n\n```json\n" + raw + "\n```";
+          } else if (format === "terminal") {
+            raw = "### Laine Cross-Repo Impact Analysis\n\n```text\n" + raw + "\n```";
+          }
+
+          const maxBodyLength = 65000;
+          let body = `${marker}\n${raw}`;
+          if (body.length > maxBodyLength) {
+            body =
+              body.slice(0, maxBodyLength - 120) +
+              "\n\n---\n_Report truncated to fit GitHub's comment size limit._";
+          }
+
+          const { owner, repo } = context.repo;
+          const issueNumber = context.issue.number;
+
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner,
+            repo,
+            issue_number: issueNumber,
+            per_page: 100,
+          });
+
+          const existing = comments.find(
+            (comment) => comment.body && comment.body.includes(marker)
+          );
+
+          if (existing) {
+            await github.rest.issues.updateComment({
+              owner,
+              repo,
+              comment_id: existing.id,
+              body,
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              body,
+            });
+          }
+
+    - name: Propagate Laine exit code
+      shell: bash
+      env:
+        LAINE_EXIT_CODE: ${{ steps.run-laine.outputs.exit-code }}
+      run: |
+        if [ "${LAINE_EXIT_CODE}" -ne 0 ]; then
+          echo "Laine exited with status ${LAINE_EXIT_CODE}"
+          exit "${LAINE_EXIT_CODE}"
+        fi

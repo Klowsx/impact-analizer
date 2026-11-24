@@ -340,29 +340,29 @@ El roadmap prioriza validar el **análisis cross-repo desde la Fase 1**, en luga
 
 ### Fase 2 — Profundidad Semántica y Precisión
 - [x] Mejorar *data-flow*: alias locales, `axios.create({ baseURL })`, constantes de URL, variables de entorno mapeadas en configuración, wrappers HTTP personalizados (`[[clients]]`) y paso de respuesta a funciones helper (1 nivel).
-- [x] Añadir extracción de rutas Express (`app.get`, `router.get`, `app.use('/prefix', router)`) y Laravel (`routes/api.php`, `routes/web.php`) y reportar discrepancias entre código y OpenAPI.
-- [x] Propagación indirecta (`POSSIBLE`) cuando un servicio consumidor expone datos a un tercero.
+- [x] Añadir extracción de rutas Express (`app.get`, `router.get`, `app.use('/prefix', router)`), Laravel (`routes/api.php`, `routes/web.php`), FastAPI y Flask, además de soporte para componentes Vue SFC (`.vue`) y consumidores Python (`requests` / `httpx`), reportando discrepancias entre código y OpenAPI.
+- [x] Propagación indirecta (`POSSIBLE`) cuando un servicio consumidor expone datos a un tercero y diff de contratos en request body y parámetros requeridos.
 - [x] Suite completa de tests: golden tests JSON, casos negativos, ciclos, wrappers personalizados y rutas sin OpenAPI.
 
 **Resultado:** motor confiable y defendible ante revisión de ingenieros senior.
 
 ### Fase 3 — CLI Completa, Políticas, Persistencia y Benchmarks
-- [ ] Subcomandos completos: `init`, `repo add`, `index`, `analyze`, `report`.
-- [ ] Motor de políticas (severidad, reglas de bloqueo, códigos de salida: `0` limpio, `2` breaking change, `1` error técnico).
-- [ ] Paralelismo con `rayon` y persistencia/caché local opcional en SQLite (`rusqlite`) por commit SHA.
+- [x] Subcomandos principales: `init`, `repo add`, `index`, `demo-setup`, `analyze` (con formatos `terminal`, `json` y `markdown`).
+- [x] Motor de políticas (`[policy]`: `fail_on`, `ignore_endpoints`, `fail_on_unresolved` y códigos de salida: `0` limpio, `2` breaking change, `1` error técnico).
+- [x] Paralelismo con `rayon` y persistencia/caché local opcional en SQLite (`rusqlite`) por commit SHA.
 - [ ] Benchmarks reproducibles con `criterion` (tiempo de indexación, tiempo de análisis, memoria pico).
 
 **Resultado:** MVP listo para portafolio y primeros usuarios reales.
 
 ### Fase 4 — Integración CI y Lanzamiento Open Source
-- [ ] GitHub Action oficial que comenta/publica checks en Pull Requests.
-- [ ] Builds automatizados y releases binarios (Linux, macOS, Windows) + instalación simple.
-- [ ] Documentación pública: README con demo reproducible, ADRs, especificación del IR y comparativa técnica honesta.
+- [x] GitHub Action oficial (`action.yml`) que comenta/actualiza reportes y propaga exit codes en Pull Requests.
+- [x] Builds automatizados y releases binarios (Linux, macOS, Windows) con checksums SHA-256 (`.github/workflows/release.yml`).
+- [x] Documentación pública: README de lanzamiento v0.1.0, ADRs (`001`, `002`, `003`), especificación del IR (`docs/ir-spec.md`), `LICENSE` (MIT) y guía de contribución.
 
-**Resultado:** lanzamiento público v0.1 / v1.0 open source.
+**Resultado:** lanzamiento público v0.1 open source.
 
 ### Fase 5 — Evolución Post-v1
-- [ ] Soporte multilenguaje con `tree-sitter` (Python, Go, Java) reutilizando el mismo IR.
+- [ ] Soporte multilenguaje adicional con `tree-sitter` (Go, Java, Rust) reutilizando el mismo IR (Python ya integrado en `laine-py`).
 - [ ] Protocolos adicionales: GraphQL, gRPC y eventos asíncronos.
 - [ ] Correlación opcional con trazas reales de OpenTelemetry.
 - [ ] Ownership (`CODEOWNERS`) para sugerir revisores afectados y selección de tests.

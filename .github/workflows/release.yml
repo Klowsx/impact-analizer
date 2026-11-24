@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and publish (e.g. v0.1.0; defaults to current ref name)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            bin: laine
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            bin: laine
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            bin: laine.exe
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ -n "${INPUT_TAG}" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="${REF_NAME}"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }} -p laine-cli --bin laine
+
+      - name: Package Unix archive and SHA-256 checksum
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.bin }}
+        run: |
+          set -euo pipefail
+          STAGE_DIR="dist/stage"
+          ASSET="laine-${TAG}-${TARGET}.tar.gz"
+          mkdir -p "${STAGE_DIR}"
+          cp "target/${TARGET}/release/${BIN}" "${STAGE_DIR}/${BIN}"
+          cp LICENSE README.md "${STAGE_DIR}/"
+          chmod +x "${STAGE_DIR}/${BIN}"
+          tar -czf "dist/${ASSET}" -C "${STAGE_DIR}" "${BIN}" LICENSE README.md
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${ASSET}" > "${ASSET}.sha256"
+            else
+              shasum -a 256 "${ASSET}" > "${ASSET}.sha256"
+            fi
+          )
+
+      - name: Package Windows archive and SHA-256 checksum
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TAG: ${{ steps.meta.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          BIN: ${{ matrix.bin }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stageDir = "dist/stage"
+          $asset = "laine-$($env:TAG)-$($env:TARGET).zip"
+          New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+          Copy-Item "target/$($env:TARGET)/release/$($env:BIN)" "$stageDir/$($env:BIN)"
+          Copy-Item "LICENSE", "README.md" "$stageDir/"
+          Compress-Archive -Path "$stageDir/$($env:BIN)", "$stageDir/LICENSE", "$stageDir/README.md" -DestinationPath "dist/$asset" -Force
+          $hash = (Get-FileHash -Algorithm SHA256 -Path "dist/$asset").Hash.ToLowerInvariant()
+          "$hash  $asset" | Out-File -FilePath "dist/$asset.sha256" -Encoding ascii -NoNewline
+          "`n" | Add-Content -Path "dist/$asset.sha256" -NoNewline
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/laine-*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Combine SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 | LC_ALL=C sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/laine-*
+            dist/SHA256SUMS.txt

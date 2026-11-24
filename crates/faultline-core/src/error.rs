@@ -18,6 +18,9 @@ pub enum FaultlineError {
 
     #[error("Git command failed ({command}): {message}")]
     Git { command: String, message: String },
+
+    #[error("Failed to parse OpenAPI specification: {0}")]
+    OpenApiParse(String),
 }
 
 pub type Result<T> = std::result::Result<T, FaultlineError>;

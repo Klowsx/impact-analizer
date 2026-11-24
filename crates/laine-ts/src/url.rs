@@ -75,6 +75,36 @@ fn normalize_consumer_path(raw_path: &str) -> String {
     }
 }
 
+/// Normalizes a relative endpoint path (stripping query/hash and optionally prepending `path_prefix`).
+pub fn normalize_relative_path(raw_path: &str, path_prefix: Option<&str>) -> String {
+    let without_fragment = raw_path.split('#').next().unwrap_or(raw_path);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment)
+        .trim();
+
+    let combined = match path_prefix {
+        Some(prefix) if !prefix.trim().is_empty() => {
+            let p = prefix.trim().trim_end_matches('/');
+            let r = without_query.trim_start_matches('/');
+            if r.is_empty() {
+                p.to_string()
+            } else {
+                format!("{p}/{r}")
+            }
+        }
+        _ => without_query.to_string(),
+    };
+
+    normalize_consumer_path(&combined)
+}
+
+pub fn is_absolute_http_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("http://") || trimmed.starts_with("https://")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

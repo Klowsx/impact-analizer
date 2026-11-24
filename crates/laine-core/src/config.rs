@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,12 @@ pub struct WorkspaceConfig {
     pub version: u32,
     #[serde(default)]
     pub services: Vec<ServiceConfig>,
+    /// Optional custom HTTP client wrappers (e.g. `getClient().fetch`, `$fetch`, `apiClient`).
+    #[serde(default)]
+    pub clients: Vec<CustomClientConfig>,
+    /// Optional environment variable values for resolving `process.env.X` / `import.meta.env.X`.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -20,6 +27,19 @@ pub struct ServiceConfig {
     pub openapi: Option<PathBuf>,
     #[serde(default)]
     pub base_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomClientConfig {
+    /// Callee pattern to recognize:
+    /// - Exact call such as `getClient().fetch`, `$fetch`, `fetchApi`
+    /// - Or an HTTP client object such as `apiClient` (matches `.get/.post/.put/.patch/.delete/.fetch`)
+    pub callee: String,
+    /// Service name from `[[services]]` targeted when called with a relative path like `'/corp/listBooking'`.
+    pub target_service: String,
+    /// Optional path prefix prepended to relative paths (e.g. `"/api"`).
+    #[serde(default)]
+    pub path_prefix: Option<String>,
 }
 
 impl WorkspaceConfig {
@@ -79,5 +99,34 @@ path = "./billing-service"
         let raw = "version = 99\n";
         let err = WorkspaceConfig::parse_toml(raw).unwrap_err();
         assert!(matches!(err, LaineError::ConfigInvalid(_)));
+    }
+
+    #[test]
+    fn parses_custom_clients_and_env_mappings() {
+        let raw = r#"
+version = 1
+
+[env]
+VITE_API_URL = "http://customer-service"
+
+[[services]]
+name = "customer-service"
+path = "./customer-service"
+base_urls = ["http://customer-service"]
+
+[[clients]]
+callee = "getClient().fetch"
+target_service = "customer-service"
+path_prefix = "/api"
+"#;
+        let cfg = WorkspaceConfig::parse_toml(raw).expect("extended config should parse");
+        assert_eq!(
+            cfg.env.get("VITE_API_URL").map(String::as_str),
+            Some("http://customer-service")
+        );
+        assert_eq!(cfg.clients.len(), 1);
+        assert_eq!(cfg.clients[0].callee, "getClient().fetch");
+        assert_eq!(cfg.clients[0].target_service, "customer-service");
+        assert_eq!(cfg.clients[0].path_prefix.as_deref(), Some("/api"));
     }
 }

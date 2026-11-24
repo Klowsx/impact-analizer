@@ -4,10 +4,13 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use laine_cli::engine::{AnalyzeRequest, run_analysis};
-use laine_cli::report::{render_json, render_terminal};
-use laine_core::config::{RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig};
+use laine_cli::engine::{AnalyzeRequest, index_workspace, run_analysis_with_options};
+use laine_cli::report::{render_json, render_markdown, render_terminal};
+use laine_core::config::{
+    PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig,
+};
 use laine_core::fixtures::create_demo_workspace;
+use laine_core::policy::evaluate_policy;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,6 +45,12 @@ enum Commands {
         #[arg(default_value = "fixtures/demo-workspace")]
         path: PathBuf,
     },
+    /// Pre-compute and cache consumer repository AST extractions in SQLite
+    Index {
+        /// Path to laine.toml
+        #[arg(long, default_value = "laine.toml")]
+        config: PathBuf,
+    },
     /// Analyze cross-repository impact between two Git revisions
     Analyze {
         /// Path to laine.toml
@@ -59,6 +68,9 @@ enum Commands {
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
         format: OutputFormat,
+        /// Bypass the SQLite incremental extraction cache
+        #[arg(long)]
+        no_cache: bool,
     },
 }
 
@@ -98,6 +110,7 @@ enum CliRouteFramework {
 enum OutputFormat {
     Terminal,
     Json,
+    Markdown,
 }
 
 const STARTER_CONFIG: &str = r#"# Laine cross-repository impact analyzer configuration
@@ -174,6 +187,8 @@ fn main() -> ExitCode {
                     services: Vec::new(),
                     clients: Vec::new(),
                     env: Default::default(),
+                    policy: PolicyConfig::default(),
+                    cache_path: None,
                 }
             };
 
@@ -243,14 +258,42 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Commands::Index { config } => {
+            let started = Instant::now();
+            match index_workspace(&config) {
+                Ok(summary) => {
+                    println!(
+                        "Indexed {} repo(s) in {} ms ({} cache hit(s), {} cache miss(es)) -> {}",
+                        summary.repos_indexed,
+                        started.elapsed().as_millis(),
+                        summary.cache_hits,
+                        summary.cache_misses,
+                        summary.cache_path.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Index error: {err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Commands::Analyze {
             config,
             repo,
             base,
             head,
             format,
+            no_cache,
         } => {
             let started = Instant::now();
+            let workspace_cfg = match WorkspaceConfig::load_from_path(&config) {
+                Ok(cfg) => cfg,
+                Err(err) => {
+                    eprintln!("Analysis error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let req = AnalyzeRequest {
                 config_path: config,
                 target_repo: repo,
@@ -258,10 +301,10 @@ fn main() -> ExitCode {
                 head_rev: head,
             };
 
-            match run_analysis(&req) {
+            match run_analysis_with_options(&req, no_cache) {
                 Ok(report) => {
                     let elapsed_ms = started.elapsed().as_millis();
-                    let has_breaking_changes = !report.findings.is_empty();
+                    let policy_eval = evaluate_policy(&report, &workspace_cfg.policy);
 
                     match format {
                         OutputFormat::Terminal => {
@@ -274,9 +317,12 @@ fn main() -> ExitCode {
                                 return ExitCode::FAILURE;
                             }
                         },
+                        OutputFormat::Markdown => {
+                            print!("{}", render_markdown(&report));
+                        }
                     }
 
-                    if has_breaking_changes {
+                    if policy_eval.should_fail {
                         ExitCode::from(2)
                     } else {
                         ExitCode::SUCCESS

@@ -157,6 +157,8 @@ paths:
         ],
         clients: Vec::new(),
         env: Default::default(),
+        policy: Default::default(),
+        cache_path: None,
     };
     cfg.save_to_path(&cfg_path)
         .expect("save_to_path should work");

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use laine_core::cache::{IndexCache, compute_config_hash};
 use laine_core::config::{RouteFramework, RouteSourceConfig, WorkspaceConfig};
 use laine_core::error::{LaineError, Result};
 use laine_core::git::GitRepo;
@@ -9,9 +10,10 @@ use laine_core::impact::{ImpactInput, analyze_impact};
 use laine_core::laravel::extract_laravel_routes;
 use laine_core::model::{
     AnalysisReport, AnalysisStats, Confidence, ContractChange, ContractDiscrepancy, Evidence,
-    UnresolvedCall,
+    HttpMethod, UnresolvedCall,
 };
 use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
+use laine_core::policy::filter_ignored_findings;
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
 use laine_py::{
     PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
@@ -20,6 +22,8 @@ use laine_ts::{
     ExtractContext, TypeContractDef, extract_express_routes, extract_file_with_context,
     extract_type_definitions, resolve_type_fields,
 };
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct AnalyzeRequest {
@@ -29,19 +33,72 @@ pub struct AnalyzeRequest {
     pub head_rev: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexSummary {
+    pub repos_indexed: usize,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+    pub cache_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CachedConsumeEdge {
+    file: String,
+    target_service: String,
+    method: HttpMethod,
+    normalized_path: String,
+    line: usize,
+    snippet: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CachedFieldReadEdge {
+    file: String,
+    target_service: String,
+    method: HttpMethod,
+    normalized_path: String,
+    field_path: String,
+    line: usize,
+    snippet: String,
+    call_file: String,
+    call_line: usize,
+    confidence: Confidence,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CachedUnresolvedCall {
+    file: String,
+    line: usize,
+    snippet: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct CachedConsumerRepo {
+    files_analyzed: usize,
+    consumes: Vec<CachedConsumeEdge>,
+    field_reads: Vec<CachedFieldReadEdge>,
+    unresolved_calls: Vec<CachedUnresolvedCall>,
+}
+
+/// Runs a full cross-repository impact analysis without mutating any repository's working tree,
+/// using the SQLite incremental extraction cache by default.
+pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
+    run_analysis_with_options(req, false)
+}
+
 /// Runs a full cross-repository impact analysis without mutating any repository's working tree.
 ///
 /// Supports producers configured with:
 /// - `openapi` specification (OpenAPI 3.0/3.1 YAML or JSON)
-/// - `routes` code extraction (Express or Laravel) without requiring OpenAPI
+/// - `routes` code extraction (Express, Laravel, FastAPI, or Flask) without requiring OpenAPI
 /// - Both `openapi` and `routes` (also reporting discrepancies between spec and code)
-pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
+///
+/// When `no_cache` is `false`, per-repository consumer AST extractions are served from and
+/// persisted to the SQLite incremental cache keyed by `(repo, commit_sha, config_hash, schema_version)`.
+pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result<AnalysisReport> {
     let config = WorkspaceConfig::load_from_path(&req.config_path)?;
-    let config_dir = req
-        .config_path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
+    let config_dir = config_directory(&req.config_path);
 
     let target_service = config.find_service(&req.target_repo).ok_or_else(|| {
         LaineError::ConfigInvalid(format!(
@@ -109,7 +166,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
         head_openapi_contract = Some(head_contract);
     }
 
-    // 2. Optional code-based producer route extraction (Express / Laravel)
+    // 2. Optional code-based producer route extraction (Express / Laravel / FastAPI / Flask)
     if let Some(route_cfg) = target_service.routes.as_ref() {
         let (base_routes, base_files_count, sample_file, sample_raw) =
             extract_producer_routes(&producer_git, &target_service.name, &base_sha, route_cfg)?;
@@ -161,7 +218,15 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
         }
     }
 
-    // 3. Consumer repository analysis (TypeScript / JavaScript)
+    // 3. Consumer repository analysis (TypeScript / Vue / JavaScript / Python) with Rayon + SQLite cache
+    let config_hash = compute_config_hash(&config);
+    let cache = if no_cache {
+        None
+    } else {
+        let cache_path = resolve_cache_path(config_dir, config.cache_path.as_deref());
+        Some(IndexCache::open(&cache_path)?)
+    };
+
     let mut unresolved_calls = Vec::new();
     for service in &config.services {
         if service.name == target_service.name {
@@ -173,164 +238,41 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
         let consumer_git = GitRepo::new(&consumer_path);
         let consumer_rev = consumer_git.resolve_revision("HEAD")?;
 
-        let candidate_files: Vec<String> = consumer_git
-            .list_files(&consumer_rev)?
-            .into_iter()
-            .filter(|f| is_analyzable_ts_or_js(f) || is_analyzable_python(f))
-            .collect();
-
-        let file_contents = consumer_git.read_files_batch(&consumer_rev, &candidate_files)?;
-
-        // Pass 1: build repo-wide TypeScript interface/type contract registry for generic calls
-        // like `getClient().fetch<ReserveResponse>('/corp/listBooking')`.
-        let mut type_registry: BTreeMap<String, TypeContractDef> = BTreeMap::new();
-        for (file_path, source) in &file_contents {
-            if is_analyzable_ts_or_js(file_path)
-                && let Ok(defs) = extract_type_definitions(file_path, source)
-            {
-                for def in defs {
-                    type_registry.entry(def.name.clone()).or_insert(def);
-                }
+        let cached_snapshot = if let Some(cache_db) = cache.as_ref() {
+            match cache_db.get_repo_snapshot(&service.name, &consumer_rev, &config_hash)? {
+                Some(raw_json) => serde_json::from_str::<CachedConsumerRepo>(&raw_json).ok(),
+                None => None,
             }
-        }
+        } else {
+            None
+        };
 
-        // Pass 2: extract HTTP calls, direct field reads (CONFIRMED), and generic type contracts (LIKELY).
-        for (file_path, source) in &file_contents {
-            files_analyzed += 1;
-
-            if is_analyzable_python(file_path) {
-                let extracted = extract_python_file(
-                    file_path,
-                    source,
-                    PyExtractContext {
-                        services: &config.services,
-                        clients: &config.clients,
-                        env: &config.env,
-                    },
-                );
-
-                for call in &extracted.calls {
-                    graph.link_consumes(
+        let snapshot = match cached_snapshot {
+            Some(hit) => hit,
+            None => {
+                let extracted = extract_consumer_repo(&consumer_git, &consumer_rev, &config)?;
+                if let Some(cache_db) = cache.as_ref() {
+                    let payload = serde_json::to_string(&extracted)
+                        .map_err(|err| LaineError::Cache(err.to_string()))?;
+                    cache_db.put_repo_snapshot(
                         &service.name,
-                        file_path,
                         &consumer_rev,
-                        &call.service,
-                        call.method,
-                        &call.normalized_path,
-                        call.line,
-                        &call.snippet,
-                    );
+                        &config_hash,
+                        &payload,
+                    )?;
                 }
-
-                for read in &extracted.field_reads {
-                    if let Some(call) = extracted.calls.get(read.call_id) {
-                        graph.link_reads_field(
-                            &service.name,
-                            file_path,
-                            &consumer_rev,
-                            &call.service,
-                            call.method,
-                            &call.normalized_path,
-                            &read.field_path,
-                            read.line,
-                            &read.snippet,
-                            call.line,
-                        );
-                    }
-                }
-
-                for unresolved in extracted.unresolved_calls {
-                    unresolved_calls.push(UnresolvedCall {
-                        repo: service.name.clone(),
-                        evidence: Evidence {
-                            repo: service.name.clone(),
-                            revision: consumer_rev.clone(),
-                            file: file_path.clone(),
-                            line: unresolved.line,
-                            snippet: unresolved.snippet,
-                        },
-                        reason: unresolved.reason,
-                    });
-                }
-                continue;
+                extracted
             }
+        };
 
-            let Ok(extracted) = extract_file_with_context(
-                file_path,
-                source,
-                ExtractContext {
-                    services: &config.services,
-                    clients: &config.clients,
-                    env: &config.env,
-                },
-            ) else {
-                continue;
-            };
-
-            for call in &extracted.calls {
-                graph.link_consumes(
-                    &service.name,
-                    file_path,
-                    &consumer_rev,
-                    &call.service,
-                    call.method,
-                    &call.normalized_path,
-                    call.line,
-                    &call.snippet,
-                );
-
-                if let Some(ref response_type) = call.response_type {
-                    for (type_file, field_def) in resolve_type_fields(response_type, &type_registry)
-                    {
-                        graph.link_reads_field_with_confidence(
-                            &service.name,
-                            &type_file,
-                            &consumer_rev,
-                            &call.service,
-                            call.method,
-                            &call.normalized_path,
-                            &field_def.field_path,
-                            field_def.line,
-                            &field_def.snippet,
-                            file_path,
-                            call.line,
-                            Confidence::Likely,
-                        );
-                    }
-                }
-            }
-
-            for read in &extracted.field_reads {
-                if let Some(call) = extracted.calls.get(read.call_id) {
-                    graph.link_reads_field(
-                        &service.name,
-                        file_path,
-                        &consumer_rev,
-                        &call.service,
-                        call.method,
-                        &call.normalized_path,
-                        &read.field_path,
-                        read.line,
-                        &read.snippet,
-                        call.line,
-                    );
-                }
-            }
-
-            for unresolved in extracted.unresolved_calls {
-                unresolved_calls.push(UnresolvedCall {
-                    repo: service.name.clone(),
-                    evidence: Evidence {
-                        repo: service.name.clone(),
-                        revision: consumer_rev.clone(),
-                        file: file_path.clone(),
-                        line: unresolved.line,
-                        snippet: unresolved.snippet,
-                    },
-                    reason: unresolved.reason,
-                });
-            }
-        }
+        apply_cached_consumer_repo(
+            &service.name,
+            &consumer_rev,
+            &snapshot,
+            &mut graph,
+            &mut unresolved_calls,
+            &mut files_analyzed,
+        );
     }
 
     let stats = AnalysisStats {
@@ -340,7 +282,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
         graph_edges: graph.edge_count(),
     };
 
-    Ok(analyze_impact(
+    let mut report = analyze_impact(
         &graph,
         ImpactInput {
             target_repo: &target_service.name,
@@ -354,7 +296,348 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
             discrepancies,
             stats,
         },
-    ))
+    );
+
+    filter_ignored_findings(&mut report, &config.policy);
+
+    Ok(report)
+}
+
+/// Pre-computes and persists consumer AST extraction snapshots for every repository declared
+/// in `config_path`, populating the SQLite incremental cache for subsequent `laine analyze` runs.
+pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
+    let config = WorkspaceConfig::load_from_path(config_path)?;
+    let config_dir = config_directory(config_path);
+    let cache_path = resolve_cache_path(config_dir, config.cache_path.as_deref());
+    let cache = IndexCache::open(&cache_path)?;
+    let config_hash = compute_config_hash(&config);
+
+    let mut repos_indexed = 0usize;
+    let mut cache_hits = 0usize;
+    let mut cache_misses = 0usize;
+
+    for service in &config.services {
+        let repo_path = resolve_repo_path(config_dir, &service.path);
+        let git = GitRepo::new(&repo_path);
+        let head_sha = git.resolve_revision("HEAD")?;
+
+        let is_valid_hit = cache
+            .get_repo_snapshot(&service.name, &head_sha, &config_hash)?
+            .and_then(|raw| serde_json::from_str::<CachedConsumerRepo>(&raw).ok())
+            .is_some();
+
+        if is_valid_hit {
+            cache_hits += 1;
+        } else {
+            let snapshot = extract_consumer_repo(&git, &head_sha, &config)?;
+            let payload = serde_json::to_string(&snapshot)
+                .map_err(|err| LaineError::Cache(err.to_string()))?;
+            cache.put_repo_snapshot(&service.name, &head_sha, &config_hash, &payload)?;
+            cache_misses += 1;
+        }
+
+        repos_indexed += 1;
+    }
+
+    Ok(IndexSummary {
+        repos_indexed,
+        cache_hits,
+        cache_misses,
+        cache_path,
+    })
+}
+
+fn extract_consumer_repo(
+    git: &GitRepo,
+    rev: &str,
+    config: &WorkspaceConfig,
+) -> Result<CachedConsumerRepo> {
+    let candidate_files: Vec<String> = git
+        .list_files(rev)?
+        .into_iter()
+        .filter(|f| is_analyzable_ts_or_js(f) || is_analyzable_python(f))
+        .collect();
+
+    let file_contents: Vec<(String, String)> = git
+        .read_files_batch(rev, &candidate_files)?
+        .into_iter()
+        .collect();
+
+    // Pass 1 (parallel): build repo-wide TypeScript interface/type contract registry for generic calls
+    // like `getClient().fetch<ReserveResponse>('/corp/listBooking')`.
+    let per_file_types: Vec<Vec<TypeContractDef>> = file_contents
+        .par_iter()
+        .map(|(file_path, source)| {
+            if is_analyzable_ts_or_js(file_path) {
+                extract_type_definitions(file_path, source).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+
+    let mut type_registry: BTreeMap<String, TypeContractDef> = BTreeMap::new();
+    for defs in per_file_types {
+        for def in defs {
+            type_registry.entry(def.name.clone()).or_insert(def);
+        }
+    }
+
+    // Pass 2 (parallel): extract HTTP calls, direct field reads (CONFIRMED), and generic type contracts (LIKELY).
+    let per_file_extracted: Vec<(
+        Vec<CachedConsumeEdge>,
+        Vec<CachedFieldReadEdge>,
+        Vec<CachedUnresolvedCall>,
+    )> = file_contents
+        .par_iter()
+        .map(|(file_path, source)| {
+            let mut consumes = Vec::new();
+            let mut field_reads = Vec::new();
+            let mut unresolved = Vec::new();
+
+            if is_analyzable_python(file_path) {
+                let extracted = extract_python_file(
+                    file_path,
+                    source,
+                    PyExtractContext {
+                        services: &config.services,
+                        clients: &config.clients,
+                        env: &config.env,
+                    },
+                );
+
+                for call in &extracted.calls {
+                    consumes.push(CachedConsumeEdge {
+                        file: file_path.clone(),
+                        target_service: call.service.clone(),
+                        method: call.method,
+                        normalized_path: call.normalized_path.clone(),
+                        line: call.line,
+                        snippet: call.snippet.clone(),
+                    });
+                }
+
+                for read in &extracted.field_reads {
+                    if let Some(call) = extracted.calls.get(read.call_id) {
+                        field_reads.push(CachedFieldReadEdge {
+                            file: file_path.clone(),
+                            target_service: call.service.clone(),
+                            method: call.method,
+                            normalized_path: call.normalized_path.clone(),
+                            field_path: read.field_path.clone(),
+                            line: read.line,
+                            snippet: read.snippet.clone(),
+                            call_file: file_path.clone(),
+                            call_line: call.line,
+                            confidence: Confidence::Confirmed,
+                        });
+                    }
+                }
+
+                for item in extracted.unresolved_calls {
+                    unresolved.push(CachedUnresolvedCall {
+                        file: file_path.clone(),
+                        line: item.line,
+                        snippet: item.snippet,
+                        reason: item.reason,
+                    });
+                }
+
+                return (consumes, field_reads, unresolved);
+            }
+
+            let Ok(extracted) = extract_file_with_context(
+                file_path,
+                source,
+                ExtractContext {
+                    services: &config.services,
+                    clients: &config.clients,
+                    env: &config.env,
+                },
+            ) else {
+                return (consumes, field_reads, unresolved);
+            };
+
+            for call in &extracted.calls {
+                consumes.push(CachedConsumeEdge {
+                    file: file_path.clone(),
+                    target_service: call.service.clone(),
+                    method: call.method,
+                    normalized_path: call.normalized_path.clone(),
+                    line: call.line,
+                    snippet: call.snippet.clone(),
+                });
+
+                if let Some(ref response_type) = call.response_type {
+                    for (type_file, field_def) in resolve_type_fields(response_type, &type_registry)
+                    {
+                        field_reads.push(CachedFieldReadEdge {
+                            file: type_file,
+                            target_service: call.service.clone(),
+                            method: call.method,
+                            normalized_path: call.normalized_path.clone(),
+                            field_path: field_def.field_path,
+                            line: field_def.line,
+                            snippet: field_def.snippet,
+                            call_file: file_path.clone(),
+                            call_line: call.line,
+                            confidence: Confidence::Likely,
+                        });
+                    }
+                }
+            }
+
+            for read in &extracted.field_reads {
+                if let Some(call) = extracted.calls.get(read.call_id) {
+                    field_reads.push(CachedFieldReadEdge {
+                        file: file_path.clone(),
+                        target_service: call.service.clone(),
+                        method: call.method,
+                        normalized_path: call.normalized_path.clone(),
+                        field_path: read.field_path.clone(),
+                        line: read.line,
+                        snippet: read.snippet.clone(),
+                        call_file: file_path.clone(),
+                        call_line: call.line,
+                        confidence: Confidence::Confirmed,
+                    });
+                }
+            }
+
+            for item in extracted.unresolved_calls {
+                unresolved.push(CachedUnresolvedCall {
+                    file: file_path.clone(),
+                    line: item.line,
+                    snippet: item.snippet,
+                    reason: item.reason,
+                });
+            }
+
+            (consumes, field_reads, unresolved)
+        })
+        .collect();
+
+    let mut consumes = Vec::new();
+    let mut field_reads = Vec::new();
+    let mut unresolved_calls = Vec::new();
+
+    for (file_consumes, file_reads, file_unresolved) in per_file_extracted {
+        consumes.extend(file_consumes);
+        field_reads.extend(file_reads);
+        unresolved_calls.extend(file_unresolved);
+    }
+
+    consumes.sort_by(|a, b| {
+        (
+            &a.file,
+            a.line,
+            &a.target_service,
+            a.method,
+            &a.normalized_path,
+            &a.snippet,
+        )
+            .cmp(&(
+                &b.file,
+                b.line,
+                &b.target_service,
+                b.method,
+                &b.normalized_path,
+                &b.snippet,
+            ))
+    });
+
+    field_reads.sort_by(|a, b| {
+        (
+            &a.file,
+            a.line,
+            &a.call_file,
+            a.call_line,
+            &a.target_service,
+            a.method,
+            &a.normalized_path,
+            &a.field_path,
+            a.confidence,
+            &a.snippet,
+        )
+            .cmp(&(
+                &b.file,
+                b.line,
+                &b.call_file,
+                b.call_line,
+                &b.target_service,
+                b.method,
+                &b.normalized_path,
+                &b.field_path,
+                b.confidence,
+                &b.snippet,
+            ))
+    });
+
+    unresolved_calls.sort_by(|a, b| {
+        (&a.file, a.line, &a.reason, &a.snippet).cmp(&(&b.file, b.line, &b.reason, &b.snippet))
+    });
+
+    Ok(CachedConsumerRepo {
+        files_analyzed: file_contents.len(),
+        consumes,
+        field_reads,
+        unresolved_calls,
+    })
+}
+
+fn apply_cached_consumer_repo(
+    service_name: &str,
+    consumer_rev: &str,
+    snapshot: &CachedConsumerRepo,
+    graph: &mut DependencyGraph,
+    unresolved_calls: &mut Vec<UnresolvedCall>,
+    files_analyzed: &mut usize,
+) {
+    *files_analyzed += snapshot.files_analyzed;
+
+    for edge in &snapshot.consumes {
+        graph.link_consumes(
+            service_name,
+            &edge.file,
+            consumer_rev,
+            &edge.target_service,
+            edge.method,
+            &edge.normalized_path,
+            edge.line,
+            &edge.snippet,
+        );
+    }
+
+    for read in &snapshot.field_reads {
+        graph.link_reads_field_with_confidence(
+            service_name,
+            &read.file,
+            consumer_rev,
+            &read.target_service,
+            read.method,
+            &read.normalized_path,
+            &read.field_path,
+            read.line,
+            &read.snippet,
+            &read.call_file,
+            read.call_line,
+            read.confidence,
+        );
+    }
+
+    for unresolved in &snapshot.unresolved_calls {
+        unresolved_calls.push(UnresolvedCall {
+            repo: service_name.to_string(),
+            evidence: Evidence {
+                repo: service_name.to_string(),
+                revision: consumer_rev.to_string(),
+                file: unresolved.file.clone(),
+                line: unresolved.line,
+                snippet: unresolved.snippet.clone(),
+            },
+            reason: unresolved.reason.clone(),
+        });
+    }
 }
 
 fn extract_producer_routes(
@@ -437,6 +720,21 @@ fn extract_producer_routes(
     }
 
     Ok((routes, files_count, first_file, first_raw))
+}
+
+fn config_directory(config_path: &Path) -> &Path {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn resolve_cache_path(config_dir: &Path, configured: Option<&Path>) -> PathBuf {
+    match configured {
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => config_dir.join(path),
+        None => config_dir.join(".laine-cache.db"),
+    }
 }
 
 fn resolve_repo_path(config_dir: &Path, service_path: &Path) -> PathBuf {

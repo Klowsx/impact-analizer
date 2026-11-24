@@ -21,6 +21,9 @@ pub enum LaineError {
 
     #[error("Failed to parse OpenAPI specification: {0}")]
     OpenApiParse(String),
+
+    #[error("Cache error: {0}")]
+    Cache(String),
 }
 
 pub type Result<T> = std::result::Result<T, LaineError>;

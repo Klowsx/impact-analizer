@@ -1,8 +1,8 @@
-# Faultline — Change Impact Analyzer
+# Laine — Change Impact Analyzer
 
 > Plan de producto, arquitectura y desarrollo de una herramienta CLI open source, escrita en **Rust**, para detectar y explicar el impacto de cambios de código entre repositorios independientes.
 
-**Estado:** plan v2 (revisado para Rust + *vertical slice first*) · **Nombre provisional:** `Faultline` · **Objetivo:** Portafolio técnico de nivel Senior/Staff → lanzamiento Open Source distribuible como binario único.
+**Estado:** plan v2 (revisado para Rust + *vertical slice first*) · **Nombre provisional:** `Laine` · **Objetivo:** Portafolio técnico de nivel Senior/Staff → lanzamiento Open Source distribuible como binario único.
 
 ---
 
@@ -29,7 +29,7 @@
 
 En empresas con múltiples repositorios y microservicios, un cambio pequeño en un servicio —como eliminar un campo de una respuesta HTTP, cambiar su tipo o modificar una ruta— puede pasar todas las pruebas locales de ese repositorio y aun así romper sistemas de otros equipos al llegar a producción.
 
-**Faultline** actúa como un radar de efecto dominó que se ejecuta antes de publicar el cambio, respondiendo:
+**Laine** actúa como un radar de efecto dominó que se ejecuta antes de publicar el cambio, respondiendo:
 
 - ¿Qué contratos o campos cambiaron de forma incompatible entre dos revisiones de Git?
 - ¿Qué otros repositorios consumen ese endpoint y utilizan exactamente el campo modificado?
@@ -49,7 +49,7 @@ En empresas con múltiples repositorios y microservicios, un cambio pequeño en 
 
 Imagina una empresa con cuatro proyectos separados en carpetas Git locales: `customer-service`, `billing-service`, `notification-service` y `shipping-service`.
 
-Un desarrollador edita `customer-service` y elimina el campo `fullName` de `GET /customers/:id` (sustituyéndolo por `firstName` y `lastName`). Antes de subir su cambio, ejecuta `faultline analyze`:
+Un desarrollador edita `customer-service` y elimina el campo `fullName` de `GET /customers/:id` (sustituyéndolo por `firstName` y `lastName`). Antes de subir su cambio, ejecuta `laine analyze`:
 
 1. **Detecta qué cambió en `customer-service`:** compara la versión anterior (`main`) contra la versión nueva (`head`) directamente desde el historial de Git y detecta que `fullName` fue eliminado de `GET /customers/:id`.
 2. **Inspecciona los demás repositorios:** analiza el código de `billing-service`, `notification-service` y `shipping-service`, identifica qué llamadas HTTP apuntan a `GET /customers/:id` y rastrea qué campos de la respuesta se leen.
@@ -76,7 +76,7 @@ Un desarrollador edita `customer-service` y elimina el campo `fullName` de `GET 
 
 ### Panorama existente
 
-| Solución | Qué resuelve bien | Brecha frente a Faultline |
+| Solución | Qué resuelve bien | Brecha frente a Laine |
 |---|---|---|
 | **oasdiff** | Detecta *breaking changes* en especificaciones OpenAPI. | No sabe qué repositorios ni qué líneas de código consumen los campos modificados. |
 | **Nx / Turborepo** | Identifica proyectos afectados dentro de un monorepo. | No cruza fronteras HTTP entre repositorios independientes. |
@@ -86,7 +86,7 @@ Un desarrollador edita `customer-service` y elimina el campo `fullName` de `GET 
 
 ### Nicho diferencial
 
-Faultline apunta a **equipos reales con microservicios REST en múltiples repositorios**, sin Pact ni SDKs generados, que quieren detectar impactos *cross-repo* en **milisegundos**, de forma **local/self-hosted**, con un **único binario** y sin enviar código propietario a terceros.
+Laine apunta a **equipos reales con microservicios REST en múltiples repositorios**, sin Pact ni SDKs generados, que quieren detectar impactos *cross-repo* en **milisegundos**, de forma **local/self-hosted**, con un **único binario** y sin enviar código propietario a terceros.
 
 ---
 
@@ -107,7 +107,7 @@ La arquitectura separa la lectura de Git, los analizadores por lenguaje/contrato
 
 ```mermaid
 flowchart TD
-    CFG[faultline.toml] --> IDX[Repository & Git Snapshot Reader]
+    CFG[laine.toml] --> IDX[Repository & Git Snapshot Reader]
     GIT[Repositorios Git locales] --> IDX
     IDX --> TS[TypeScript Analyzer - oxc]
     IDX --> OAS[OpenAPI Contract Analyzer]
@@ -207,7 +207,7 @@ Para evitar los cuellos de botella clásicos del análisis estático, el MVP fij
 
 ## 9. Experiencia de uso
 
-### Configuración (`faultline.toml`)
+### Configuración (`laine.toml`)
 
 ```toml
 version = 1
@@ -238,19 +238,19 @@ path = "./fixtures/shipping-service"
 
 ```bash
 # Inicializar configuración base
-faultline init
+laine init
 
 # Registrar un repositorio
-faultline repo add ./customer-service --name customer-service --base-url http://customer-service
+laine repo add ./customer-service --name customer-service --base-url http://customer-service
 
 # Analizar impacto de un cambio entre dos revisiones
-faultline analyze \
+laine analyze \
   --repo customer-service \
   --base main \
   --head feature/split-customer-name
 
 # Exportar salida estructurada para CI o scripts
-faultline analyze \
+laine analyze \
   --repo customer-service \
   --base main \
   --head feature/split-customer-name \
@@ -260,7 +260,7 @@ faultline analyze \
 ### Ejemplo de salida en terminal
 
 ```text
-Faultline v0.1.0 — Cross-Repo Impact Analysis
+Laine v0.1.0 — Cross-Repo Impact Analysis
 Target: customer-service (main -> feature/split-customer-name)
 Analyzed: 4 repos | 48 files | 19 ms
 
@@ -293,15 +293,15 @@ RESULT: INCOMPATIBLE CHANGE (exit code 2)
 Workspace Rust minimalista (3 crates) para evitar sobreingeniería al inicio y permitir extracción limpia cuando crezca:
 
 ```text
-faultline/
+laine/
 ├── Cargo.toml                     # Workspace root
 ├── PLAN.md                        # Este plan
 ├── README.md
 ├── LICENSE
 ├── crates/
-│   ├── faultline-core/            # Dominio, IR, lector Git, diff OpenAPI, grafo petgraph, motor de impacto
-│   ├── faultline-ts/              # Analizador TS/JS con oxc (fetch, Axios, data-flow, rutas Express)
-│   └── faultline-cli/             # Binario CLI (clap), carga de faultline.toml, reportes terminal/JSON
+│   ├── laine-core/            # Dominio, IR, lector Git, diff OpenAPI, grafo petgraph, motor de impacto
+│   ├── laine-ts/              # Analizador TS/JS con oxc (fetch, Axios, data-flow, rutas Express)
+│   └── laine-cli/             # Binario CLI (clap), carga de laine.toml, reportes terminal/JSON
 ├── fixtures/
 │   └── demo-workspace/            # Script/generador de los 4 repos Git reproducibles
 ├── tests/                         # Tests de integración end-to-end y golden tests JSON
@@ -318,7 +318,7 @@ faultline/
 El roadmap prioriza validar el **análisis cross-repo desde la Fase 1**, en lugar de posponerlo para el final.
 
 ### Fase 0 — Setup y Fixtures Reproducibles
-- [x] Inicializar workspace Rust (`faultline-core`, `faultline-ts`, `faultline-cli`) con versiones fijadas.
+- [x] Inicializar workspace Rust (`laine-core`, `laine-ts`, `laine-cli`) con versiones fijadas.
 - [x] Crear un generador reproducible en `fixtures/` que materialice 4 repositorios Git independientes:
   - `customer-service` (commit `v1` con `fullName`, commit `v2` reemplazándolo por `firstName`/`lastName`).
   - `billing-service` (consume `GET /customers/:id` con `fetch` y lee `fullName`, más una llamada dinámica no resoluble).
@@ -326,7 +326,7 @@ El roadmap prioriza validar el **análisis cross-repo desde la Fase 1**, en luga
   - `shipping-service` (consume `GET /customers/:id` pero solo lee `address` — caso negativo).
 
 ### Fase 1 — Vertical Slice Cross-Repo (Core MVP)
-- [ ] Leer `faultline.toml` y abrir los repositorios Git sin modificar el working directory.
+- [ ] Leer `laine.toml` y abrir los repositorios Git sin modificar el working directory.
 - [ ] Extraer y comparar contratos OpenAPI entre `--base` y `--head` (campos eliminados, endpoints eliminados, cambios de tipo incompatibles).
 - [ ] Implementar analizador TS/JS con `oxc_parser` + `oxc_semantic`:
   - Detectar llamadas `fetch` y `axios.get/post/put/patch/delete`.
@@ -396,7 +396,7 @@ La Fase 1 se considera completa cuando todas estas pruebas pasan automáticament
 
 | Riesgo | Mitigación |
 |---|---|
-| URLs dinámicas / configuración externa | Soportar mapeos explícitos en `faultline.toml` y marcar el resto como `UNKNOWN`. |
+| URLs dinámicas / configuración externa | Soportar mapeos explícitos en `laine.toml` y marcar el resto como `UNKNOWN`. |
 | Wrappers propios de HTTP (`apiClient.get`) | Soportar wrappers simples por seguimiento de funciones locales y permitir declaraciones en configuración en Fase 2. |
 | Contratos OpenAPI desactualizados | Contrastar rutas contra el analizador Express (Fase 2) y reportar discrepancias explícitamente. |
 | Cambios de API en crates jóvenes (`oxc_*`, `gix`) | Fijar versiones exactas en `Cargo.toml` y aislar el acceso detrás de módulos propios. |

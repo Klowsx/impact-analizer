@@ -2,12 +2,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use faultline_core::config::WorkspaceConfig;
-use faultline_core::fixtures::create_demo_workspace;
+use laine_core::config::WorkspaceConfig;
+use laine_core::fixtures::create_demo_workspace;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "faultline",
+    name = "laine",
     version,
     about = "Cross-repository change impact analyzer"
 )]
@@ -26,8 +26,8 @@ enum Commands {
     },
     /// Analyze cross-repository impact between two Git revisions (implemented in Phase 1)
     Analyze {
-        /// Path to faultline.toml
-        #[arg(long, default_value = "faultline.toml")]
+        /// Path to laine.toml
+        #[arg(long, default_value = "laine.toml")]
         config: PathBuf,
         /// Service repository where the change occurred
         #[arg(long)]

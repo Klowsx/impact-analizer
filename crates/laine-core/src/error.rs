@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum FaultlineError {
+pub enum LaineError {
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -23,4 +23,4 @@ pub enum FaultlineError {
     OpenApiParse(String),
 }
 
-pub type Result<T> = std::result::Result<T, FaultlineError>;
+pub type Result<T> = std::result::Result<T, LaineError>;

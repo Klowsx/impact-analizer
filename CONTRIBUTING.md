@@ -1,6 +1,6 @@
-# Contributing to Faultline
+# Contributing to Laine
 
-Thank you for your interest in contributing to **Faultline**. This project follows a lightweight, disciplined Git workflow designed to keep `main` always green and the commit history clean.
+Thank you for your interest in contributing to **Laine**. This project follows a lightweight, disciplined Git workflow designed to keep `main` always green and the commit history clean.
 
 ## Branching Strategy (Trunk-Based)
 
@@ -37,10 +37,10 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) in imperative m
 - `chore` — maintenance, tooling, dependency updates
 
 ### Scopes
-- `core` — `faultline-core` (domain model, config, graph, impact engine)
+- `core` — `laine-core` (domain model, config, graph, impact engine)
 - `openapi` — OpenAPI parsing and contract diffing
-- `ts` — `faultline-ts` (`oxc` parser, HTTP extraction, data-flow)
-- `cli` — `faultline-cli` (commands, flags, output formatting)
+- `ts` — `laine-ts` (`oxc` parser, HTTP extraction, data-flow)
+- `cli` — `laine-cli` (commands, flags, output formatting)
 - `fixtures` — reproducible demo/test repositories
 - `ci` / `docs` / `deps`
 
@@ -49,7 +49,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) in imperative m
 - **One PR = one focused responsibility.**
 - **PR title** must follow Conventional Commits (because **Squash and Merge** uses the PR title as the commit message on `main`).
 - Include tests for every new feature or bug fix (including negative and `UNKNOWN`/unresolvable cases where relevant).
-- Keep `Cargo.lock` committed: Faultline is a CLI application workspace and relies on reproducible builds.
+- Keep `Cargo.lock` committed: Laine is a CLI application workspace and relies on reproducible builds.
 
 ## Local Quality Gates
 

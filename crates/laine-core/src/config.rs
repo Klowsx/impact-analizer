@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{FaultlineError, Result};
+use crate::error::{LaineError, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceConfig {
@@ -24,7 +24,7 @@ pub struct ServiceConfig {
 
 impl WorkspaceConfig {
     pub fn load_from_path(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path).map_err(|source| FaultlineError::Io {
+        let raw = fs::read_to_string(path).map_err(|source| LaineError::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -34,7 +34,7 @@ impl WorkspaceConfig {
     pub fn parse_toml(raw: &str) -> Result<Self> {
         let cfg: WorkspaceConfig = toml::from_str(raw)?;
         if cfg.version != 1 {
-            return Err(FaultlineError::ConfigInvalid(format!(
+            return Err(LaineError::ConfigInvalid(format!(
                 "unsupported config version {} (expected 1)",
                 cfg.version
             )));
@@ -78,6 +78,6 @@ path = "./billing-service"
     fn rejects_unsupported_version() {
         let raw = "version = 99\n";
         let err = WorkspaceConfig::parse_toml(raw).unwrap_err();
-        assert!(matches!(err, FaultlineError::ConfigInvalid(_)));
+        assert!(matches!(err, LaineError::ConfigInvalid(_)));
     }
 }

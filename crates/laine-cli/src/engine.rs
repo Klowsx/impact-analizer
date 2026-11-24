@@ -13,6 +13,9 @@ use laine_core::model::{
 };
 use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
+use laine_py::{
+    PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
+};
 use laine_ts::{
     ExtractContext, TypeContractDef, extract_express_routes, extract_file_with_context,
     extract_type_definitions, resolve_type_fields,
@@ -173,7 +176,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
         let candidate_files: Vec<String> = consumer_git
             .list_files(&consumer_rev)?
             .into_iter()
-            .filter(|f| is_analyzable_ts_or_js(f))
+            .filter(|f| is_analyzable_ts_or_js(f) || is_analyzable_python(f))
             .collect();
 
         let file_contents = consumer_git.read_files_batch(&consumer_rev, &candidate_files)?;
@@ -182,7 +185,9 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
         // like `getClient().fetch<ReserveResponse>('/corp/listBooking')`.
         let mut type_registry: BTreeMap<String, TypeContractDef> = BTreeMap::new();
         for (file_path, source) in &file_contents {
-            if let Ok(defs) = extract_type_definitions(file_path, source) {
+            if is_analyzable_ts_or_js(file_path)
+                && let Ok(defs) = extract_type_definitions(file_path, source)
+            {
                 for def in defs {
                     type_registry.entry(def.name.clone()).or_insert(def);
                 }
@@ -192,6 +197,63 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
         // Pass 2: extract HTTP calls, direct field reads (CONFIRMED), and generic type contracts (LIKELY).
         for (file_path, source) in &file_contents {
             files_analyzed += 1;
+
+            if is_analyzable_python(file_path) {
+                let extracted = extract_python_file(
+                    file_path,
+                    source,
+                    PyExtractContext {
+                        services: &config.services,
+                        clients: &config.clients,
+                        env: &config.env,
+                    },
+                );
+
+                for call in &extracted.calls {
+                    graph.link_consumes(
+                        &service.name,
+                        file_path,
+                        &consumer_rev,
+                        &call.service,
+                        call.method,
+                        &call.normalized_path,
+                        call.line,
+                        &call.snippet,
+                    );
+                }
+
+                for read in &extracted.field_reads {
+                    if let Some(call) = extracted.calls.get(read.call_id) {
+                        graph.link_reads_field(
+                            &service.name,
+                            file_path,
+                            &consumer_rev,
+                            &call.service,
+                            call.method,
+                            &call.normalized_path,
+                            &read.field_path,
+                            read.line,
+                            &read.snippet,
+                            call.line,
+                        );
+                    }
+                }
+
+                for unresolved in extracted.unresolved_calls {
+                    unresolved_calls.push(UnresolvedCall {
+                        repo: service.name.clone(),
+                        evidence: Evidence {
+                            repo: service.name.clone(),
+                            revision: consumer_rev.clone(),
+                            file: file_path.clone(),
+                            line: unresolved.line,
+                            snippet: unresolved.snippet,
+                        },
+                        reason: unresolved.reason,
+                    });
+                }
+                continue;
+            }
 
             let Ok(extracted) = extract_file_with_context(
                 file_path,
@@ -318,6 +380,10 @@ fn extract_producer_routes(
                 .into_iter()
                 .filter(|f| is_analyzable_ts_or_js(f))
                 .collect(),
+            RouteFramework::FastApi | RouteFramework::Flask => all_files
+                .into_iter()
+                .filter(|f| is_analyzable_python(f))
+                .collect(),
         }
     };
 
@@ -350,6 +416,22 @@ fn extract_producer_routes(
                 {
                     routes.extend(extracted);
                 }
+            }
+            RouteFramework::FastApi => {
+                routes.extend(extract_fastapi_routes(
+                    service_name,
+                    &file,
+                    &raw,
+                    route_cfg.prefix.as_deref(),
+                ));
+            }
+            RouteFramework::Flask => {
+                routes.extend(extract_flask_routes(
+                    service_name,
+                    &file,
+                    &raw,
+                    route_cfg.prefix.as_deref(),
+                ));
             }
         }
     }
@@ -391,4 +473,30 @@ fn is_analyzable_ts_or_js(path: &str) -> bool {
         || lower.ends_with(".jsx")
         || lower.ends_with(".mjs")
         || lower.ends_with(".cjs")
+}
+
+fn is_analyzable_python(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if !lower.ends_with(".py") {
+        return false;
+    }
+
+    for segment in lower.split('/') {
+        if segment.starts_with('.')
+            || matches!(
+                segment,
+                "venv"
+                    | "env"
+                    | "__pycache__"
+                    | "site-packages"
+                    | "node_modules"
+                    | "dist"
+                    | "build"
+            )
+        {
+            return false;
+        }
+    }
+
+    true
 }

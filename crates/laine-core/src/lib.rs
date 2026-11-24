@@ -4,5 +4,7 @@ pub mod fixtures;
 pub mod git;
 pub mod graph;
 pub mod impact;
+pub mod laravel;
 pub mod model;
 pub mod openapi;
+pub mod routes;

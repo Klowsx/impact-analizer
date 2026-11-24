@@ -19,12 +19,32 @@ pub struct WorkspaceConfig {
     pub env: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RouteFramework {
+    Express,
+    Laravel,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteSourceConfig {
+    pub framework: RouteFramework,
+    /// Optional explicit list of route files relative to the service repository root.
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+    /// Optional mount prefix prepended to extracted routes (e.g. `"/api"`).
+    #[serde(default)]
+    pub prefix: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceConfig {
     pub name: String,
     pub path: PathBuf,
     #[serde(default)]
     pub openapi: Option<PathBuf>,
+    #[serde(default)]
+    pub routes: Option<RouteSourceConfig>,
     #[serde(default)]
     pub base_urls: Vec<String>,
 }

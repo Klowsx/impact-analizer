@@ -113,6 +113,20 @@ pub struct UnresolvedCall {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscrepancyKind {
+    UndocumentedInOpenApi,
+    MissingInCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractDiscrepancy {
+    pub endpoint: EndpointId,
+    pub kind: DiscrepancyKind,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AnalysisStats {
     pub repositories: usize,
@@ -130,4 +144,6 @@ pub struct AnalysisReport {
     pub stats: AnalysisStats,
     pub findings: Vec<ImpactFinding>,
     pub unresolved_calls: Vec<UnresolvedCall>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discrepancies: Vec<ContractDiscrepancy>,
 }

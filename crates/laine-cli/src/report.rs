@@ -125,6 +125,25 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
         }
     }
 
+    if !report.discrepancies.is_empty() {
+        let _ = writeln!(
+            out,
+            "CONTRACT DISCREPANCIES ({})",
+            report.discrepancies.len()
+        );
+        for d in &report.discrepancies {
+            let _ = writeln!(
+                out,
+                "  - [{:?}] {} {} — {}",
+                d.kind,
+                d.endpoint.method.as_str(),
+                d.endpoint.normalized_path,
+                d.detail
+            );
+        }
+        let _ = writeln!(out);
+    }
+
     if !report.unresolved_calls.is_empty() {
         let _ = writeln!(
             out,

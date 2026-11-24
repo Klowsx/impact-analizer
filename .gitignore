@@ -1,0 +1,17 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Generated demo git repositories (reproducible via `faultline demo-setup`)
+/fixtures/demo-workspace/
+
+# Local SQLite databases
+*.db
+*.sqlite
+*.sqlite3
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,14 @@
+[package]
+name = "faultline-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "faultline"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+faultline-core = { path = "../faultline-core" }

@@ -85,6 +85,15 @@ impl WorkspaceConfig {
     pub fn find_service(&self, name: &str) -> Option<&ServiceConfig> {
         self.services.iter().find(|svc| svc.name == name)
     }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<()> {
+        let serialized = toml::to_string_pretty(self)
+            .map_err(|err| LaineError::ConfigInvalid(err.to_string()))?;
+        fs::write(path, serialized).map_err(|source| LaineError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
 }
 
 #[cfg(test)]

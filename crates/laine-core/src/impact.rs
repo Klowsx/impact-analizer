@@ -1,7 +1,9 @@
+use std::collections::{BTreeMap, HashSet};
+
 use crate::graph::DependencyGraph;
 use crate::model::{
     AffectedConsumer, AnalysisReport, AnalysisStats, Confidence, ContractChange,
-    ContractDiscrepancy, Evidence, ImpactFinding, Severity, UnresolvedCall,
+    ContractDiscrepancy, Evidence, ImpactFinding, IndirectConsumer, Severity, UnresolvedCall,
 };
 use crate::openapi::find_field_line;
 
@@ -108,6 +110,27 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
             (_, true) => Severity::Medium,
         };
 
+        let direct_repo_set: HashSet<String> = consumers.iter().map(|c| c.repo.clone()).collect();
+        let mut indirect_map: BTreeMap<String, IndirectConsumer> = BTreeMap::new();
+        for direct_repo in &direct_repo_set {
+            for (downstream_repo, chain) in graph.transitive_dependent_paths(direct_repo) {
+                if downstream_repo == input.target_repo
+                    || direct_repo_set.contains(&downstream_repo)
+                {
+                    continue;
+                }
+                indirect_map
+                    .entry(downstream_repo.clone())
+                    .or_insert_with(|| IndirectConsumer {
+                        repo: downstream_repo,
+                        confidence: Confidence::Possible,
+                        via_repo: direct_repo.clone(),
+                        dependency_chain: chain,
+                    });
+            }
+        }
+        let indirect_consumers: Vec<IndirectConsumer> = indirect_map.into_values().collect();
+
         findings.push(ImpactFinding {
             id: format!("LAINE-{:03}", idx + 1),
             change,
@@ -121,6 +144,7 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                 snippet: producer_snippet,
             },
             consumers,
+            indirect_consumers,
         });
     }
 

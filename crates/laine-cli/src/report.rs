@@ -121,6 +121,23 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
                     );
                 }
             }
+            if !finding.indirect_consumers.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  Indirectly affected consumers ({} possible):",
+                    finding.indirect_consumers.len()
+                );
+                for indirect in &finding.indirect_consumers {
+                    let _ = writeln!(
+                        out,
+                        "    - {} [{:?}] via {} ({})",
+                        indirect.repo,
+                        indirect.confidence,
+                        indirect.via_repo,
+                        indirect.dependency_chain.join(" -> ")
+                    );
+                }
+            }
             let _ = writeln!(out);
         }
     }

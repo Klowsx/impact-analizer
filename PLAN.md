@@ -339,10 +339,10 @@ El roadmap prioriza validar el **análisis cross-repo desde la Fase 1**, en luga
 **Resultado:** demostración real end-to-end funcionando en milisegundos sobre 4 repos Git independientes.
 
 ### Fase 2 — Profundidad Semántica y Precisión
-- [ ] Mejorar *data-flow*: alias locales, `axios.create({ baseURL })`, constantes de URL, variables de entorno mapeadas en configuración y paso de respuesta a funciones helper (1–2 niveles).
-- [ ] Añadir extracción de rutas Express (`app.get`, `router.get`, `app.use('/prefix', router)`) y reportar discrepancias entre código y OpenAPI.
-- [ ] Propagación indirecta (`POSSIBLE`) cuando un servicio consumidor expone datos a un tercero.
-- [ ] Suite completa de tests: golden tests JSON, casos negativos, ciclos, símbolos homónimos y rutas ambiguas.
+- [x] Mejorar *data-flow*: alias locales, `axios.create({ baseURL })`, constantes de URL, variables de entorno mapeadas en configuración, wrappers HTTP personalizados (`[[clients]]`) y paso de respuesta a funciones helper (1 nivel).
+- [x] Añadir extracción de rutas Express (`app.get`, `router.get`, `app.use('/prefix', router)`) y Laravel (`routes/api.php`, `routes/web.php`) y reportar discrepancias entre código y OpenAPI.
+- [x] Propagación indirecta (`POSSIBLE`) cuando un servicio consumidor expone datos a un tercero.
+- [x] Suite completa de tests: golden tests JSON, casos negativos, ciclos, wrappers personalizados y rutas sin OpenAPI.
 
 **Resultado:** motor confiable y defendible ante revisión de ingenieros senior.
 

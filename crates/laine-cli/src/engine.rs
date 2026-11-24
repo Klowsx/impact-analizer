@@ -7,7 +7,7 @@ use laine_core::graph::DependencyGraph;
 use laine_core::impact::{ImpactInput, analyze_impact};
 use laine_core::model::{AnalysisReport, AnalysisStats, Evidence, UnresolvedCall};
 use laine_core::openapi::{diff_contracts, extract_contract};
-use laine_ts::extract_file;
+use laine_ts::{ExtractContext, extract_file_with_context};
 
 #[derive(Debug, Clone)]
 pub struct AnalyzeRequest {
@@ -95,7 +95,15 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
             let source = consumer_git.read_file(&consumer_rev, Path::new(&file_path))?;
             files_analyzed += 1;
 
-            let Ok(extracted) = extract_file(&file_path, &source, &config.services) else {
+            let Ok(extracted) = extract_file_with_context(
+                &file_path,
+                &source,
+                ExtractContext {
+                    services: &config.services,
+                    clients: &config.clients,
+                    env: &config.env,
+                },
+            ) else {
                 continue;
             };
 

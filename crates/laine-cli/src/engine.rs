@@ -65,6 +65,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
     let mut discrepancies: Vec<ContractDiscrepancy> = Vec::new();
     let mut source_file_display = String::new();
     let mut base_source_raw = String::new();
+    let mut head_source_raw = String::new();
 
     // 1. Optional OpenAPI producer contract analysis
     let mut head_openapi_contract = None;
@@ -97,6 +98,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
 
         source_file_display = openapi_rel.to_string_lossy().replace('\\', "/");
         base_source_raw = base_raw;
+        head_source_raw = head_raw;
         head_openapi_contract = Some(head_contract);
     }
 
@@ -248,6 +250,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
             head_rev: &head_sha,
             source_file: &source_file_display,
             base_source_raw: &base_source_raw,
+            head_source_raw: &head_source_raw,
             changes: contract_changes,
             unresolved_calls,
             discrepancies,

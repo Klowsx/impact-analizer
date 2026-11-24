@@ -164,12 +164,15 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
         let consumer_git = GitRepo::new(&consumer_path);
         let consumer_rev = consumer_git.resolve_revision("HEAD")?;
 
-        for file_path in consumer_git.list_files(&consumer_rev)? {
-            if !is_analyzable_ts_or_js(&file_path) {
-                continue;
-            }
+        let candidate_files: Vec<String> = consumer_git
+            .list_files(&consumer_rev)?
+            .into_iter()
+            .filter(|f| is_analyzable_ts_or_js(f))
+            .collect();
 
-            let source = consumer_git.read_file(&consumer_rev, Path::new(&file_path))?;
+        let file_contents = consumer_git.read_files_batch(&consumer_rev, &candidate_files)?;
+
+        for (file_path, source) in file_contents {
             files_analyzed += 1;
 
             let Ok(extracted) = extract_file_with_context(
@@ -284,10 +287,9 @@ fn extract_producer_routes(
     let mut first_file = String::new();
     let mut first_raw = String::new();
 
-    for file in candidate_files {
-        let Ok(raw) = git.read_file(rev, Path::new(&file)) else {
-            continue;
-        };
+    let batch_contents = git.read_files_batch(rev, &candidate_files)?;
+
+    for (file, raw) in batch_contents {
         files_count += 1;
         if first_file.is_empty() {
             first_file = file.clone();
@@ -326,17 +328,21 @@ fn resolve_repo_path(config_dir: &Path, service_path: &Path) -> PathBuf {
 
 fn is_analyzable_ts_or_js(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".d.ts")
-        || lower.starts_with("node_modules/")
-        || lower.contains("/node_modules/")
-        || lower.starts_with("dist/")
-        || lower.contains("/dist/")
-        || lower.starts_with(".nuxt/")
-        || lower.contains("/.nuxt/")
-        || lower.starts_with(".output/")
-        || lower.contains("/.output/")
-    {
+    if lower.ends_with(".d.ts") {
         return false;
+    }
+
+    // Skip hidden dot-directories (`.agents`, `.claude`, `.github`, `.nuxt`, `.output`, etc.)
+    // as well as vendor/build output folders (`node_modules`, `dist`, `build`, `coverage`).
+    for segment in lower.split('/') {
+        if segment.starts_with('.')
+            || matches!(
+                segment,
+                "node_modules" | "dist" | "build" | "coverage" | "vendor"
+            )
+        {
+            return false;
+        }
     }
 
     lower.ends_with(".ts")

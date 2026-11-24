@@ -1,10 +1,10 @@
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 
-use crate::model::HttpMethod;
+use crate::model::{Confidence, HttpMethod};
 use crate::openapi::canonical_route_key;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -44,7 +44,9 @@ pub enum GraphEdge {
         revision: String,
         line: usize,
         snippet: String,
+        call_file: String,
         call_line: usize,
+        confidence: Confidence,
     },
 }
 
@@ -55,8 +57,10 @@ pub struct FieldConsumerHit {
     pub file: String,
     pub line: usize,
     pub snippet: String,
+    pub call_file: String,
     pub call_line: usize,
     pub matched_field: String,
+    pub confidence: Confidence,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +217,38 @@ impl DependencyGraph {
         snippet: &str,
         call_line: usize,
     ) {
+        self.link_reads_field_with_confidence(
+            consumer_repo,
+            consumer_file,
+            revision,
+            target_service,
+            method,
+            consumer_path,
+            field_path,
+            line,
+            snippet,
+            consumer_file,
+            call_line,
+            Confidence::Confirmed,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_reads_field_with_confidence(
+        &mut self,
+        consumer_repo: &str,
+        consumer_file: &str,
+        revision: &str,
+        target_service: &str,
+        method: HttpMethod,
+        consumer_path: &str,
+        field_path: &str,
+        line: usize,
+        snippet: &str,
+        call_file: &str,
+        call_line: usize,
+        confidence: Confidence,
+    ) {
         let file_idx = self.add_file(consumer_repo, consumer_file);
 
         // Attach to the producer's canonical endpoint path if already registered.
@@ -234,7 +270,9 @@ impl DependencyGraph {
                 revision: revision.to_string(),
                 line,
                 snippet: snippet.to_string(),
+                call_file: call_file.to_string(),
                 call_line,
+                confidence,
             },
         );
     }
@@ -249,8 +287,8 @@ impl DependencyGraph {
         changed_field: &str,
     ) -> Vec<FieldConsumerHit> {
         let producer_canonical = canonical_route_key(producer_path);
-        let mut hits = Vec::new();
-        let mut dedup = HashSet::new();
+        let mut dedup: BTreeMap<(String, String, usize, String), FieldConsumerHit> =
+            BTreeMap::new();
 
         for (&(ref svc, m, ref ep_canonical, ref field_path), &field_idx) in &self.fields {
             if svc != service
@@ -266,33 +304,35 @@ impl DependencyGraph {
                     revision,
                     line,
                     snippet,
+                    call_file,
                     call_line,
+                    confidence,
                 } = edge.weight()
                     && let GraphNode::File { repo, path } = &self.graph[edge.source()]
-                    && dedup.insert((repo.clone(), path.clone(), *line, field_path.clone()))
                 {
-                    hits.push(FieldConsumerHit {
+                    let key = (repo.clone(), path.clone(), *line, field_path.clone());
+                    let candidate = FieldConsumerHit {
                         repo: repo.clone(),
                         revision: revision.clone(),
                         file: path.clone(),
                         line: *line,
                         snippet: snippet.clone(),
+                        call_file: call_file.clone(),
                         call_line: *call_line,
                         matched_field: field_path.clone(),
-                    });
+                        confidence: *confidence,
+                    };
+                    match dedup.get(&key) {
+                        Some(existing) if existing.confidence >= candidate.confidence => {}
+                        _ => {
+                            dedup.insert(key, candidate);
+                        }
+                    }
                 }
             }
         }
 
-        hits.sort_by(|a, b| {
-            (&a.repo, &a.file, a.line, &a.matched_field).cmp(&(
-                &b.repo,
-                &b.file,
-                b.line,
-                &b.matched_field,
-            ))
-        });
-        hits
+        dedup.into_values().collect()
     }
 
     /// Finds all consumer file locations calling an endpoint (used when an entire endpoint is removed).

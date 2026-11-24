@@ -148,13 +148,15 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
             if finding.consumers.is_empty() {
                 let _ = writeln!(out, "  Affected consumers: 0 detected");
             } else {
-                let _ = writeln!(
-                    out,
-                    "  Affected consumers ({} confirmed):",
-                    finding.consumers.len()
-                );
+                let _ = writeln!(out, "  Affected consumers ({}):", finding.consumers.len());
                 for (i, consumer) in finding.consumers.iter().enumerate() {
-                    let _ = writeln!(out, "    {}. {}", i + 1, consumer.repo);
+                    let _ = writeln!(
+                        out,
+                        "    {}. {} [{:?}]",
+                        i + 1,
+                        consumer.repo,
+                        consumer.confidence
+                    );
                     let _ = writeln!(
                         out,
                         "       File: {}/{}:{} (commit {})",

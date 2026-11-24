@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use laine_core::config::{RouteFramework, RouteSourceConfig, WorkspaceConfig};
@@ -8,11 +8,15 @@ use laine_core::graph::DependencyGraph;
 use laine_core::impact::{ImpactInput, analyze_impact};
 use laine_core::laravel::extract_laravel_routes;
 use laine_core::model::{
-    AnalysisReport, AnalysisStats, ContractChange, ContractDiscrepancy, Evidence, UnresolvedCall,
+    AnalysisReport, AnalysisStats, Confidence, ContractChange, ContractDiscrepancy, Evidence,
+    UnresolvedCall,
 };
 use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
-use laine_ts::{ExtractContext, extract_express_routes, extract_file_with_context};
+use laine_ts::{
+    ExtractContext, TypeContractDef, extract_express_routes, extract_file_with_context,
+    extract_type_definitions, resolve_type_fields,
+};
 
 #[derive(Debug, Clone)]
 pub struct AnalyzeRequest {
@@ -174,12 +178,24 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
 
         let file_contents = consumer_git.read_files_batch(&consumer_rev, &candidate_files)?;
 
-        for (file_path, source) in file_contents {
+        // Pass 1: build repo-wide TypeScript interface/type contract registry for generic calls
+        // like `getClient().fetch<ReserveResponse>('/corp/listBooking')`.
+        let mut type_registry: BTreeMap<String, TypeContractDef> = BTreeMap::new();
+        for (file_path, source) in &file_contents {
+            if let Ok(defs) = extract_type_definitions(file_path, source) {
+                for def in defs {
+                    type_registry.entry(def.name.clone()).or_insert(def);
+                }
+            }
+        }
+
+        // Pass 2: extract HTTP calls, direct field reads (CONFIRMED), and generic type contracts (LIKELY).
+        for (file_path, source) in &file_contents {
             files_analyzed += 1;
 
             let Ok(extracted) = extract_file_with_context(
-                &file_path,
-                &source,
+                file_path,
+                source,
                 ExtractContext {
                     services: &config.services,
                     clients: &config.clients,
@@ -192,7 +208,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
             for call in &extracted.calls {
                 graph.link_consumes(
                     &service.name,
-                    &file_path,
+                    file_path,
                     &consumer_rev,
                     &call.service,
                     call.method,
@@ -200,13 +216,33 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
                     call.line,
                     &call.snippet,
                 );
+
+                if let Some(ref response_type) = call.response_type {
+                    for (type_file, field_def) in resolve_type_fields(response_type, &type_registry)
+                    {
+                        graph.link_reads_field_with_confidence(
+                            &service.name,
+                            &type_file,
+                            &consumer_rev,
+                            &call.service,
+                            call.method,
+                            &call.normalized_path,
+                            &field_def.field_path,
+                            field_def.line,
+                            &field_def.snippet,
+                            file_path,
+                            call.line,
+                            Confidence::Likely,
+                        );
+                    }
+                }
             }
 
             for read in &extracted.field_reads {
                 if let Some(call) = extracted.calls.get(read.call_id) {
                     graph.link_reads_field(
                         &service.name,
-                        &file_path,
+                        file_path,
                         &consumer_rev,
                         &call.service,
                         call.method,
@@ -350,6 +386,7 @@ fn is_analyzable_ts_or_js(path: &str) -> bool {
 
     lower.ends_with(".ts")
         || lower.ends_with(".tsx")
+        || lower.ends_with(".vue")
         || lower.ends_with(".js")
         || lower.ends_with(".jsx")
         || lower.ends_with(".mjs")

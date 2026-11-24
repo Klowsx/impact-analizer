@@ -91,24 +91,38 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                 );
                 let consumers = hits
                     .into_iter()
-                    .map(|hit| AffectedConsumer {
-                        repo: hit.repo.clone(),
-                        evidence: Evidence {
+                    .map(|hit| {
+                        let step_label = if hit.confidence == Confidence::Likely {
+                            "typed contract"
+                        } else {
+                            "read"
+                        };
+                        AffectedConsumer {
                             repo: hit.repo.clone(),
-                            revision: hit.revision,
-                            file: hit.file.clone(),
-                            line: hit.line,
-                            snippet: hit.snippet,
-                        },
-                        confidence: Confidence::Confirmed,
-                        dependency_path: vec![
-                            format!("{} {}", endpoint.method.as_str(), endpoint.normalized_path),
-                            format!("HTTP call @ {}/{}:{}", hit.repo, hit.file, hit.call_line),
-                            format!(
-                                "read `{}` @ {}/{}:{}",
-                                hit.matched_field, hit.repo, hit.file, hit.line
-                            ),
-                        ],
+                            evidence: Evidence {
+                                repo: hit.repo.clone(),
+                                revision: hit.revision,
+                                file: hit.file.clone(),
+                                line: hit.line,
+                                snippet: hit.snippet,
+                            },
+                            confidence: hit.confidence,
+                            dependency_path: vec![
+                                format!(
+                                    "{} {}",
+                                    endpoint.method.as_str(),
+                                    endpoint.normalized_path
+                                ),
+                                format!(
+                                    "HTTP call @ {}/{}:{}",
+                                    hit.repo, hit.call_file, hit.call_line
+                                ),
+                                format!(
+                                    "{step_label} `{}` @ {}/{}:{}",
+                                    hit.matched_field, hit.repo, hit.file, hit.line
+                                ),
+                            ],
+                        }
                     })
                     .collect::<Vec<_>>();
                 (line, format!("field `{field_path}`"), consumers)

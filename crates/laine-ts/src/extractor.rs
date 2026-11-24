@@ -15,6 +15,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::url::{is_absolute_http_url, normalize_relative_path, resolve_url_against_services};
+use crate::vue::extract_vue_scripts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -94,9 +95,48 @@ pub fn extract_file_with_context(
     source: &str,
     ctx: ExtractContext<'_>,
 ) -> Result<FileExtraction, Vec<String>> {
-    let allocator = Allocator::default();
+    if file_path.to_ascii_lowercase().ends_with(".vue") {
+        let blocks = extract_vue_scripts(source);
+        let mut merged = FileExtraction {
+            file_path: file_path.to_string(),
+            ..Default::default()
+        };
+
+        for block in blocks {
+            let source_type = if block.is_ts {
+                SourceType::ts()
+            } else {
+                SourceType::mjs()
+            };
+            let extracted = extract_source_block(file_path, &block.code, source_type, ctx)?;
+            let call_offset = merged.calls.len();
+
+            for mut call in extracted.calls {
+                call.id += call_offset;
+                merged.calls.push(call);
+            }
+            for mut read in extracted.field_reads {
+                read.call_id += call_offset;
+                merged.field_reads.push(read);
+            }
+            merged.unresolved_calls.extend(extracted.unresolved_calls);
+        }
+
+        return Ok(merged);
+    }
+
     let source_type =
         SourceType::from_path(Path::new(file_path)).unwrap_or_else(|_| SourceType::ts());
+    extract_source_block(file_path, source, source_type, ctx)
+}
+
+fn extract_source_block(
+    file_path: &str,
+    source: &str,
+    source_type: SourceType,
+    ctx: ExtractContext<'_>,
+) -> Result<FileExtraction, Vec<String>> {
+    let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
 
     if !parsed.diagnostics.is_empty() {

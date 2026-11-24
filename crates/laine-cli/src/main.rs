@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use laine_core::config::WorkspaceConfig;
+use laine_cli::engine::{AnalyzeRequest, run_analysis};
+use laine_cli::report::{render_json, render_terminal};
 use laine_core::fixtures::create_demo_workspace;
 
 #[derive(Debug, Parser)]
@@ -24,7 +26,7 @@ enum Commands {
         #[arg(default_value = "fixtures/demo-workspace")]
         path: PathBuf,
     },
-    /// Analyze cross-repository impact between two Git revisions (implemented in Phase 1)
+    /// Analyze cross-repository impact between two Git revisions
     Analyze {
         /// Path to laine.toml
         #[arg(long, default_value = "laine.toml")]
@@ -87,22 +89,44 @@ fn main() -> ExitCode {
             base,
             head,
             format,
-        } => match WorkspaceConfig::load_from_path(&config) {
-            Ok(cfg) => {
-                if cfg.find_service(&repo).is_none() {
-                    eprintln!("Service '{repo}' not found in {}", config.display());
-                    return ExitCode::FAILURE;
+        } => {
+            let started = Instant::now();
+            let req = AnalyzeRequest {
+                config_path: config,
+                target_repo: repo,
+                base_rev: base,
+                head_rev: head,
+            };
+
+            match run_analysis(&req) {
+                Ok(report) => {
+                    let elapsed_ms = started.elapsed().as_millis();
+                    let has_breaking_changes = !report.findings.is_empty();
+
+                    match format {
+                        OutputFormat::Terminal => {
+                            print!("{}", render_terminal(&report, elapsed_ms));
+                        }
+                        OutputFormat::Json => match render_json(&report) {
+                            Ok(json) => println!("{json}"),
+                            Err(err) => {
+                                eprintln!("Failed to serialize JSON report: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        },
+                    }
+
+                    if has_breaking_changes {
+                        ExitCode::from(2)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
                 }
-                println!(
-                    "Loaded config ({} services). Analysis engine for {repo} ({base} -> {head}, format: {format:?}) will be wired in Phase 1.",
-                    cfg.services.len()
-                );
-                ExitCode::SUCCESS
+                Err(err) => {
+                    eprintln!("Analysis error: {err}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(err) => {
-                eprintln!("Failed to load config: {err}");
-                ExitCode::FAILURE
-            }
-        },
+        }
     }
 }

@@ -113,12 +113,21 @@ pub struct UnresolvedCall {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct AnalysisStats {
+    pub repositories: usize,
+    pub files_analyzed: usize,
+    pub graph_nodes: usize,
+    pub graph_edges: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisReport {
     pub schema_version: u32,
     pub target_repo: String,
     pub base_rev: String,
     pub head_rev: String,
+    pub stats: AnalysisStats,
     pub findings: Vec<ImpactFinding>,
     pub unresolved_calls: Vec<UnresolvedCall>,
 }

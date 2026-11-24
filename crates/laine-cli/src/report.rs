@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use laine_core::model::{AnalysisReport, ContractChange};
+use laine_core::model::{AnalysisReport, Confidence, ContractChange, EndpointId, Severity};
 
 pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
     let mut out = String::new();
@@ -248,6 +248,292 @@ pub fn render_json(report: &AnalysisReport) -> Result<String, serde_json::Error>
     serde_json::to_string_pretty(report)
 }
 
+/// Renders a GitHub-flavored Markdown report designed for pull request comments.
+pub fn render_markdown(report: &AnalysisReport) -> String {
+    let mut out = String::new();
+
+    let base_short = short_sha(&report.base_rev);
+    let head_short = short_sha(&report.head_rev);
+    let direct_consumers: usize = report.findings.iter().map(|f| f.consumers.len()).sum();
+    let indirect_consumers: usize = report
+        .findings
+        .iter()
+        .map(|f| f.indirect_consumers.len())
+        .sum();
+
+    let _ = writeln!(out, "## Laine Impact Analysis");
+    let _ = writeln!(out);
+
+    let status_badge = if report.findings.is_empty() {
+        "COMPATIBLE"
+    } else {
+        "BREAKING CHANGES DETECTED"
+    };
+    let _ = writeln!(
+        out,
+        "**Status:** `{status_badge}` | **Target:** `{}` (`{base_short}` -> `{head_short}`)",
+        report.target_repo
+    );
+    let _ = writeln!(
+        out,
+        "**Summary:** {} breaking change(s) | {} direct consumer ref(s) | {} indirect consumer(s) | {} unresolved call(s)",
+        report.findings.len(),
+        direct_consumers,
+        indirect_consumers,
+        report.unresolved_calls.len()
+    );
+    let _ = writeln!(
+        out,
+        "**Analyzed:** {} repos | {} files | {} graph nodes | {} graph edges",
+        report.stats.repositories,
+        report.stats.files_analyzed,
+        report.stats.graph_nodes,
+        report.stats.graph_edges
+    );
+    let _ = writeln!(out);
+
+    if report.findings.is_empty() {
+        let _ = writeln!(out, "No breaking contract changes detected.");
+        let _ = writeln!(out);
+    } else {
+        let _ = writeln!(
+            out,
+            "| ID | Severity | Confidence | Endpoint | Change | Consumers |"
+        );
+        let _ = writeln!(out, "| --- | --- | --- | --- | --- | --- |");
+
+        for finding in &report.findings {
+            let endpoint = change_endpoint(&finding.change);
+            let endpoint_str = format!(
+                "`{} {}`",
+                endpoint.method.as_str(),
+                escape_md_cell(&endpoint.normalized_path)
+            );
+            let change_desc = escape_md_cell(&describe_change(&finding.change));
+            let consumers_summary = if finding.indirect_consumers.is_empty() {
+                format!("{} direct", finding.consumers.len())
+            } else {
+                format!(
+                    "{} direct, {} indirect",
+                    finding.consumers.len(),
+                    finding.indirect_consumers.len()
+                )
+            };
+
+            let _ = writeln!(
+                out,
+                "| `{}` | `{}` | `{}` | {} | {} | {} |",
+                escape_md_cell(&finding.id),
+                severity_label(finding.severity),
+                confidence_label(finding.confidence),
+                endpoint_str,
+                change_desc,
+                consumers_summary
+            );
+        }
+        let _ = writeln!(out);
+
+        for finding in &report.findings {
+            let endpoint = change_endpoint(&finding.change);
+            let change_desc = describe_change(&finding.change);
+            let _ = writeln!(out, "<details>");
+            let _ = writeln!(
+                out,
+                "<summary><strong>{}</strong> [<code>{}</code> | <code>{}</code>] <code>{} {}</code> — {}</summary>",
+                finding.id,
+                severity_label(finding.severity),
+                confidence_label(finding.confidence),
+                endpoint.method.as_str(),
+                endpoint.normalized_path,
+                change_desc
+            );
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "- **Producer:** `{}/{}:{}` (commit `{}`)",
+                finding.producer_evidence.repo,
+                finding.producer_evidence.file,
+                finding.producer_evidence.line,
+                short_sha(&finding.producer_evidence.revision)
+            );
+
+            if finding.consumers.is_empty() {
+                let _ = writeln!(out, "- **Affected consumers:** 0 detected");
+            } else {
+                let _ = writeln!(
+                    out,
+                    "- **Affected consumers ({}):**",
+                    finding.consumers.len()
+                );
+                for consumer in &finding.consumers {
+                    let _ = writeln!(
+                        out,
+                        "  - `{}` [`{}`] — `{}/{}:{}` (commit `{}`)",
+                        consumer.repo,
+                        confidence_label(consumer.confidence),
+                        consumer.evidence.repo,
+                        consumer.evidence.file,
+                        consumer.evidence.line,
+                        short_sha(&consumer.evidence.revision)
+                    );
+                    let _ = writeln!(
+                        out,
+                        "    - Code: `{}`",
+                        escape_inline_code(&consumer.evidence.snippet)
+                    );
+                    let _ = writeln!(
+                        out,
+                        "    - Path: `{}`",
+                        consumer.dependency_path.join(" -> ")
+                    );
+                }
+            }
+
+            if !finding.indirect_consumers.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "- **Indirectly affected consumers ({} `POSSIBLE`):**",
+                    finding.indirect_consumers.len()
+                );
+                for indirect in &finding.indirect_consumers {
+                    let _ = writeln!(
+                        out,
+                        "  - `{}` [`{}`] via `{}` (`{}`)",
+                        indirect.repo,
+                        confidence_label(indirect.confidence),
+                        indirect.via_repo,
+                        indirect.dependency_chain.join(" -> ")
+                    );
+                }
+            }
+
+            let _ = writeln!(out);
+            let _ = writeln!(out, "</details>");
+            let _ = writeln!(out);
+        }
+    }
+
+    if !report.discrepancies.is_empty() {
+        let _ = writeln!(
+            out,
+            "### Contract Discrepancies ({})",
+            report.discrepancies.len()
+        );
+        let _ = writeln!(out);
+        for d in &report.discrepancies {
+            let _ = writeln!(
+                out,
+                "- [`{:?}`] `{} {}` — {}",
+                d.kind,
+                d.endpoint.method.as_str(),
+                d.endpoint.normalized_path,
+                d.detail
+            );
+        }
+        let _ = writeln!(out);
+    }
+
+    if !report.unresolved_calls.is_empty() {
+        let _ = writeln!(
+            out,
+            "### Unresolved Calls (`UNKNOWN`) ({})",
+            report.unresolved_calls.len()
+        );
+        let _ = writeln!(out);
+        for call in &report.unresolved_calls {
+            let _ = writeln!(
+                out,
+                "- `{}/{}:{}` — {} (`{}`)",
+                call.evidence.repo,
+                call.evidence.file,
+                call.evidence.line,
+                call.reason,
+                escape_inline_code(&call.evidence.snippet)
+            );
+        }
+        let _ = writeln!(out);
+    }
+
+    out
+}
+
+fn change_endpoint(change: &ContractChange) -> &EndpointId {
+    match change {
+        ContractChange::EndpointRemoved { endpoint }
+        | ContractChange::ResponseFieldRemoved { endpoint, .. }
+        | ContractChange::ResponseFieldTypeChanged { endpoint, .. }
+        | ContractChange::RequestFieldAddedRequired { endpoint, .. }
+        | ContractChange::RequestFieldTypeChanged { endpoint, .. }
+        | ContractChange::RequiredParameterAdded { endpoint, .. } => endpoint,
+    }
+}
+
+fn describe_change(change: &ContractChange) -> String {
+    match change {
+        ContractChange::EndpointRemoved { .. } => "Removed endpoint".to_string(),
+        ContractChange::ResponseFieldRemoved {
+            status_code,
+            field_path,
+            previous_type,
+            ..
+        } => {
+            format!("Removed response field `{field_path}` ({previous_type}, HTTP {status_code})")
+        }
+        ContractChange::ResponseFieldTypeChanged {
+            status_code,
+            field_path,
+            previous_type,
+            new_type,
+            ..
+        } => format!(
+            "Changed response field `{field_path}` type: {previous_type} -> {new_type} (HTTP {status_code})"
+        ),
+        ContractChange::RequestFieldAddedRequired {
+            field_path,
+            field_type,
+            ..
+        } => format!("Added required request field `{field_path}` ({field_type})"),
+        ContractChange::RequestFieldTypeChanged {
+            field_path,
+            previous_type,
+            new_type,
+            ..
+        } => format!("Changed request field `{field_path}` type: {previous_type} -> {new_type}"),
+        ContractChange::RequiredParameterAdded {
+            location,
+            name,
+            param_type,
+            ..
+        } => format!("Added required {location} parameter `{name}` ({param_type})"),
+    }
+}
+
+fn severity_label(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Low => "LOW",
+        Severity::Medium => "MEDIUM",
+        Severity::High => "HIGH",
+        Severity::Critical => "CRITICAL",
+    }
+}
+
+fn confidence_label(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::Unknown => "UNKNOWN",
+        Confidence::Possible => "POSSIBLE",
+        Confidence::Likely => "LIKELY",
+        Confidence::Confirmed => "CONFIRMED",
+    }
+}
+
+fn escape_md_cell(raw: &str) -> String {
+    raw.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+fn escape_inline_code(raw: &str) -> String {
+    raw.replace('`', "'").replace(['\r', '\n'], " ")
+}
+
 fn short_sha(rev: &str) -> &str {
     rev.get(..7).unwrap_or(rev)
 }
@@ -331,5 +617,122 @@ mod tests {
         assert!(rendered.contains("Added required request field `taxId` (string)"));
         assert!(rendered.contains("Changed request field `amount` type: integer -> string"));
         assert!(rendered.contains("Added required header parameter `X-Tenant-Id` (string)"));
+    }
+
+    #[test]
+    fn renders_markdown_pr_report_with_table_details_indirect_discrepancies_and_unresolved() {
+        use laine_core::model::{
+            AffectedConsumer, ContractDiscrepancy, DiscrepancyKind, IndirectConsumer,
+            UnresolvedCall,
+        };
+
+        let ep = EndpointId {
+            service: "customer-service".into(),
+            method: HttpMethod::Get,
+            normalized_path: "/customers/:id".into(),
+        };
+
+        let report = AnalysisReport {
+            schema_version: 1,
+            target_repo: "customer-service".into(),
+            base_rev: "1111111aaaa".into(),
+            head_rev: "2222222bbbb".into(),
+            stats: AnalysisStats {
+                repositories: 3,
+                files_analyzed: 12,
+                graph_nodes: 20,
+                graph_edges: 25,
+            },
+            findings: vec![ImpactFinding {
+                id: "LAINE-001".into(),
+                change: ContractChange::ResponseFieldRemoved {
+                    endpoint: ep.clone(),
+                    status_code: "200".into(),
+                    field_path: "fullName".into(),
+                    previous_type: "string".into(),
+                },
+                severity: Severity::High,
+                confidence: Confidence::Confirmed,
+                producer_evidence: Evidence {
+                    repo: "customer-service".into(),
+                    revision: "2222222bbbb".into(),
+                    file: "openapi.yaml".into(),
+                    line: 14,
+                    snippet: "field `fullName`".into(),
+                },
+                consumers: vec![AffectedConsumer {
+                    repo: "billing-service".into(),
+                    evidence: Evidence {
+                        repo: "billing-service".into(),
+                        revision: "3333333cccc".into(),
+                        file: "src/invoice.ts".into(),
+                        line: 9,
+                        snippet: "return c.fullName;".into(),
+                    },
+                    confidence: Confidence::Confirmed,
+                    dependency_path: vec![
+                        "GET /customers/:id".into(),
+                        "HTTP call @ billing-service/src/invoice.ts:7".into(),
+                        "read `fullName` @ billing-service/src/invoice.ts:9".into(),
+                    ],
+                }],
+                indirect_consumers: vec![IndirectConsumer {
+                    repo: "accounting-service".into(),
+                    confidence: Confidence::Possible,
+                    via_repo: "billing-service".into(),
+                    dependency_chain: vec!["billing-service".into(), "accounting-service".into()],
+                }],
+            }],
+            unresolved_calls: vec![UnresolvedCall {
+                repo: "billing-service".into(),
+                evidence: Evidence {
+                    repo: "billing-service".into(),
+                    revision: "3333333cccc".into(),
+                    file: "src/legacy.ts".into(),
+                    line: 22,
+                    snippet: "fetch(dynamicUrl)".into(),
+                },
+                reason: "dynamic URL cannot be resolved statically".into(),
+            }],
+            discrepancies: vec![ContractDiscrepancy {
+                endpoint: ep,
+                kind: DiscrepancyKind::UndocumentedInOpenApi,
+                detail: "Route exposed in routes/api.php:10 is missing from OpenAPI".into(),
+            }],
+        };
+
+        let md = render_markdown(&report);
+        assert!(md.contains("## Laine Impact Analysis"));
+        assert!(md.contains("| ID | Severity | Confidence | Endpoint | Change | Consumers |"));
+        assert!(md.contains("| `LAINE-001` | `HIGH` | `CONFIRMED` | `GET /customers/:id` |"));
+        assert!(md.contains("1 direct, 1 indirect"));
+        assert!(md.contains("<details>"));
+        assert!(md.contains("billing-service/src/invoice.ts:9"));
+        assert!(md.contains("return c.fullName;"));
+        assert!(md.contains("accounting-service"));
+        assert!(md.contains("POSSIBLE"));
+        assert!(md.contains("### Contract Discrepancies (1)"));
+        assert!(md.contains("### Unresolved Calls (`UNKNOWN`) (1)"));
+        assert!(md.contains("billing-service/src/legacy.ts:22"));
+    }
+
+    #[test]
+    fn renders_markdown_for_compatible_report() {
+        let report = AnalysisReport {
+            schema_version: 1,
+            target_repo: "customer-service".into(),
+            base_rev: "1111111".into(),
+            head_rev: "2222222".into(),
+            stats: AnalysisStats::default(),
+            findings: Vec::new(),
+            unresolved_calls: Vec::new(),
+            discrepancies: Vec::new(),
+        };
+
+        let md = render_markdown(&report);
+        assert!(md.contains("## Laine Impact Analysis"));
+        assert!(md.contains("COMPATIBLE"));
+        assert!(md.contains("No breaking contract changes detected."));
+        assert!(!md.contains("<details>"));
     }
 }

@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod config;
 pub mod error;
 pub mod fixtures;
@@ -7,4 +8,5 @@ pub mod impact;
 pub mod laravel;
 pub mod model;
 pub mod openapi;
+pub mod policy;
 pub mod routes;

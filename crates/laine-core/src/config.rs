@@ -5,6 +5,50 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LaineError, Result};
+use crate::model::Severity;
+
+fn default_fail_on() -> Severity {
+    Severity::Low
+}
+
+fn deserialize_severity<'de, D>(deserializer: D) -> std::result::Result<Severity, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => Ok(Severity::Low),
+        "medium" => Ok(Severity::Medium),
+        "high" => Ok(Severity::High),
+        "critical" => Ok(Severity::Critical),
+        other => Err(serde::de::Error::custom(format!(
+            "invalid severity '{other}' (expected one of: low, medium, high, critical)"
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PolicyConfig {
+    /// Minimum finding severity that causes `laine analyze` to fail (exit code 2).
+    #[serde(default = "default_fail_on", deserialize_with = "deserialize_severity")]
+    pub fail_on: Severity,
+    /// Normalized paths or canonical keys to ignore (e.g. `"/health"`, `"/internal/*"`).
+    #[serde(default)]
+    pub ignore_endpoints: Vec<String>,
+    /// When true, any unresolved (`UNKNOWN`) HTTP call also triggers a policy failure.
+    #[serde(default)]
+    pub fail_on_unresolved: bool,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            fail_on: Severity::Low,
+            ignore_endpoints: Vec::new(),
+            fail_on_unresolved: false,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkspaceConfig {
@@ -17,6 +61,12 @@ pub struct WorkspaceConfig {
     /// Optional environment variable values for resolving `process.env.X` / `import.meta.env.X`.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// Policy rules controlling ignored endpoints and failure thresholds.
+    #[serde(default)]
+    pub policy: PolicyConfig,
+    /// Optional path to the SQLite incremental extraction cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,5 +209,33 @@ path_prefix = "/api"
         assert_eq!(cfg.clients[0].callee, "getClient().fetch");
         assert_eq!(cfg.clients[0].target_service, "customer-service");
         assert_eq!(cfg.clients[0].path_prefix.as_deref(), Some("/api"));
+    }
+
+    #[test]
+    fn parses_policy_and_cache_path_with_case_insensitive_severity() {
+        let raw = r#"
+version = 1
+cache_path = ".cache/laine.sqlite"
+
+[policy]
+fail_on = "critical"
+ignore_endpoints = ["/health", "/internal/*"]
+fail_on_unresolved = true
+"#;
+        let cfg = WorkspaceConfig::parse_toml(raw).expect("policy config should parse");
+        assert_eq!(cfg.cache_path, Some(PathBuf::from(".cache/laine.sqlite")));
+        assert_eq!(cfg.policy.fail_on, Severity::Critical);
+        assert_eq!(
+            cfg.policy.ignore_endpoints,
+            vec!["/health".to_string(), "/internal/*".to_string()]
+        );
+        assert!(cfg.policy.fail_on_unresolved);
+
+        // Defaults preserve backwards compatibility when `[policy]` is omitted.
+        let minimal = WorkspaceConfig::parse_toml("version = 1\n").unwrap();
+        assert_eq!(minimal.policy, PolicyConfig::default());
+        assert_eq!(minimal.policy.fail_on, Severity::Low);
+        assert!(!minimal.policy.fail_on_unresolved);
+        assert!(minimal.cache_path.is_none());
     }
 }

@@ -1,14 +1,14 @@
 [package]
-name = "faultline-cli"
+name = "laine-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "faultline"
+name = "laine"
 path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
-faultline-core = { path = "../faultline-core" }
+laine-core = { path = "../laine-core" }

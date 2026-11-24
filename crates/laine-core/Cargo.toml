@@ -1,5 +1,5 @@
 [package]
-name = "faultline-core"
+name = "laine-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

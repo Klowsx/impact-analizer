@@ -2,7 +2,7 @@
 /target
 **/*.rs.bk
 
-# Generated demo git repositories (reproducible via `faultline demo-setup`)
+# Generated demo git repositories (reproducible via `laine demo-setup`)
 /fixtures/demo-workspace/
 
 # Local SQLite databases

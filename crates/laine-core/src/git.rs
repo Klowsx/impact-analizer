@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::error::{FaultlineError, Result};
+use crate::error::{LaineError, Result};
 
 /// Read-only view into a local Git repository.
 ///
@@ -53,13 +53,13 @@ impl GitRepo {
             .current_dir(&self.root)
             .args(args)
             .output()
-            .map_err(|source| FaultlineError::Io {
+            .map_err(|source| LaineError::Io {
                 path: self.root.clone(),
                 source,
             })?;
 
         if !output.status.success() {
-            return Err(FaultlineError::Git {
+            return Err(LaineError::Git {
                 command: format!("git {}", args.join(" ")),
                 message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
             });
@@ -83,7 +83,7 @@ mod tests {
 
     #[test]
     fn reads_base_and_head_snapshots_without_touching_working_tree() {
-        let tmp = std::env::temp_dir().join(format!("faultline-git-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("laine-git-test-{}", std::process::id()));
         let paths = create_demo_workspace(&tmp).expect("demo workspace should generate");
 
         let repo = GitRepo::new(&paths.customer_service);
@@ -117,15 +117,14 @@ mod tests {
 
     #[test]
     fn rejects_nonexistent_revision() {
-        let tmp =
-            std::env::temp_dir().join(format!("faultline-git-err-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("laine-git-err-test-{}", std::process::id()));
         let paths = create_demo_workspace(&tmp).expect("demo workspace should generate");
 
         let repo = GitRepo::new(&paths.customer_service);
         let err = repo
             .resolve_revision("branch-that-does-not-exist")
             .unwrap_err();
-        assert!(matches!(err, FaultlineError::Git { .. }));
+        assert!(matches!(err, LaineError::Git { .. }));
 
         let _ = fs::remove_dir_all(&tmp);
     }

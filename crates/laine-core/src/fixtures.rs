@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::error::{FaultlineError, Result};
+use crate::error::{LaineError, Result};
 
 const FIXTURE_DATE: &str = "2026-01-15T12:00:00Z";
 const FIXTURE_DATE_V2: &str = "2026-01-16T12:00:00Z";
@@ -21,12 +21,12 @@ pub struct DemoWorkspacePaths {
 /// Safe to re-run: removes an existing directory at `root` before regenerating.
 pub fn create_demo_workspace(root: &Path) -> Result<DemoWorkspacePaths> {
     if root.exists() {
-        fs::remove_dir_all(root).map_err(|source| FaultlineError::Io {
+        fs::remove_dir_all(root).map_err(|source| LaineError::Io {
             path: root.to_path_buf(),
             source,
         })?;
     }
-    fs::create_dir_all(root).map_err(|source| FaultlineError::Io {
+    fs::create_dir_all(root).map_err(|source| LaineError::Io {
         path: root.to_path_buf(),
         source,
     })?;
@@ -41,7 +41,7 @@ pub fn create_demo_workspace(root: &Path) -> Result<DemoWorkspacePaths> {
     build_notification_service(&notification)?;
     build_shipping_service(&shipping)?;
 
-    let config_path = root.join("faultline.toml");
+    let config_path = root.join("laine.toml");
     let config_toml = r#"version = 1
 
 [[services]]
@@ -275,13 +275,13 @@ fn build_shipping_service(dir: &Path) -> Result<()> {
 }
 
 fn init_repo(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).map_err(|source| FaultlineError::Io {
+    fs::create_dir_all(dir).map_err(|source| LaineError::Io {
         path: dir.to_path_buf(),
         source,
     })?;
     run_git(dir, &["init", "-b", "main"])?;
-    run_git(dir, &["config", "user.name", "Faultline Fixture"])?;
-    run_git(dir, &["config", "user.email", "fixture@faultline.local"])?;
+    run_git(dir, &["config", "user.name", "Laine Fixture"])?;
+    run_git(dir, &["config", "user.email", "fixture@laine.local"])?;
     Ok(())
 }
 
@@ -293,13 +293,13 @@ fn commit_all(dir: &Path, message: &str, date: &str) -> Result<()> {
         .env("GIT_AUTHOR_DATE", date)
         .env("GIT_COMMITTER_DATE", date)
         .output()
-        .map_err(|source| FaultlineError::Io {
+        .map_err(|source| LaineError::Io {
             path: dir.to_path_buf(),
             source,
         })?;
 
     if !output.status.success() {
-        return Err(FaultlineError::Git {
+        return Err(LaineError::Git {
             command: format!("git commit -m {message:?}"),
             message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
@@ -312,13 +312,13 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
         .current_dir(dir)
         .args(args)
         .output()
-        .map_err(|source| FaultlineError::Io {
+        .map_err(|source| LaineError::Io {
             path: dir.to_path_buf(),
             source,
         })?;
 
     if !output.status.success() {
-        return Err(FaultlineError::Git {
+        return Err(LaineError::Git {
             command: format!("git {}", args.join(" ")),
             message: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         });
@@ -328,12 +328,12 @@ fn run_git(dir: &Path, args: &[&str]) -> Result<String> {
 
 fn write_file(path: &Path, content: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| FaultlineError::Io {
+        fs::create_dir_all(parent).map_err(|source| LaineError::Io {
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    fs::write(path, content).map_err(|source| FaultlineError::Io {
+    fs::write(path, content).map_err(|source| LaineError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -346,12 +346,11 @@ mod tests {
 
     #[test]
     fn generates_four_reproducible_git_repos_and_valid_config() {
-        let tmp =
-            std::env::temp_dir().join(format!("faultline-fixture-test-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("laine-fixture-test-{}", std::process::id()));
 
         let paths = create_demo_workspace(&tmp).expect("demo workspace should generate");
         let cfg = WorkspaceConfig::load_from_path(&paths.config_path)
-            .expect("generated faultline.toml should parse");
+            .expect("generated laine.toml should parse");
 
         assert_eq!(cfg.services.len(), 4);
         assert!(paths.customer_service.join(".git").exists());

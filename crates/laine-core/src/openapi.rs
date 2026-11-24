@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::{FaultlineError, Result};
+use crate::error::{LaineError, Result};
 use crate::model::{ContractChange, EndpointId, HttpMethod};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,12 +71,12 @@ pub fn canonical_route_key(normalized_path: &str) -> String {
 /// Parses an OpenAPI 3.0/3.1 document (YAML or JSON) and extracts its endpoints and JSON response fields.
 pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
     let root: Value = serde_yaml_ng::from_str(raw_spec)
-        .map_err(|err| FaultlineError::OpenApiParse(err.to_string()))?;
+        .map_err(|err| LaineError::OpenApiParse(err.to_string()))?;
 
     let paths_obj = root
         .get("paths")
         .and_then(Value::as_object)
-        .ok_or_else(|| FaultlineError::OpenApiParse("missing top-level `paths` object".into()))?;
+        .ok_or_else(|| LaineError::OpenApiParse("missing top-level `paths` object".into()))?;
 
     let mut endpoints = BTreeMap::new();
 
@@ -437,7 +437,7 @@ components:
     #[test]
     fn detects_fullname_removal_across_real_git_commits_in_demo_fixture() {
         let tmp =
-            std::env::temp_dir().join(format!("faultline-openapi-git-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("laine-openapi-git-test-{}", std::process::id()));
         let paths = create_demo_workspace(&tmp).expect("demo workspace should generate");
 
         let repo = GitRepo::new(&paths.customer_service);

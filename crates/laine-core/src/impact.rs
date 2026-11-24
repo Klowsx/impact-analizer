@@ -1,7 +1,7 @@
 use crate::graph::DependencyGraph;
 use crate::model::{
-    AffectedConsumer, AnalysisReport, AnalysisStats, Confidence, ContractChange, Evidence,
-    ImpactFinding, Severity, UnresolvedCall,
+    AffectedConsumer, AnalysisReport, AnalysisStats, Confidence, ContractChange,
+    ContractDiscrepancy, Evidence, ImpactFinding, Severity, UnresolvedCall,
 };
 use crate::openapi::find_field_line;
 
@@ -9,10 +9,11 @@ pub struct ImpactInput<'a> {
     pub target_repo: &'a str,
     pub base_rev: &'a str,
     pub head_rev: &'a str,
-    pub openapi_file: &'a str,
-    pub base_openapi_raw: &'a str,
+    pub source_file: &'a str,
+    pub base_source_raw: &'a str,
     pub changes: Vec<ContractChange>,
     pub unresolved_calls: Vec<UnresolvedCall>,
+    pub discrepancies: Vec<ContractDiscrepancy>,
     pub stats: AnalysisStats,
 }
 
@@ -24,7 +25,7 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
     for (idx, change) in input.changes.into_iter().enumerate() {
         let (producer_line, producer_snippet, consumers) = match &change {
             ContractChange::EndpointRemoved { endpoint } => {
-                let line = find_field_line(input.base_openapi_raw, &endpoint.normalized_path);
+                let line = find_field_line(input.base_source_raw, &endpoint.normalized_path);
                 let hits = graph.consumers_of_endpoint(
                     &endpoint.service,
                     endpoint.method,
@@ -68,7 +69,7 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                 field_path,
                 ..
             } => {
-                let line = find_field_line(input.base_openapi_raw, field_path);
+                let line = find_field_line(input.base_source_raw, field_path);
                 let hits = graph.consumers_of_field(
                     &endpoint.service,
                     endpoint.method,
@@ -115,7 +116,7 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
             producer_evidence: Evidence {
                 repo: input.target_repo.to_string(),
                 revision: input.head_rev.to_string(),
-                file: input.openapi_file.to_string(),
+                file: input.source_file.to_string(),
                 line: producer_line,
                 snippet: producer_snippet,
             },
@@ -141,5 +142,6 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
         stats: input.stats,
         findings,
         unresolved_calls,
+        discrepancies: input.discrepancies,
     }
 }

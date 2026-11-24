@@ -1109,6 +1109,7 @@ mod tests {
             name: "customer-service".into(),
             path: PathBuf::from("./customer-service"),
             openapi: Some(PathBuf::from("openapi.yaml")),
+            routes: None,
             base_urls: vec!["http://customer-service".into()],
         }]
     }

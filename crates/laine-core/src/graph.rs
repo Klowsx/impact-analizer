@@ -337,23 +337,35 @@ impl DependencyGraph {
 
     /// Performs a cycle-safe BFS to discover all repositories transitively depending on `target_repo`.
     pub fn transitive_dependent_repos(&self, target_repo: &str) -> Vec<String> {
+        self.transitive_dependent_paths(target_repo)
+            .into_iter()
+            .map(|(repo, _)| repo)
+            .collect()
+    }
+
+    /// Performs a cycle-safe BFS from `start_repo`, returning `(downstream_repo, path_from_start)`
+    /// sorted deterministically by repository name.
+    pub fn transitive_dependent_paths(&self, start_repo: &str) -> Vec<(String, Vec<String>)> {
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
-        let mut dependents = BTreeSet::new();
+        let mut results: Vec<(String, Vec<String>)> = Vec::new();
 
-        visited.insert(target_repo.to_string());
-        queue.push_back(target_repo.to_string());
+        visited.insert(start_repo.to_string());
+        queue.push_back((start_repo.to_string(), vec![start_repo.to_string()]));
 
-        while let Some(current_repo) = queue.pop_front() {
+        while let Some((current_repo, path)) = queue.pop_front() {
             for direct in self.direct_dependent_repos(&current_repo) {
                 if visited.insert(direct.clone()) {
-                    dependents.insert(direct.clone());
-                    queue.push_back(direct);
+                    let mut next_path = path.clone();
+                    next_path.push(direct.clone());
+                    results.push((direct.clone(), next_path.clone()));
+                    queue.push_back((direct, next_path));
                 }
             }
         }
 
-        dependents.into_iter().collect()
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results
     }
 
     fn direct_dependent_repos(&self, service: &str) -> BTreeSet<String> {

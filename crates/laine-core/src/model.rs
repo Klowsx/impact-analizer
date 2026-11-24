@@ -97,6 +97,14 @@ pub struct AffectedConsumer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndirectConsumer {
+    pub repo: String,
+    pub confidence: Confidence,
+    pub via_repo: String,
+    pub dependency_chain: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactFinding {
     pub id: String,
     pub change: ContractChange,
@@ -104,6 +112,8 @@ pub struct ImpactFinding {
     pub confidence: Confidence,
     pub producer_evidence: Evidence,
     pub consumers: Vec<AffectedConsumer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indirect_consumers: Vec<IndirectConsumer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

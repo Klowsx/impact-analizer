@@ -5,8 +5,9 @@ use laine_core::config::{CustomClientConfig, ServiceConfig};
 use laine_core::model::HttpMethod;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    Argument, BindingPattern, CallExpression, ChainElement, Expression, Function,
-    ObjectPropertyKind, Program, PropertyKey, TemplateLiteral, VariableDeclarator,
+    Argument, AssignmentExpression, AssignmentOperator, AssignmentTarget, BindingPattern,
+    CallExpression, ChainElement, Expression, Function, ObjectPropertyKind, Program, PropertyKey,
+    Statement, TSTypeAnnotation, TemplateLiteral, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -15,7 +16,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::url::{is_absolute_http_url, normalize_relative_path, resolve_url_against_services};
-use crate::vue::extract_vue_scripts;
+use crate::vue::{extract_vue_scripts_with_setup, extract_vue_template_expressions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -96,19 +97,21 @@ pub fn extract_file_with_context(
     ctx: ExtractContext<'_>,
 ) -> Result<FileExtraction, Vec<String>> {
     if file_path.to_ascii_lowercase().ends_with(".vue") {
-        let blocks = extract_vue_scripts(source);
+        let blocks = extract_vue_scripts_with_setup(source);
         let mut merged = FileExtraction {
             file_path: file_path.to_string(),
             ..Default::default()
         };
+        let mut template_bindings: HashMap<String, VarBinding> = HashMap::new();
 
-        for block in blocks {
+        for (block, is_setup) in blocks {
             let source_type = if block.is_ts {
-                SourceType::ts()
+                SourceType::ts().with_module(true)
             } else {
                 SourceType::mjs()
             };
-            let extracted = extract_source_block(file_path, &block.code, source_type, ctx)?;
+            let (extracted, top_bindings) =
+                extract_source_block_with_bindings(file_path, &block.code, source_type, ctx)?;
             let call_offset = merged.calls.len();
 
             for mut call in extracted.calls {
@@ -120,6 +123,28 @@ pub fn extract_file_with_context(
                 merged.field_reads.push(read);
             }
             merged.unresolved_calls.extend(extracted.unresolved_calls);
+
+            if is_setup {
+                for (name, binding) in top_bindings {
+                    if binding.is_template_trackable() {
+                        template_bindings.insert(name, binding.with_call_offset(call_offset));
+                    }
+                }
+            }
+        }
+
+        if !template_bindings.is_empty() {
+            let mut seen_reads: HashSet<(usize, String, usize)> = merged
+                .field_reads
+                .iter()
+                .map(|r| (r.call_id, r.field_path.clone(), r.line))
+                .collect();
+            scan_vue_template_reads(
+                source,
+                &template_bindings,
+                &mut seen_reads,
+                &mut merged.field_reads,
+            );
         }
 
         return Ok(merged);
@@ -127,15 +152,16 @@ pub fn extract_file_with_context(
 
     let source_type =
         SourceType::from_path(Path::new(file_path)).unwrap_or_else(|_| SourceType::ts());
-    extract_source_block(file_path, source, source_type, ctx)
+    let (extracted, _) = extract_source_block_with_bindings(file_path, source, source_type, ctx)?;
+    Ok(extracted)
 }
 
-fn extract_source_block(
+fn extract_source_block_with_bindings(
     file_path: &str,
     source: &str,
     source_type: SourceType,
     ctx: ExtractContext<'_>,
-) -> Result<FileExtraction, Vec<String>> {
+) -> Result<(FileExtraction, HashMap<String, VarBinding>), Vec<String>> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
 
@@ -159,16 +185,171 @@ fn extract_source_block(
     let helper_reads = collect_local_helper_reads(&parsed.program);
     let mut extractor = FileExtractor::new(file_path, source, ctx, helper_reads);
     extractor.visit_program(&parsed.program);
-    Ok(extractor.finish())
+    Ok(extractor.finish_with_top_bindings())
+}
+
+fn scan_vue_template_reads(
+    source: &str,
+    bindings: &HashMap<String, VarBinding>,
+    seen_reads: &mut HashSet<(usize, String, usize)>,
+    field_reads: &mut Vec<ExtractedFieldRead>,
+) {
+    let template_exprs = extract_vue_template_expressions(source);
+    for tpl_expr in template_exprs {
+        let allocator = Allocator::default();
+        let Ok(parsed_expr) =
+            Parser::new(&allocator, &tpl_expr.expr, SourceType::ts()).parse_expression()
+        else {
+            continue;
+        };
+
+        let mut scanner = TemplateExprScanner {
+            bindings,
+            line: tpl_expr.line,
+            snippet: &tpl_expr.snippet,
+            seen_member_spans: HashSet::new(),
+            seen_reads,
+            field_reads,
+        };
+        scanner.visit_expression(&parsed_expr);
+    }
+}
+
+struct TemplateExprScanner<'a> {
+    bindings: &'a HashMap<String, VarBinding>,
+    line: usize,
+    snippet: &'a str,
+    seen_member_spans: HashSet<u32>,
+    seen_reads: &'a mut HashSet<(usize, String, usize)>,
+    field_reads: &'a mut Vec<ExtractedFieldRead>,
+}
+
+impl TemplateExprScanner<'_> {
+    fn inspect_member_chain(&mut self, expr: &Expression<'_>) {
+        let span = expr.span();
+        if self.seen_member_spans.contains(&span.start) {
+            return;
+        }
+        let Some((root_name, segments)) = extract_member_chain(expr) else {
+            return;
+        };
+        self.seen_member_spans.insert(span.start);
+        mark_inner_member_spans(expr, &mut self.seen_member_spans);
+
+        let Some(root_binding) = self.bindings.get(&root_name) else {
+            return;
+        };
+
+        match root_binding {
+            VarBinding::JsonPayload {
+                call_id, prefix, ..
+            } => {
+                let full_path = join_field_path(prefix, &segments);
+                self.record_field_read(*call_id, full_path);
+            }
+            VarBinding::AxiosResponse { call_id, .. } | VarBinding::UseFetchResponse(call_id)
+                if segments.first().map(String::as_str) == Some("data") && segments.len() > 1 =>
+            {
+                let full_path = segments[1..].join(".");
+                self.record_field_read(*call_id, full_path);
+            }
+            _ => {}
+        }
+    }
+
+    fn record_field_read(&mut self, call_id: usize, field_path: String) {
+        if field_path.is_empty() {
+            return;
+        }
+        if self
+            .seen_reads
+            .insert((call_id, field_path.clone(), self.line))
+        {
+            self.field_reads.push(ExtractedFieldRead {
+                call_id,
+                field_path,
+                line: self.line,
+                snippet: self.snippet.to_string(),
+            });
+        }
+    }
+}
+
+impl<'a> Visit<'a> for TemplateExprScanner<'_> {
+    fn visit_expression(&mut self, expr: &Expression<'a>) {
+        if matches!(
+            expr,
+            Expression::StaticMemberExpression(_) | Expression::ChainExpression(_)
+        ) {
+            self.inspect_member_chain(expr);
+        }
+        walk::walk_expression(self, expr);
+    }
 }
 
 #[derive(Debug, Clone)]
 enum VarBinding {
+    Unassigned,
+    VueRefEmpty {
+        declared_type: Option<String>,
+    },
     StringLiteral(String),
-    HttpClientInstance { base_url: String },
-    FetchResponse(usize),
-    AxiosResponse(usize),
-    JsonPayload { call_id: usize, prefix: String },
+    HttpClientInstance {
+        base_url: String,
+    },
+    FetchResponse {
+        call_id: usize,
+        is_vue_ref: bool,
+    },
+    AxiosResponse {
+        call_id: usize,
+        is_vue_ref: bool,
+    },
+    UseFetchResponse(usize),
+    JsonPayload {
+        call_id: usize,
+        prefix: String,
+        is_vue_ref: bool,
+    },
+}
+
+impl VarBinding {
+    fn is_template_trackable(&self) -> bool {
+        matches!(
+            self,
+            Self::JsonPayload { .. } | Self::AxiosResponse { .. } | Self::UseFetchResponse(_)
+        )
+    }
+
+    fn with_call_offset(self, offset: usize) -> Self {
+        match self {
+            Self::FetchResponse {
+                call_id,
+                is_vue_ref,
+            } => Self::FetchResponse {
+                call_id: call_id + offset,
+                is_vue_ref,
+            },
+            Self::AxiosResponse {
+                call_id,
+                is_vue_ref,
+            } => Self::AxiosResponse {
+                call_id: call_id + offset,
+                is_vue_ref,
+            },
+            Self::UseFetchResponse(call_id) => Self::UseFetchResponse(call_id + offset),
+            Self::JsonPayload {
+                call_id,
+                prefix,
+                is_vue_ref,
+            } => Self::JsonPayload {
+                call_id: call_id + offset,
+                prefix,
+                is_vue_ref,
+            },
+            other => other,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +361,7 @@ enum UrlEval {
 #[derive(Debug, Clone)]
 enum CallTarget {
     Fetch(HttpMethod),
+    UseFetch(HttpMethod),
     Axios(HttpMethod),
     AxiosInstance {
         base_url: String,
@@ -189,7 +371,16 @@ enum CallTarget {
         target_service: String,
         path_prefix: Option<String>,
         method: HttpMethod,
+        is_use_fetch: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CallResultShape {
+    FetchResponse,
+    AxiosResponse,
+    UseFetchResponse,
+    JsonPayload,
 }
 
 #[derive(Debug, Clone)]
@@ -364,6 +555,7 @@ struct FileExtractor<'s> {
     ctx: ExtractContext<'s>,
     helper_reads: HashMap<String, Vec<HelperParamRead>>,
     scopes: Vec<HashMap<String, VarBinding>>,
+    return_type_stack: Vec<Option<String>>,
     calls: Vec<ExtractedHttpCall>,
     field_reads: Vec<ExtractedFieldRead>,
     unresolved_calls: Vec<ExtractedUnresolvedCall>,
@@ -386,6 +578,7 @@ impl<'s> FileExtractor<'s> {
             ctx,
             helper_reads,
             scopes: vec![HashMap::new()],
+            return_type_stack: Vec::new(),
             calls: Vec::new(),
             field_reads: Vec::new(),
             unresolved_calls: Vec::new(),
@@ -395,13 +588,15 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
-    fn finish(self) -> FileExtraction {
-        FileExtraction {
+    fn finish_with_top_bindings(mut self) -> (FileExtraction, HashMap<String, VarBinding>) {
+        let top_bindings = self.scopes.drain(..).next().unwrap_or_default();
+        let extraction = FileExtraction {
             file_path: self.file_path,
             calls: self.calls,
             field_reads: self.field_reads,
             unresolved_calls: self.unresolved_calls,
-        }
+        };
+        (extraction, top_bindings)
     }
 
     fn push_scope(&mut self) {
@@ -420,8 +615,120 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
+    fn update_or_bind_var(&mut self, name: &str, binding: VarBinding) {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(slot) = scope.get_mut(name) {
+                *slot = binding;
+                return;
+            }
+        }
+        self.bind_var(name, binding);
+    }
+
     fn lookup_var(&self, name: &str) -> Option<&VarBinding> {
         self.scopes.iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn current_return_type(&self) -> Option<String> {
+        self.return_type_stack.last().and_then(Clone::clone)
+    }
+
+    fn extract_fn_return_type(&self, return_type: Option<&TSTypeAnnotation<'_>>) -> Option<String> {
+        let ann = return_type?;
+        let span = ann.type_annotation.span();
+        let raw = self.source.get(span.start as usize..span.end as usize)?;
+        let normalized = normalize_type_expr(raw);
+        let unwrapped = strip_outer_promise(&normalized);
+        if is_non_dto_return_type(unwrapped) {
+            None
+        } else {
+            Some(unwrapped.to_string())
+        }
+    }
+
+    fn extract_vue_ref_type(&self, call: &CallExpression<'_>) -> Option<String> {
+        let raw = self.extract_response_type(call)?;
+        let unwrapped = strip_outer_promise(&raw);
+        if is_non_dto_return_type(unwrapped) {
+            None
+        } else {
+            Some(unwrapped.to_string())
+        }
+    }
+
+    fn maybe_backfill_call_response_type(&mut self, call_id: usize, declared_type: Option<String>) {
+        let Some(ty) = declared_type else {
+            return;
+        };
+        if let Some(call) = self.calls.get_mut(call_id)
+            && call.response_type.is_none()
+        {
+            call.response_type = Some(ty);
+        }
+    }
+
+    fn apply_ref_assignment_binding(
+        &mut self,
+        target_name: &str,
+        is_vue_ref_assign: bool,
+        binding: VarBinding,
+    ) -> VarBinding {
+        if let Some(VarBinding::VueRefEmpty {
+            declared_type: Some(ty),
+        }) = self.lookup_var(target_name).cloned()
+            && let VarBinding::JsonPayload {
+                call_id,
+                ref prefix,
+                ..
+            } = binding
+            && prefix.is_empty()
+        {
+            self.maybe_backfill_call_response_type(call_id, Some(ty));
+        }
+
+        if is_vue_ref_assign {
+            match binding {
+                VarBinding::JsonPayload {
+                    call_id, prefix, ..
+                } => VarBinding::JsonPayload {
+                    call_id,
+                    prefix,
+                    is_vue_ref: true,
+                },
+                VarBinding::AxiosResponse { call_id, .. } => VarBinding::AxiosResponse {
+                    call_id,
+                    is_vue_ref: true,
+                },
+                VarBinding::FetchResponse { call_id, .. } => VarBinding::FetchResponse {
+                    call_id,
+                    is_vue_ref: true,
+                },
+                other => other,
+            }
+        } else {
+            binding
+        }
+    }
+
+    fn register_unassigned_pattern(&mut self, pattern: &BindingPattern<'_>) {
+        match pattern {
+            BindingPattern::BindingIdentifier(ident) => {
+                self.bind_var(ident.name.as_str(), VarBinding::Unassigned);
+            }
+            BindingPattern::ObjectPattern(obj_pat) => {
+                for prop in &obj_pat.properties {
+                    self.register_unassigned_pattern(&prop.value);
+                }
+            }
+            BindingPattern::AssignmentPattern(assign) => {
+                self.register_unassigned_pattern(&assign.left);
+            }
+            BindingPattern::ArrayPattern(arr_pat) => {
+                for elem in arr_pat.elements.iter().flatten() {
+                    self.register_unassigned_pattern(elem);
+                }
+            }
+        }
     }
 
     fn location(&self, span: Span) -> (usize, String) {
@@ -450,7 +757,7 @@ impl<'s> FileExtractor<'s> {
         let first = type_args.params.first()?;
         let span = first.span();
         let raw = self.source.get(span.start as usize..span.end as usize)?;
-        let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = normalize_type_expr(raw);
         if normalized.is_empty() {
             None
         } else {
@@ -495,18 +802,20 @@ impl<'s> FileExtractor<'s> {
                         target_service: client.target_service.clone(),
                         path_prefix: client.path_prefix.clone(),
                         method,
+                        is_use_fetch: is_use_fetch_callee(&callee_str),
                     });
                 }
 
                 if let Some(rest) = callee_str.strip_prefix(&client.callee)
                     && let Some(method_name) = rest.strip_prefix('.')
                 {
-                    if method_name == "fetch" {
+                    if method_name == "fetch" || is_use_fetch_callee(method_name) {
                         let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
                         return Some(CallTarget::Custom {
                             target_service: client.target_service.clone(),
                             path_prefix: client.path_prefix.clone(),
                             method,
+                            is_use_fetch: is_use_fetch_callee(method_name),
                         });
                     }
                     if let Some(method) = HttpMethod::parse(method_name) {
@@ -514,17 +823,24 @@ impl<'s> FileExtractor<'s> {
                             target_service: client.target_service.clone(),
                             path_prefix: client.path_prefix.clone(),
                             method,
+                            is_use_fetch: false,
                         });
                     }
                 }
             }
         }
 
-        // 2. Built-in `fetch`, `axios.<method>`, and local `axios.create(...)` instances.
+        // 2. Built-in `fetch`, `useFetch` / `useLazyFetch`, `axios.<method>`, and local `axios.create(...)` instances.
         match unwrap_expr(&call.callee) {
             Expression::Identifier(ident) if ident.name == "fetch" => {
                 let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
                 Some(CallTarget::Fetch(method))
+            }
+            Expression::Identifier(ident)
+                if ident.name == "useFetch" || ident.name == "useLazyFetch" =>
+            {
+                let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+                Some(CallTarget::UseFetch(method))
             }
             Expression::StaticMemberExpression(member) => {
                 let Expression::Identifier(obj) = unwrap_expr(&member.object) else {
@@ -548,22 +864,39 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
-    fn process_http_call(&mut self, call: &CallExpression<'_>) -> Option<(HttpClientKind, usize)> {
+    fn process_http_call(&mut self, call: &CallExpression<'_>) -> Option<(CallResultShape, usize)> {
         let target = self.classify_http_call(call)?;
         if !self.seen_call_spans.insert(call.span.start) {
             return None;
         }
 
-        let (client_kind, method) = match &target {
-            CallTarget::Fetch(m) => (HttpClientKind::Fetch, *m),
-            CallTarget::Axios(m) | CallTarget::AxiosInstance { method: m, .. } => {
-                (HttpClientKind::Axios, *m)
+        let (client_kind, method, result_shape) = match &target {
+            CallTarget::Fetch(m) => (HttpClientKind::Fetch, *m, CallResultShape::FetchResponse),
+            CallTarget::UseFetch(m) => {
+                (HttpClientKind::Fetch, *m, CallResultShape::UseFetchResponse)
             }
-            CallTarget::Custom { method: m, .. } => (HttpClientKind::Custom, *m),
+            CallTarget::Axios(m) | CallTarget::AxiosInstance { method: m, .. } => {
+                (HttpClientKind::Axios, *m, CallResultShape::AxiosResponse)
+            }
+            CallTarget::Custom {
+                method: m,
+                is_use_fetch,
+                ..
+            } => (
+                HttpClientKind::Custom,
+                *m,
+                if *is_use_fetch {
+                    CallResultShape::UseFetchResponse
+                } else {
+                    CallResultShape::JsonPayload
+                },
+            ),
         };
 
         let (line, snippet) = self.location(call.span);
-        let response_type = self.extract_response_type(call);
+        let response_type = self
+            .extract_response_type(call)
+            .or_else(|| self.current_return_type());
 
         let Some(first_arg) = call.arguments.first() else {
             self.unresolved_calls.push(ExtractedUnresolvedCall {
@@ -588,7 +921,7 @@ impl<'s> FileExtractor<'s> {
         match self.eval_url_expr(url_expr) {
             UrlEval::Resolved(url_str) => {
                 let matched = match &target {
-                    CallTarget::Fetch(_) | CallTarget::Axios(_) => {
+                    CallTarget::Fetch(_) | CallTarget::UseFetch(_) | CallTarget::Axios(_) => {
                         resolve_url_against_services(&url_str, self.ctx.services)
                     }
                     CallTarget::AxiosInstance { base_url, .. } => {
@@ -632,7 +965,7 @@ impl<'s> FileExtractor<'s> {
                         line,
                         snippet,
                     });
-                    Some((client_kind, id))
+                    Some((result_shape, id))
                 } else {
                     None
                 }
@@ -661,8 +994,9 @@ impl<'s> FileExtractor<'s> {
             let Some(arg_expr) = arg.as_expression() else {
                 continue;
             };
-            let Some(VarBinding::JsonPayload { call_id, prefix }) =
-                self.resolve_binding_from_expr(arg_expr)
+            let Some(VarBinding::JsonPayload {
+                call_id, prefix, ..
+            }) = self.resolve_binding_from_expr(arg_expr)
             else {
                 continue;
             };
@@ -808,15 +1142,124 @@ impl<'s> FileExtractor<'s> {
                     return Some(instance);
                 }
 
-                // Direct `fetch(...)`, `axios.get(...)`, or configured custom client
-                if let Some((client, call_id)) = self.process_http_call(call) {
-                    return Some(match client {
-                        HttpClientKind::Fetch => VarBinding::FetchResponse(call_id),
-                        HttpClientKind::Axios => VarBinding::AxiosResponse(call_id),
+                // Vue `ref(...)` / `shallowRef(...)`
+                if is_vue_ref_call(call) {
+                    let declared_type = self.extract_vue_ref_type(call);
+                    if let Some(arg_expr) = call.arguments.first().and_then(Argument::as_expression)
+                        && let Some(inner) = self.resolve_binding_from_expr(arg_expr)
+                    {
+                        match inner {
+                            VarBinding::JsonPayload {
+                                call_id, prefix, ..
+                            } => {
+                                if prefix.is_empty() {
+                                    self.maybe_backfill_call_response_type(call_id, declared_type);
+                                }
+                                return Some(VarBinding::JsonPayload {
+                                    call_id,
+                                    prefix,
+                                    is_vue_ref: true,
+                                });
+                            }
+                            VarBinding::AxiosResponse { call_id, .. } => {
+                                return Some(VarBinding::AxiosResponse {
+                                    call_id,
+                                    is_vue_ref: true,
+                                });
+                            }
+                            VarBinding::FetchResponse { call_id, .. } => {
+                                return Some(VarBinding::FetchResponse {
+                                    call_id,
+                                    is_vue_ref: true,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                    return Some(VarBinding::VueRefEmpty { declared_type });
+                }
+
+                // Zod `UserSchema.parse(data)` / `UserSchema.safeParse(data)`
+                if let Some(schema_name) = crate::zod::extract_zod_parse_schema_name(call)
+                    && let Some(arg_expr) = call.arguments.first().and_then(Argument::as_expression)
+                    && let Some(inner) = self.resolve_binding_from_expr(arg_expr)
+                {
+                    let is_safe_parse = matches!(
+                        unwrap_expr(&call.callee),
+                        Expression::StaticMemberExpression(m)
+                            if matches!(m.property.name.as_str(), "safeParse" | "safeParseAsync")
+                    );
+                    if let VarBinding::JsonPayload {
+                        call_id,
+                        prefix,
+                        is_vue_ref,
+                    } = inner
+                    {
+                        if prefix.is_empty() {
+                            self.maybe_backfill_call_response_type(call_id, Some(schema_name));
+                        }
+                        if is_safe_parse {
+                            return Some(VarBinding::AxiosResponse {
+                                call_id,
+                                is_vue_ref: false,
+                            });
+                        }
+                        return Some(VarBinding::JsonPayload {
+                            call_id,
+                            prefix,
+                            is_vue_ref,
+                        });
+                    }
+                }
+
+                // Vue `computed(() => expr)` returning a tracked payload or sub-field
+                if is_vue_computed_call(call)
+                    && let Some(Argument::ArrowFunctionExpression(arrow)) = call.arguments.first()
+                {
+                    let body_expr = match &arrow.body {
+                        oxc_ast::ast::ArrowFunctionBody::FunctionBody(body) => {
+                            if body.statements.len() == 1 {
+                                match &body.statements[0] {
+                                    Statement::ReturnStatement(ret) => ret.argument.as_ref(),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        other => other.as_expression(),
+                    };
+
+                    if let Some(expr) = body_expr
+                        && let Some(VarBinding::JsonPayload {
+                            call_id, prefix, ..
+                        }) = self.resolve_binding_from_expr(expr)
+                    {
+                        return Some(VarBinding::JsonPayload {
+                            call_id,
+                            prefix,
+                            is_vue_ref: true,
+                        });
+                    }
+                }
+
+                // Direct `fetch(...)`, `useFetch(...)`, `axios.get(...)`, or configured custom client
+                if let Some((shape, call_id)) = self.process_http_call(call) {
+                    return Some(match shape {
+                        CallResultShape::FetchResponse => VarBinding::FetchResponse {
+                            call_id,
+                            is_vue_ref: false,
+                        },
+                        CallResultShape::AxiosResponse => VarBinding::AxiosResponse {
+                            call_id,
+                            is_vue_ref: false,
+                        },
+                        CallResultShape::UseFetchResponse => VarBinding::UseFetchResponse(call_id),
                         // Custom clients like `$fetch<T>` / `getClient().fetch<T>` return parsed JSON directly.
-                        HttpClientKind::Custom => VarBinding::JsonPayload {
+                        CallResultShape::JsonPayload => VarBinding::JsonPayload {
                             call_id,
                             prefix: String::new(),
+                            is_vue_ref: false,
                         },
                     });
                 }
@@ -824,12 +1267,13 @@ impl<'s> FileExtractor<'s> {
                 // `res.json()` or `(await fetch(...)).json()`
                 if let Expression::StaticMemberExpression(member) = unwrap_expr(&call.callee)
                     && member.property.name == "json"
-                    && let Some(VarBinding::FetchResponse(call_id)) =
+                    && let Some(VarBinding::FetchResponse { call_id, .. }) =
                         self.resolve_binding_from_expr(&member.object)
                 {
                     return Some(VarBinding::JsonPayload {
                         call_id,
                         prefix: String::new(),
+                        is_vue_ref: false,
                     });
                 }
                 None
@@ -839,16 +1283,41 @@ impl<'s> FileExtractor<'s> {
                 let (root_name, segments) = extract_member_chain(unwrapped)?;
                 let root_binding = self.lookup_var(&root_name)?.clone();
                 match root_binding {
-                    VarBinding::AxiosResponse(call_id) => {
-                        let first = segments.first()?;
-                        if first != "data" {
+                    VarBinding::FetchResponse {
+                        call_id,
+                        is_vue_ref: true,
+                    } if segments.len() == 1 && segments[0] == "value" => {
+                        Some(VarBinding::FetchResponse {
+                            call_id,
+                            is_vue_ref: false,
+                        })
+                    }
+                    VarBinding::AxiosResponse {
+                        call_id,
+                        is_vue_ref,
+                    } => {
+                        let effective = if is_vue_ref
+                            && segments.first().map(String::as_str) == Some("value")
+                        {
+                            &segments[1..]
+                        } else {
+                            &segments[..]
+                        };
+                        if effective.is_empty() {
+                            return Some(VarBinding::AxiosResponse {
+                                call_id,
+                                is_vue_ref: false,
+                            });
+                        }
+                        if effective[0] != "data" {
                             return None;
                         }
-                        let field_segments = &segments[1..];
+                        let field_segments = &effective[1..];
                         if field_segments.is_empty() {
                             Some(VarBinding::JsonPayload {
                                 call_id,
                                 prefix: String::new(),
+                                is_vue_ref: false,
                             })
                         } else {
                             let field_path = field_segments.join(".");
@@ -856,16 +1325,71 @@ impl<'s> FileExtractor<'s> {
                             Some(VarBinding::JsonPayload {
                                 call_id,
                                 prefix: field_path,
+                                is_vue_ref: false,
                             })
                         }
                     }
-                    VarBinding::JsonPayload { call_id, prefix } => {
-                        let full_path = join_field_path(&prefix, &segments);
-                        self.record_field_read(call_id, full_path.clone(), unwrapped.span());
-                        Some(VarBinding::JsonPayload {
-                            call_id,
-                            prefix: full_path,
-                        })
+                    VarBinding::UseFetchResponse(call_id) => {
+                        if segments.first().map(String::as_str) != Some("data") {
+                            return None;
+                        }
+                        let after_data = &segments[1..];
+                        if after_data.is_empty() {
+                            return Some(VarBinding::JsonPayload {
+                                call_id,
+                                prefix: String::new(),
+                                is_vue_ref: true,
+                            });
+                        }
+                        let field_segments =
+                            if after_data.first().map(String::as_str) == Some("value") {
+                                &after_data[1..]
+                            } else {
+                                after_data
+                            };
+                        if field_segments.is_empty() {
+                            Some(VarBinding::JsonPayload {
+                                call_id,
+                                prefix: String::new(),
+                                is_vue_ref: false,
+                            })
+                        } else {
+                            let field_path = field_segments.join(".");
+                            self.record_field_read(call_id, field_path.clone(), unwrapped.span());
+                            Some(VarBinding::JsonPayload {
+                                call_id,
+                                prefix: field_path,
+                                is_vue_ref: false,
+                            })
+                        }
+                    }
+                    VarBinding::JsonPayload {
+                        call_id,
+                        prefix,
+                        is_vue_ref,
+                    } => {
+                        let effective = if is_vue_ref
+                            && segments.first().map(String::as_str) == Some("value")
+                        {
+                            &segments[1..]
+                        } else {
+                            &segments[..]
+                        };
+                        if effective.is_empty() {
+                            Some(VarBinding::JsonPayload {
+                                call_id,
+                                prefix,
+                                is_vue_ref: false,
+                            })
+                        } else {
+                            let full_path = join_field_path(&prefix, effective);
+                            self.record_field_read(call_id, full_path.clone(), unwrapped.span());
+                            Some(VarBinding::JsonPayload {
+                                call_id,
+                                prefix: full_path,
+                                is_vue_ref: false,
+                            })
+                        }
                     }
                     _ => None,
                 }
@@ -885,16 +1409,29 @@ impl<'s> FileExtractor<'s> {
                         continue;
                     };
                     match &binding {
-                        VarBinding::AxiosResponse(call_id) if key_name == "data" => {
+                        VarBinding::AxiosResponse { call_id, .. } if key_name == "data" => {
                             self.bind_pattern(
                                 &prop.value,
                                 VarBinding::JsonPayload {
                                     call_id: *call_id,
                                     prefix: String::new(),
+                                    is_vue_ref: false,
                                 },
                             );
                         }
-                        VarBinding::JsonPayload { call_id, prefix } => {
+                        VarBinding::UseFetchResponse(call_id) if key_name == "data" => {
+                            self.bind_pattern(
+                                &prop.value,
+                                VarBinding::JsonPayload {
+                                    call_id: *call_id,
+                                    prefix: String::new(),
+                                    is_vue_ref: true,
+                                },
+                            );
+                        }
+                        VarBinding::JsonPayload {
+                            call_id, prefix, ..
+                        } => {
                             let field_path = join_field_path(prefix, &[key_name]);
                             self.record_field_read(*call_id, field_path.clone(), prop.span);
                             self.bind_pattern(
@@ -902,6 +1439,7 @@ impl<'s> FileExtractor<'s> {
                                 VarBinding::JsonPayload {
                                     call_id: *call_id,
                                     prefix: field_path,
+                                    is_vue_ref: false,
                                 },
                             );
                         }
@@ -918,26 +1456,64 @@ impl<'s> FileExtractor<'s> {
 
     fn inspect_member_chain(&mut self, expr: &Expression<'_>) {
         let span = expr.span();
-        if !self.seen_member_spans.insert(span.start) {
+        if self.seen_member_spans.contains(&span.start) {
             return;
         }
         let Some((root_name, segments)) = extract_member_chain(expr) else {
             return;
         };
+        self.seen_member_spans.insert(span.start);
+        mark_inner_member_spans(expr, &mut self.seen_member_spans);
+
         let Some(root_binding) = self.lookup_var(&root_name).cloned() else {
             return;
         };
 
         match root_binding {
-            VarBinding::JsonPayload { call_id, prefix } => {
-                let full_path = join_field_path(&prefix, &segments);
-                self.record_field_read(call_id, full_path, span);
+            VarBinding::JsonPayload {
+                call_id,
+                prefix,
+                is_vue_ref,
+            } => {
+                let effective =
+                    if is_vue_ref && segments.first().map(String::as_str) == Some("value") {
+                        &segments[1..]
+                    } else {
+                        &segments[..]
+                    };
+                if !effective.is_empty() {
+                    let full_path = join_field_path(&prefix, effective);
+                    self.record_field_read(call_id, full_path, span);
+                }
             }
-            VarBinding::AxiosResponse(call_id)
+            VarBinding::AxiosResponse {
+                call_id,
+                is_vue_ref,
+            } => {
+                let effective =
+                    if is_vue_ref && segments.first().map(String::as_str) == Some("value") {
+                        &segments[1..]
+                    } else {
+                        &segments[..]
+                    };
+                if effective.first().map(String::as_str) == Some("data") && effective.len() > 1 {
+                    let full_path = effective[1..].join(".");
+                    self.record_field_read(call_id, full_path, span);
+                }
+            }
+            VarBinding::UseFetchResponse(call_id)
                 if segments.first().map(String::as_str) == Some("data") && segments.len() > 1 =>
             {
-                let full_path = segments[1..].join(".");
-                self.record_field_read(call_id, full_path, span);
+                let after_data = &segments[1..];
+                let effective = if after_data.first().map(String::as_str) == Some("value") {
+                    &after_data[1..]
+                } else {
+                    after_data
+                };
+                if !effective.is_empty() {
+                    let full_path = effective.join(".");
+                    self.record_field_read(call_id, full_path, span);
+                }
             }
             _ => {}
         }
@@ -952,48 +1528,346 @@ impl<'a> Visit<'a> for FileExtractor<'_> {
     }
 
     fn visit_function(&mut self, it: &Function<'a>, flags: oxc_semantic::ScopeFlags) {
+        let ret = self.extract_fn_return_type(it.return_type.as_deref());
+        self.return_type_stack.push(ret);
         self.push_scope();
         walk::walk_function(self, it, flags);
         self.pop_scope();
+        self.return_type_stack.pop();
     }
 
     fn visit_arrow_function_expression(&mut self, it: &oxc_ast::ast::ArrowFunctionExpression<'a>) {
+        let ret = self.extract_fn_return_type(it.return_type.as_deref());
+        self.return_type_stack.push(ret);
         self.push_scope();
         walk::walk_arrow_function_expression(self, it);
         self.pop_scope();
+        self.return_type_stack.pop();
     }
 
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
         if let Some(init) = &decl.init {
             if let Some(binding) = self.resolve_binding_from_expr(init) {
                 self.bind_pattern(&decl.id, binding);
+                if matches!(
+                    unwrap_expr(init),
+                    Expression::StaticMemberExpression(_) | Expression::ChainExpression(_)
+                ) {
+                    self.seen_member_spans
+                        .insert(unwrap_expr(init).span().start);
+                    mark_inner_member_spans(init, &mut self.seen_member_spans);
+                }
+            } else {
+                self.register_unassigned_pattern(&decl.id);
             }
-            if matches!(
-                unwrap_expr(init),
-                Expression::StaticMemberExpression(_) | Expression::ChainExpression(_)
-            ) {
-                self.seen_member_spans
-                    .insert(unwrap_expr(init).span().start);
-            }
+        } else {
+            self.register_unassigned_pattern(&decl.id);
         }
         walk::walk_variable_declarator(self, decl);
     }
 
+    fn visit_assignment_expression(&mut self, it: &AssignmentExpression<'a>) {
+        if matches!(
+            it.operator,
+            AssignmentOperator::Assign
+                | AssignmentOperator::LogicalNullish
+                | AssignmentOperator::LogicalOr
+        ) && let Some((target_name, is_vue_ref_assign)) = extract_assignment_target(&it.left)
+        {
+            if let Some(binding) = self.resolve_binding_from_expr(&it.right) {
+                let updated =
+                    self.apply_ref_assignment_binding(&target_name, is_vue_ref_assign, binding);
+                self.update_or_bind_var(&target_name, updated);
+                if matches!(
+                    unwrap_expr(&it.right),
+                    Expression::StaticMemberExpression(_) | Expression::ChainExpression(_)
+                ) {
+                    self.seen_member_spans
+                        .insert(unwrap_expr(&it.right).span().start);
+                    mark_inner_member_spans(&it.right, &mut self.seen_member_spans);
+                }
+            }
+            if is_vue_ref_assign {
+                self.seen_member_spans.insert(it.left.span().start);
+            }
+        }
+        walk::walk_assignment_expression(self, it);
+    }
+
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         let _ = self.process_http_call(call);
+        if let Some(schema_name) = crate::zod::extract_zod_parse_schema_name(call)
+            && let Some(arg_expr) = call.arguments.first().and_then(Argument::as_expression)
+            && let Some(VarBinding::JsonPayload {
+                call_id, prefix, ..
+            }) = self.resolve_binding_from_expr(arg_expr)
+            && prefix.is_empty()
+        {
+            self.maybe_backfill_call_response_type(call_id, Some(schema_name));
+        }
         self.process_helper_call(call);
         walk::walk_call_expression(self, call);
     }
 
     fn visit_expression(&mut self, expr: &Expression<'a>) {
-        match expr {
-            Expression::StaticMemberExpression(_) | Expression::ChainExpression(_) => {
-                self.inspect_member_chain(expr);
-                mark_inner_member_spans(expr, &mut self.seen_member_spans);
+        if matches!(
+            expr,
+            Expression::StaticMemberExpression(_) | Expression::ChainExpression(_)
+        ) {
+            self.inspect_member_chain(expr);
+        }
+        walk::walk_expression(self, expr);
+    }
+}
+
+fn normalize_type_expr(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn strip_outer_promise(raw: &str) -> &str {
+    let mut current = raw.trim();
+    loop {
+        if let Some(inner) = current
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            && has_balanced_delimiters(inner)
+        {
+            current = inner.trim();
+            continue;
+        }
+        if let Some(inner) = current
+            .strip_prefix("Promise<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            && has_balanced_delimiters(inner)
+        {
+            current = inner.trim();
+            continue;
+        }
+        break;
+    }
+    current
+}
+
+fn has_balanced_delimiters(s: &str) -> bool {
+    let mut angle: isize = 0;
+    let mut paren: isize = 0;
+    let mut brace: isize = 0;
+    let mut bracket: isize = 0;
+
+    for b in s.bytes() {
+        match b {
+            b'<' => angle += 1,
+            b'>' => {
+                angle -= 1;
+                if angle < 0 {
+                    return false;
+                }
+            }
+            b'(' => paren += 1,
+            b')' => {
+                paren -= 1;
+                if paren < 0 {
+                    return false;
+                }
+            }
+            b'{' => brace += 1,
+            b'}' => {
+                brace -= 1;
+                if brace < 0 {
+                    return false;
+                }
+            }
+            b'[' => bracket += 1,
+            b']' => {
+                bracket -= 1;
+                if bracket < 0 {
+                    return false;
+                }
             }
             _ => {}
         }
-        walk::walk_expression(self, expr);
+    }
+
+    angle == 0 && paren == 0 && brace == 0 && bracket == 0
+}
+
+fn split_top_level<'a>(s: &'a str, delims: &[u8]) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut angle: usize = 0;
+    let mut paren: usize = 0;
+    let mut brace: usize = 0;
+    let mut bracket: usize = 0;
+    let mut start = 0;
+
+    for (idx, b) in s.bytes().enumerate() {
+        match b {
+            b'<' => angle += 1,
+            b'>' => angle = angle.saturating_sub(1),
+            b'(' => paren += 1,
+            b')' => paren = paren.saturating_sub(1),
+            b'{' => brace += 1,
+            b'}' => brace = brace.saturating_sub(1),
+            b'[' => bracket += 1,
+            b']' => bracket = bracket.saturating_sub(1),
+            _ if angle == 0 && paren == 0 && brace == 0 && bracket == 0 && delims.contains(&b) => {
+                parts.push(s[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(s[start..].trim());
+    parts
+}
+
+fn is_non_dto_return_type(ty: &str) -> bool {
+    let trimmed = ty.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let parts = split_top_level(trimmed, b"|&");
+    parts.iter().all(|part| is_primitive_type_atom(part))
+}
+
+fn is_primitive_type_atom(raw: &str) -> bool {
+    let mut current = raw.trim();
+    loop {
+        if let Some(inner) = current
+            .strip_prefix('(')
+            .and_then(|rest| rest.strip_suffix(')'))
+            && has_balanced_delimiters(inner)
+        {
+            current = inner.trim();
+            continue;
+        }
+        if let Some(inner) = current.strip_suffix("[]") {
+            current = inner.trim();
+            continue;
+        }
+        if let Some(inner) = current.strip_prefix("readonly ") {
+            current = inner.trim();
+            continue;
+        }
+        if let Some(inner) = current
+            .strip_prefix("Readonly<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .or_else(|| {
+                current
+                    .strip_prefix("Array<")
+                    .and_then(|rest| rest.strip_suffix('>'))
+            })
+            .or_else(|| {
+                current
+                    .strip_prefix("ReadonlyArray<")
+                    .and_then(|rest| rest.strip_suffix('>'))
+            })
+            && has_balanced_delimiters(inner)
+        {
+            current = inner.trim();
+            continue;
+        }
+        break;
+    }
+
+    if current.is_empty() {
+        return true;
+    }
+
+    let nested = split_top_level(current, b"|&");
+    if nested.len() > 1 {
+        return nested.iter().all(|part| is_primitive_type_atom(part));
+    }
+
+    if (current.starts_with('\'') && current.ends_with('\''))
+        || (current.starts_with('"') && current.ends_with('"'))
+        || current.chars().all(|c| c.is_ascii_digit() || c == '.')
+    {
+        return true;
+    }
+
+    matches!(
+        current,
+        "string"
+            | "number"
+            | "boolean"
+            | "void"
+            | "null"
+            | "undefined"
+            | "any"
+            | "unknown"
+            | "never"
+            | "bigint"
+            | "symbol"
+            | "true"
+            | "false"
+            | "Blob"
+            | "Response"
+            | "ArrayBuffer"
+            | "Uint8Array"
+            | "FormData"
+    )
+}
+
+fn is_use_fetch_callee(callee: &str) -> bool {
+    callee == "useFetch"
+        || callee == "useLazyFetch"
+        || callee.ends_with(".useFetch")
+        || callee.ends_with(".useLazyFetch")
+}
+
+fn is_vue_ref_call(call: &CallExpression<'_>) -> bool {
+    match unwrap_expr(&call.callee) {
+        Expression::Identifier(ident) => ident.name == "ref" || ident.name == "shallowRef",
+        Expression::StaticMemberExpression(member) => {
+            member.property.name == "ref" || member.property.name == "shallowRef"
+        }
+        _ => false,
+    }
+}
+
+fn is_vue_computed_call(call: &CallExpression<'_>) -> bool {
+    match unwrap_expr(&call.callee) {
+        Expression::Identifier(ident) => ident.name == "computed",
+        Expression::StaticMemberExpression(member) => member.property.name == "computed",
+        _ => false,
+    }
+}
+
+fn extract_assignment_target(target: &AssignmentTarget<'_>) -> Option<(String, bool)> {
+    match target {
+        AssignmentTarget::AssignmentTargetIdentifier(ident) => {
+            Some((ident.name.to_string(), false))
+        }
+        AssignmentTarget::StaticMemberExpression(member) => {
+            if member.property.name == "value"
+                && let Expression::Identifier(ident) = unwrap_expr(&member.object)
+            {
+                return Some((ident.name.to_string(), true));
+            }
+            None
+        }
+        AssignmentTarget::TSNonNullExpression(ts) => extract_expr_assignment_target(&ts.expression),
+        AssignmentTarget::TSAsExpression(ts) => extract_expr_assignment_target(&ts.expression),
+        AssignmentTarget::TSSatisfiesExpression(ts) => {
+            extract_expr_assignment_target(&ts.expression)
+        }
+        AssignmentTarget::TSTypeAssertion(ts) => extract_expr_assignment_target(&ts.expression),
+        _ => None,
+    }
+}
+
+fn extract_expr_assignment_target(expr: &Expression<'_>) -> Option<(String, bool)> {
+    match unwrap_expr(expr) {
+        Expression::Identifier(ident) => Some((ident.name.to_string(), false)),
+        Expression::StaticMemberExpression(member) => {
+            if member.property.name == "value"
+                && let Expression::Identifier(ident) = unwrap_expr(&member.object)
+            {
+                return Some((ident.name.to_string(), true));
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1353,10 +2227,283 @@ export const service = {
             .expect("shipping address.ts should extract");
 
         assert_eq!(ship.calls.len(), 1);
+        assert_eq!(ship.calls[0].response_type, None);
         assert_eq!(ship.field_reads.len(), 1);
         assert_eq!(ship.field_reads[0].field_path, "address");
         assert!(!ship.field_reads.iter().any(|r| r.field_path == "fullName"));
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn captures_function_method_and_arrow_return_types_while_skipping_primitives() {
+        let services = customer_services();
+        let clients = vec![CustomClientConfig {
+            callee: "getClient().fetch".into(),
+            target_service: "customer-service".into(),
+            path_prefix: Some("/api".into()),
+        }];
+        let empty_env = BTreeMap::new();
+
+        let code = r#"
+import axios from "axios";
+
+export async function getUser(id: string): Promise<UserResponse> {
+  const res = await fetch(`http://customer-service/customers/${id}`);
+  return res.json();
+}
+
+export async function getInvoiceCustomer(id: string): Promise<string> {
+  const res = await fetch(`http://customer-service/customers/${id}`);
+  const customer = await res.json();
+  return `Invoice for ${customer.fullName}`;
+}
+
+export const userApi = {
+  getUser(id: string): Promise<UserResponse> {
+    return getClient().fetch('/users/' + id);
+  },
+  async deleteUser(id: string): Promise<void> {
+    await getClient().fetch('/users/' + id, { method: 'DELETE' });
+  },
+  async downloadAvatar(id: string): Promise<Blob> {
+    return getClient().fetch(`/users/${id}/avatar`);
+  },
+  async rawResponse(id: string): Promise<Response> {
+    return fetch(`http://customer-service/customers/${id}`);
+  },
+};
+
+export class CustomerClient {
+  fetchNullable(id: string): Promise<UserResponse | null> {
+    return getClient().fetch('/customers/' + id);
+  }
+}
+
+export const arrowFetch = async (id: string): Promise<CustomerSummary[]> => {
+  const { data } = await axios.get(`http://customer-service/customers/${id}`);
+  return data;
+};
+
+export async function explicitGenericWins(id: string): Promise<UserViewModel> {
+  const { data } = await axios.get<ExplicitApiDTO>(`http://customer-service/customers/${id}`);
+  return data;
+}
+"#;
+
+        let extracted = extract_file_with_context(
+            "src/userApi.ts",
+            code,
+            ExtractContext {
+                services: &services,
+                clients: &clients,
+                env: &empty_env,
+            },
+        )
+        .expect("TS with return types should extract");
+
+        assert_eq!(extracted.calls.len(), 9);
+        assert_eq!(
+            extracted.calls[0].response_type.as_deref(),
+            Some("UserResponse")
+        );
+        assert_eq!(extracted.calls[1].response_type, None); // Promise<string> skipped
+        assert_eq!(
+            extracted.calls[2].response_type.as_deref(),
+            Some("UserResponse")
+        );
+        assert_eq!(extracted.calls[3].response_type, None); // Promise<void> skipped
+        assert_eq!(extracted.calls[4].response_type, None); // Promise<Blob> skipped
+        assert_eq!(extracted.calls[5].response_type, None); // Promise<Response> skipped
+        assert_eq!(
+            extracted.calls[6].response_type.as_deref(),
+            Some("UserResponse | null")
+        );
+        assert_eq!(
+            extracted.calls[7].response_type.as_deref(),
+            Some("CustomerSummary[]")
+        );
+        assert_eq!(
+            extracted.calls[8].response_type.as_deref(),
+            Some("ExplicitApiDTO")
+        );
+    }
+
+    #[test]
+    fn tracks_vue_ref_assignments_and_extracts_template_field_reads_with_exact_lines() {
+        let sfc = concat!(
+            "<script setup lang=\"ts\">\n", // line 1
+            "import { ref } from 'vue';\n", // line 2
+            "\n",                           // line 3
+            "const user = ref(null);\n",    // line 4
+            "const res = await fetch('http://customer-service/customers/42');\n", // line 5
+            "user.value = await res.json();\n", // line 6
+            "console.log(user.value.primerApellido);\n", // line 7
+            "</script>\n",                  // line 8
+            "\n",                           // line 9
+            "<template>\n",                 // line 10
+            "  <p>{{ user.segundoApellido }}</p>\n", // line 11
+            "  <span :title=\"user?.email\"></span>\n", // line 12
+            "</template>\n",                // line 13
+        );
+
+        let extracted = extract_file("src/components/UserProfile.vue", sfc, &customer_services())
+            .expect("Vue SFC with ref and template reads should extract");
+
+        assert_eq!(extracted.calls.len(), 1);
+        assert_eq!(extracted.calls[0].id, 0);
+        assert_eq!(extracted.calls[0].normalized_path, "/customers/42");
+        assert_eq!(extracted.calls[0].line, 5);
+
+        let reads: Vec<(usize, &str, usize)> = extracted
+            .field_reads
+            .iter()
+            .map(|r| (r.call_id, r.field_path.as_str(), r.line))
+            .collect();
+
+        assert!(reads.contains(&(0, "primerApellido", 7)));
+        assert!(reads.contains(&(0, "segundoApellido", 11)));
+        assert!(reads.contains(&(0, "email", 12)));
+        assert!(
+            !extracted
+                .field_reads
+                .iter()
+                .any(|r| r.field_path == "value" || r.field_path.starts_with("value.")),
+            "Vue ref `.value` wrapper must never leak into field_path: {:?}",
+            extracted.field_reads
+        );
+
+        let segundo = extracted
+            .field_reads
+            .iter()
+            .find(|r| r.field_path == "segundoApellido")
+            .unwrap();
+        assert_eq!(segundo.snippet, "<p>{{ user.segundoApellido }}</p>");
+
+        let email = extracted
+            .field_reads
+            .iter()
+            .find(|r| r.field_path == "email")
+            .unwrap();
+        assert_eq!(email.snippet, "<span :title=\"user?.email\"></span>");
+    }
+
+    #[test]
+    fn tracks_nested_ref_assignment_shallow_ref_use_fetch_and_plain_let_assignment() {
+        let services = customer_services();
+        let clients = vec![CustomClientConfig {
+            callee: "getClient().fetch".into(),
+            target_service: "customer-service".into(),
+            path_prefix: None,
+        }];
+        let empty_env = BTreeMap::new();
+
+        let sfc = concat!(
+            "<script lang=\"ts\">\n",              // line 1
+            "export async function preload() {\n", // line 2
+            "  let legacy;\n",                     // line 3
+            "  const res = await fetch('http://customer-service/customers/1');\n", // line 4
+            "  legacy = await res.json();\n",      // line 5
+            "  return legacy.legacyField;\n",      // line 6
+            "}\n",                                 // line 7
+            "</script>\n",                         // line 8
+            "\n",                                  // line 9
+            "<script setup lang=\"ts\">\n",        // line 10
+            "import { ref, shallowRef } from 'vue';\n", // line 11
+            "const user = ref<UserDTO | null>(null);\n", // line 12
+            "const order = shallowRef<OrderDTO>();\n", // line 13
+            "const { data: profile } = await useFetch<ProfileDTO>('http://customer-service/customers/9');\n", // line 14
+            "\n",                                                                      // line 15
+            "async function loadAll(id: string): Promise<void> {\n",                   // line 16
+            "  const res = await fetch(`http://customer-service/customers/${id}`);\n", // line 17
+            "  user.value = await res.json();\n",                                      // line 18
+            "  order.value = await getClient().fetch('/orders/' + id);\n",             // line 19
+            "  console.log(profile.value?.displayName);\n",                            // line 20
+            "}\n",                                                                     // line 21
+            "</script>\n",                                                             // line 22
+            "\n",                                                                      // line 23
+            "<template>\n",                                                            // line 24
+            "  <div v-if=\"user?.active\">\n",                                         // line 25
+            "    <p>{{ user.segundoApellido }}</p>\n",                                 // line 26
+            "    <p>{{ profile.avatarUrl }}</p>\n",                                    // line 27
+            "    <ul><li v-for=\"item in order.items\">{{ item.sku }}</li></ul>\n",    // line 28
+            "  </div>\n",                                                              // line 29
+            "</template>\n",                                                           // line 30
+        );
+
+        let extracted = extract_file_with_context(
+            "src/views/Dashboard.vue",
+            sfc,
+            ExtractContext {
+                services: &services,
+                clients: &clients,
+                env: &empty_env,
+            },
+        )
+        .expect("complex Vue SFC should extract");
+
+        // Call 0: <script> fetch(/customers/1)
+        // Call 1: <script setup> useFetch(/customers/9) -> ProfileDTO
+        // Call 2: <script setup> fetch(/customers/:id) -> backfilled UserDTO | null
+        // Call 3: <script setup> getClient().fetch(/orders/:param) -> backfilled OrderDTO
+        assert_eq!(extracted.calls.len(), 4);
+        assert_eq!(extracted.calls[0].response_type, None);
+        assert_eq!(
+            extracted.calls[1].response_type.as_deref(),
+            Some("ProfileDTO")
+        );
+        assert_eq!(
+            extracted.calls[2].response_type.as_deref(),
+            Some("UserDTO | null")
+        );
+        assert_eq!(
+            extracted.calls[3].response_type.as_deref(),
+            Some("OrderDTO")
+        );
+
+        let reads: Vec<(usize, &str, usize)> = extracted
+            .field_reads
+            .iter()
+            .map(|r| (r.call_id, r.field_path.as_str(), r.line))
+            .collect();
+
+        assert!(reads.contains(&(0, "legacyField", 6)));
+        assert!(reads.contains(&(1, "displayName", 20)));
+        assert!(reads.contains(&(1, "avatarUrl", 27)));
+        assert!(reads.contains(&(2, "active", 25)));
+        assert!(reads.contains(&(2, "segundoApellido", 26)));
+        assert!(reads.contains(&(3, "items", 28)));
+    }
+
+    #[test]
+    fn handles_template_before_script_setup_axios_ref_and_object_class_binding() {
+        let sfc = concat!(
+            "<template>\n",                                                              // line 1
+            "  <div :class=\"{ active: user?.isActive }\">\n",                           // line 2
+            "    <input v-model=\"user.email\" />\n",                                    // line 3
+            "    <p>{{ rawResp.data.fullName }}</p>\n",                                  // line 4
+            "  </div>\n",                                                                // line 5
+            "</template>\n",                                                             // line 6
+            "\n",                                                                        // line 7
+            "<script setup lang=\"ts\">\n",                                              // line 8
+            "const user = ref(null);\n",                                                 // line 9
+            "const rawResp = await axios.get('http://customer-service/customers/5');\n", // line 10
+            "user.value = rawResp.data;\n",                                              // line 11
+            "</script>\n",                                                               // line 12
+        );
+
+        let extracted = extract_file("src/components/Inline.vue", sfc, &customer_services())
+            .expect("Vue SFC with template-first and no imports should extract");
+
+        assert_eq!(extracted.calls.len(), 1);
+        let reads: Vec<(usize, &str, usize)> = extracted
+            .field_reads
+            .iter()
+            .map(|r| (r.call_id, r.field_path.as_str(), r.line))
+            .collect();
+
+        assert!(reads.contains(&(0, "isActive", 2)));
+        assert!(reads.contains(&(0, "email", 3)));
+        assert!(reads.contains(&(0, "fullName", 4)));
     }
 }

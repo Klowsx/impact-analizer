@@ -20,7 +20,7 @@ use laine_py::{
 };
 use laine_ts::{
     ExtractContext, TypeContractDef, extract_express_routes, extract_file_with_context,
-    extract_type_definitions, resolve_type_fields,
+    extract_type_definitions, extract_zod_schemas, resolve_type_fields,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -363,23 +363,34 @@ fn extract_consumer_repo(
         .into_iter()
         .collect();
 
-    // Pass 1 (parallel): build repo-wide TypeScript interface/type contract registry for generic calls
-    // like `getClient().fetch<ReserveResponse>('/corp/listBooking')`.
-    let per_file_types: Vec<Vec<TypeContractDef>> = file_contents
+    // Pass 1 (parallel): build repo-wide TypeScript interface/type & Zod schema registry for
+    // generic calls (`fetch<ReserveResponse>`), return-type annotations (`: Promise<UserDTO>`),
+    // and Zod validators (`UserSchema.parse(data)` / `type User = z.infer<typeof UserSchema>`).
+    let per_file_types: Vec<(Vec<TypeContractDef>, Vec<TypeContractDef>)> = file_contents
         .par_iter()
         .map(|(file_path, source)| {
             if is_analyzable_ts_or_js(file_path) {
-                extract_type_definitions(file_path, source).unwrap_or_default()
+                let ts_defs = extract_type_definitions(file_path, source).unwrap_or_default();
+                let zod_defs = extract_zod_schemas(file_path, source).unwrap_or_default();
+                (ts_defs, zod_defs)
             } else {
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         })
         .collect();
 
     let mut type_registry: BTreeMap<String, TypeContractDef> = BTreeMap::new();
-    for defs in per_file_types {
-        for def in defs {
-            type_registry.entry(def.name.clone()).or_insert(def);
+    for (ts_defs, _) in &per_file_types {
+        for def in ts_defs {
+            type_registry
+                .entry(def.name.clone())
+                .or_insert_with(|| def.clone());
+        }
+    }
+    for (_, zod_defs) in per_file_types {
+        for def in zod_defs {
+            // Zod definitions take precedence over placeholder `z.infer` aliases from `types.rs`.
+            type_registry.insert(def.name.clone(), def);
         }
     }
 

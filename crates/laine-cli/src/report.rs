@@ -15,7 +15,7 @@ pub fn omit_snippets(report: &mut AnalysisReport) {
     }
 }
 
-// Muestra la evidencia localizada y sus descripciones cuando están disponibles.
+// Muestra la evidencia localizada y la decisión de política del análisis.
 pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
     let mut out = String::new();
 
@@ -245,17 +245,7 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
         let _ = writeln!(out);
     }
 
-    let direct_consumers: usize = report.findings.iter().map(|f| f.consumers.len()).sum();
-    if report.findings.is_empty() {
-        let _ = writeln!(out, "RESULT: COMPATIBLE (exit code 0)");
-    } else {
-        let _ = writeln!(
-            out,
-            "RESULT: INCOMPATIBLE CHANGE ({} breaking change(s), {} confirmed consumer reference(s), exit code 2)",
-            report.findings.len(),
-            direct_consumers
-        );
-    }
+    let _ = writeln!(out, "RESULT: {}", describe_policy(report));
 
     out
 }
@@ -265,7 +255,7 @@ pub fn render_json(report: &AnalysisReport) -> Result<String, serde_json::Error>
 }
 
 /// Renders a GitHub-flavored Markdown report designed for pull request comments.
-// Genera un reporte Markdown con descripciones opcionales de la evidencia.
+// Genera un reporte Markdown con la decisión de política y el resumen de hallazgos.
 pub fn render_markdown(report: &AnalysisReport) -> String {
     let mut out = String::new();
 
@@ -281,15 +271,11 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
     let _ = writeln!(out, "## Laine Impact Analysis");
     let _ = writeln!(out);
 
-    let status_badge = if report.findings.is_empty() {
-        "COMPATIBLE"
-    } else {
-        "BREAKING CHANGES DETECTED"
-    };
     let _ = writeln!(
         out,
-        "**Status:** `{status_badge}` | **Target:** `{}` (`{base_short}` -> `{head_short}`)",
-        report.target_repo
+        "**Policy:** {} | **Target:** `{}` (`{base_short}` -> `{head_short}`)",
+        describe_policy(report),
+        report.target_repo,
     );
     let _ = writeln!(
         out,
@@ -476,6 +462,22 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
     out
 }
 
+// Resume la decisión evaluada y conserva un estado explícito para informes antiguos.
+fn describe_policy(report: &AnalysisReport) -> String {
+    let Some(policy) = &report.policy else {
+        return "POLICY NOT EVALUATED".into();
+    };
+    let status = if policy.should_fail {
+        "POLICY BLOCKED"
+    } else {
+        "POLICY PASSED"
+    };
+    format!(
+        "{status} (exit code {}) — {}",
+        policy.exit_code, policy.reason
+    )
+}
+
 fn change_endpoint(change: &ContractChange) -> &EndpointId {
     match change {
         ContractChange::EndpointRemoved { endpoint }
@@ -588,6 +590,7 @@ mod tests {
             target_repo: "customer-service".into(),
             base_rev: "1111111aaa".into(),
             head_rev: "2222222bbb".into(),
+            policy: None,
             stats: AnalysisStats::default(),
             findings: vec![
                 ImpactFinding {
@@ -660,6 +663,7 @@ mod tests {
             target_repo: "customer-service".into(),
             base_rev: "1111111aaaa".into(),
             head_rev: "2222222bbbb".into(),
+            policy: None,
             stats: AnalysisStats {
                 repositories: 3,
                 files_analyzed: 12,
@@ -739,22 +743,28 @@ mod tests {
         assert!(md.contains("billing-service/src/legacy.ts:22"));
     }
 
+    // Verifica el reporte compatible con una política evaluada.
     #[test]
     fn renders_markdown_for_compatible_report() {
-        let report = AnalysisReport {
+        let mut report = AnalysisReport {
             schema_version: 1,
             target_repo: "customer-service".into(),
             base_rev: "1111111".into(),
             head_rev: "2222222".into(),
+            policy: None,
             stats: AnalysisStats::default(),
             findings: Vec::new(),
             unresolved_calls: Vec::new(),
             discrepancies: Vec::new(),
         };
+        report.policy = Some(laine_core::policy::evaluate_policy(
+            &report,
+            &Default::default(),
+        ));
 
         let md = render_markdown(&report);
         assert!(md.contains("## Laine Impact Analysis"));
-        assert!(md.contains("COMPATIBLE"));
+        assert!(md.contains("POLICY PASSED (exit code 0)"));
         assert!(md.contains("No breaking contract changes detected."));
         assert!(!md.contains("<details>"));
     }
@@ -766,6 +776,7 @@ mod tests {
             target_repo: "cerebro-web".into(),
             base_rev: "abcdef1234567890".into(),
             head_rev: "WORKTREE".into(),
+            policy: None,
             stats: AnalysisStats::default(),
             findings: Vec::new(),
             unresolved_calls: Vec::new(),

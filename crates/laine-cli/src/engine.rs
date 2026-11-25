@@ -13,7 +13,7 @@ use laine_core::model::{
     HttpMethod, UnresolvedCall,
 };
 use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
-use laine_core::policy::filter_ignored_findings;
+use laine_core::policy::{evaluate_policy, filter_ignored_findings};
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
 use laine_py::{
     PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
@@ -96,6 +96,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
 ///
 /// When `no_cache` is `false`, per-repository consumer AST extractions are served from and
 /// persisted to the SQLite incremental cache keyed by `(repo, commit_sha, config_hash, schema_version)`.
+// Ejecuta el análisis y evalúa la política con la misma configuración del grafo.
 pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result<AnalysisReport> {
     let config = WorkspaceConfig::load_from_path(&req.config_path)?;
     let config_dir = config_directory(&req.config_path);
@@ -309,6 +310,7 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     );
 
     filter_ignored_findings(&mut report, &config.policy);
+    report.policy = Some(evaluate_policy(&report, &config.policy));
 
     Ok(report)
 }

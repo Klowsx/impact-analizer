@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 use laine_cli::engine::{AnalyzeRequest, index_workspace, run_analysis, run_analysis_with_options};
@@ -6,7 +7,6 @@ use laine_cli::report::{render_json, render_markdown};
 use laine_core::config::WorkspaceConfig;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::model::Severity;
-use laine_core::policy::evaluate_policy;
 
 #[test]
 fn index_workspace_populates_sqlite_cache_and_matches_uncached_json_byte_for_byte() {
@@ -63,6 +63,7 @@ fn index_workspace_populates_sqlite_cache_and_matches_uncached_json_byte_for_byt
     let _ = fs::remove_dir_all(&tmp);
 }
 
+// Comprueba que los formatos y el proceso reflejen la misma evaluación de política.
 #[test]
 fn policy_ignore_endpoints_and_fail_on_thresholds_control_filtering_and_cli_exit_codes() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-policy-{}", std::process::id()));
@@ -90,6 +91,7 @@ fn policy_ignore_endpoints_and_fail_on_thresholds_control_filtering_and_cli_exit
     assert_eq!(default_out.status.code(), Some(2));
     let stdout = String::from_utf8_lossy(&default_out.stdout);
     assert!(stdout.contains("## Laine Impact Analysis"));
+    assert!(stdout.contains("POLICY BLOCKED (exit code 2)"));
     assert!(stdout.contains("| `LAINE-001` | `HIGH` | `CONFIRMED` |"));
 
     // 2. CLI `laine index` subcommand works and reports cache hits after analyze populated cache
@@ -119,25 +121,9 @@ fn policy_ignore_endpoints_and_fail_on_thresholds_control_filtering_and_cli_exit
     .unwrap();
     assert_eq!(report_critical.findings.len(), 1);
     assert_eq!(report_critical.findings[0].severity, Severity::High);
-    let eval = evaluate_policy(&report_critical, &critical_cfg.policy);
+    let eval = report_critical.policy.unwrap();
     assert!(!eval.should_fail);
-
-    let critical_cli = Command::new(bin)
-        .args([
-            "analyze",
-            "--config",
-            critical_cfg_path.to_str().unwrap(),
-            "--repo",
-            "customer-service",
-            "--base",
-            "main",
-            "--head",
-            "feature/split-customer-name",
-            "--no-cache",
-        ])
-        .output()
-        .expect("laine analyze with fail_on=critical should run");
-    assert_eq!(critical_cli.status.code(), Some(0));
+    assert_policy_output(bin, &critical_cfg_path, 0, 1, 0);
 
     // 4. Policy ignore_endpoints suppresses matching routes cleanly -> 0 findings, exit code 0
     let mut ignore_raw = fs::read_to_string(&paths.config_path).unwrap();
@@ -178,23 +164,55 @@ fn policy_ignore_endpoints_and_fail_on_thresholds_control_filtering_and_cli_exit
     let strict_cfg_path = tmp.join("laine-strict-unresolved.toml");
     fs::write(&strict_cfg_path, &strict_unresolved_raw).unwrap();
 
-    let strict_cli = Command::new(bin)
-        .args([
-            "analyze",
-            "--config",
-            strict_cfg_path.to_str().unwrap(),
-            "--repo",
-            "customer-service",
-            "--base",
-            "main",
-            "--head",
-            "feature/split-customer-name",
-        ])
-        .output()
-        .expect("laine analyze with fail_on_unresolved should run");
-    assert_eq!(strict_cli.status.code(), Some(2));
+    assert_policy_output(bin, &strict_cfg_path, 2, 0, 1);
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+// Ejecuta la misma fixture en los tres formatos y comprueba decisión y hallazgos.
+fn assert_policy_output(
+    bin: &str,
+    config: &Path,
+    exit_code: i32,
+    findings: usize,
+    blocking_unresolved: usize,
+) {
+    for format in ["terminal", "markdown", "json"] {
+        let output = Command::new(bin)
+            .args(["analyze", "--config"])
+            .arg(config)
+            .args([
+                "--repo",
+                "customer-service",
+                "--base",
+                "main",
+                "--head",
+                "feature/split-customer-name",
+                "--format",
+                format,
+            ])
+            .output()
+            .expect("laine should print a policy decision");
+        assert_eq!(output.status.code(), Some(exit_code), "{format}");
+        assert!(output.stderr.is_empty(), "{format}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if format == "json" {
+            let report: laine_core::model::AnalysisReport = serde_json::from_str(&stdout).unwrap();
+            let policy = report.policy.unwrap();
+            assert_eq!(i32::from(policy.exit_code), exit_code);
+            assert_eq!(policy.should_fail, exit_code == 2);
+            assert_eq!(policy.blocking_findings, 0);
+            assert_eq!(policy.blocking_unresolved_calls, blocking_unresolved);
+            assert_eq!(report.findings.len(), findings);
+        } else {
+            let decision = if exit_code == 0 { "PASSED" } else { "BLOCKED" };
+            assert!(stdout.contains(&format!("POLICY {decision} (exit code {exit_code})")));
+            assert_eq!(
+                stdout.contains("No breaking contract changes detected."),
+                findings == 0
+            );
+        }
+    }
 }
 
 #[test]

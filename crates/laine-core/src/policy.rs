@@ -1,12 +1,16 @@
+use serde::{Deserialize, Serialize};
+
 use crate::config::PolicyConfig;
 use crate::graph::route_covers;
 use crate::model::{AnalysisReport, ContractChange, EndpointId, HttpMethod};
 use crate::openapi::canonical_route_key;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyEvaluation {
     pub should_fail: bool,
+    pub exit_code: u8,
     pub blocking_findings: usize,
+    pub blocking_unresolved_calls: usize,
     pub reason: String,
 }
 
@@ -28,7 +32,7 @@ pub fn filter_ignored_findings(report: &mut AnalysisReport, policy: &PolicyConfi
     });
 }
 
-/// Evaluates whether an `AnalysisReport` violates `policy` and should fail the CLI / CI check.
+/// Evalúa los hallazgos y las llamadas no resueltas para decidir el código de salida.
 ///
 /// Fails when:
 /// - Any finding has `finding.severity >= policy.fail_on`, OR
@@ -63,7 +67,13 @@ pub fn evaluate_policy(report: &AnalysisReport, policy: &PolicyConfig) -> Policy
 
     PolicyEvaluation {
         should_fail,
+        exit_code: if should_fail { 2 } else { 0 },
         blocking_findings,
+        blocking_unresolved_calls: if unresolved_blocks {
+            unresolved_count
+        } else {
+            0
+        },
         reason,
     }
 }
@@ -148,6 +158,7 @@ mod tests {
         AnalysisReport {
             schema_version: 1,
             target_repo: "customer-service".into(),
+            policy: None,
             base_rev: "base".into(),
             head_rev: "head".into(),
             stats: AnalysisStats::default(),

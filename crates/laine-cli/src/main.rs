@@ -15,7 +15,6 @@ use laine_core::config::{
 };
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::STAGED_REV;
-use laine_core::policy::evaluate_policy;
 use laine_core::workspace::{
     DiscoveredRepo, WorkspaceRegistry, build_workspace_config, infer_workspace_scan_dir,
     inspect_repo_path, merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
@@ -904,7 +903,7 @@ fn filter_selected_repos(
     Ok(selected)
 }
 
-// Ejecuta el análisis y aplica la opción de privacidad antes de imprimir resultados y errores.
+// Imprime el análisis filtrado por privacidad y devuelve el código de su política.
 fn execute_analysis(
     config: PathBuf,
     repo: String,
@@ -915,13 +914,6 @@ fn execute_analysis(
     no_snippets: bool,
 ) -> ExitCode {
     let started = Instant::now();
-    let workspace_cfg = match WorkspaceConfig::load_from_path(&config) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            print_analysis_error("Analysis", &err, no_snippets);
-            return ExitCode::FAILURE;
-        }
-    };
     let req = AnalyzeRequest {
         config_path: config,
         target_repo: repo,
@@ -935,7 +927,7 @@ fn execute_analysis(
                 omit_snippets(&mut report);
             }
             let elapsed_ms = started.elapsed().as_millis();
-            let policy_eval = evaluate_policy(&report, &workspace_cfg.policy);
+            let exit_code = report.policy.as_ref().map_or(1, |policy| policy.exit_code);
 
             match format {
                 OutputFormat::Terminal => {
@@ -953,11 +945,7 @@ fn execute_analysis(
                 }
             }
 
-            if policy_eval.should_fail {
-                ExitCode::from(2)
-            } else {
-                ExitCode::SUCCESS
-            }
+            ExitCode::from(exit_code)
         }
         Err(err) => {
             print_analysis_error("Analysis", &err, no_snippets);

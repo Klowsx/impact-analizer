@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::policy::PolicyEvaluation;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
@@ -168,6 +170,8 @@ pub struct AnalysisReport {
     pub target_repo: String,
     pub base_rev: String,
     pub head_rev: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyEvaluation>,
     pub stats: AnalysisStats,
     pub findings: Vec<ImpactFinding>,
     pub unresolved_calls: Vec<UnresolvedCall>,

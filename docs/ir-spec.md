@@ -69,12 +69,15 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 | `target_repo` | `string` | Yes | — | Name of the producer repository whose diff was analyzed. |
 | `base_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Base commit before the change. |
 | `head_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Head commit after the change. |
+| `policy` | `object` | For CLI analysis | Omitted by reports produced without workspace policy | The policy decision for the reported findings and unresolved calls. |
 | `stats` | [`AnalysisStats`](#32-analysisstats) | Yes | — | Deterministic structural counts for the run. |
 | `findings` | `Array<`[`ImpactFinding`](#35-impactfinding)`>` | Yes | May be empty `[]` | Detected breaking contract changes and their direct/indirect consumers. |
 | `unresolved_calls` | `Array<`[`UnresolvedCall`](#38-unresolvedcall)`>` | Yes | Sorted by `(repo, file, line, reason)` | Dynamic or unresolvable consumer HTTP calls (`UNKNOWN`). |
 | `discrepancies` | `Array<`[`ContractDiscrepancy`](#39-contractdiscrepancy)`>` | No | Omitted when empty (`skip_serializing_if`) | Mismatches between OpenAPI spec and extracted backend code routes. |
 
 > **Note on volatile metrics:** Wall-clock timings (such as `elapsed_ms`) are intentionally excluded from `AnalysisReport` JSON and rendered only in terminal output so repeated runs on identical commits remain byte-for-byte identical.
+
+`policy` contains `should_fail`, `exit_code`, `blocking_findings`, `blocking_unresolved_calls`, and `reason`. `exit_code` is `0` when policy passes or `2` when it blocks, matching the CLI process. A report can include findings below the configured threshold or be blocked by unresolved calls with zero findings.
 
 ### 3.2 `AnalysisStats`
 

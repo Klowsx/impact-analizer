@@ -255,6 +255,7 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
         target_repo: input.target_repo.to_string(),
         base_rev: input.base_rev.to_string(),
         head_rev: input.head_rev.to_string(),
+        policy: None,
         stats: input.stats,
         findings,
         unresolved_calls,

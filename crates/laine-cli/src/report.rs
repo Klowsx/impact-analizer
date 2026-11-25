@@ -535,7 +535,11 @@ fn escape_inline_code(raw: &str) -> String {
 }
 
 fn short_sha(rev: &str) -> &str {
-    rev.get(..7).unwrap_or(rev)
+    if !rev.is_empty() && rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+        rev.get(..7).unwrap_or(rev)
+    } else {
+        rev
+    }
 }
 
 #[cfg(test)]
@@ -734,5 +738,32 @@ mod tests {
         assert!(md.contains("COMPATIBLE"));
         assert!(md.contains("No breaking contract changes detected."));
         assert!(!md.contains("<details>"));
+    }
+
+    #[test]
+    fn preserves_worktree_and_staged_revision_labels_without_truncation() {
+        let report = AnalysisReport {
+            schema_version: 1,
+            target_repo: "cerebro-web".into(),
+            base_rev: "abcdef1234567890".into(),
+            head_rev: "WORKTREE".into(),
+            stats: AnalysisStats::default(),
+            findings: Vec::new(),
+            unresolved_calls: Vec::new(),
+            discrepancies: Vec::new(),
+        };
+
+        let term = render_terminal(&report, 10);
+        assert!(
+            term.contains("(abcdef1 -> WORKTREE)"),
+            "expected full WORKTREE label, got:\n{term}"
+        );
+        assert!(!term.contains("WORKTRE)"));
+
+        let md = render_markdown(&report);
+        assert!(
+            md.contains("`abcdef1` -> `WORKTREE`"),
+            "expected full WORKTREE label in markdown, got:\n{md}"
+        );
     }
 }

@@ -142,6 +142,8 @@ laine index --config laine.toml
 
 When Git detects a rename of the configured OpenAPI file, `analyze` compares both names and cites the file in each revision. Stage a local rename so Git can detect it.
 
+Source files are read as UTF-8. OpenAPI also accepts a UTF-8 byte order mark. Laine leaves symbolic links unread in commits, the index, and the worktree, and reports skipped candidate files as incomplete coverage.
+
 ---
 
 ## Configuration (`laine.toml`)

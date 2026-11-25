@@ -56,6 +56,7 @@ fn reports_partial_extraction_without_asserting_route_removal() {
     fs::write(api.join("app.ts"), "const app = {\n").unwrap();
     fs::write(web.join("good.ts"), "fetch('http://api/users');\n").unwrap();
     fs::write(web.join("bad.ts"), "const invalid = {\n").unwrap();
+    fs::write(web.join("raw.ts"), [0x65, 0xe9]).unwrap();
     git(&web, &["add", "."]);
     git(&web, &["commit", "-m", "test: add consumer sources"]);
 
@@ -107,21 +108,27 @@ path = "./web"
     assert_eq!(
         coverage.consumers,
         FileCoverage {
-            discovered: 3,
+            discovered: 4,
             read: 3,
             analyzed: 2,
-            failed: 1
+            failed: 2
         }
     );
-    assert_eq!(result.diagnostics.len(), 2);
+    assert_eq!(result.diagnostics.len(), 3);
     assert_eq!(result.diagnostics[0].file, "app.ts");
     assert_eq!(result.diagnostics[0].stage, ExtractionStage::ProducerHead);
     assert_eq!(result.diagnostics[0].revision, "WORKTREE");
     assert_eq!(result.diagnostics[1].file, "bad.ts");
+    assert_eq!(result.diagnostics[2].file, "raw.ts");
+    assert_eq!(
+        result.diagnostics[2].code,
+        ExtractionFailure::FileReadFailed
+    );
     assert!(
         result
             .diagnostics
             .iter()
+            .take(2)
             .all(|item| item.code == ExtractionFailure::FileParseFailed)
     );
     assert!(render_terminal(&result, 0).contains("Coverage: INCOMPLETE"));

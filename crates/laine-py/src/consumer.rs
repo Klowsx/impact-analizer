@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use laine_core::config::{
@@ -103,6 +104,7 @@ enum UrlEval {
 
 #[derive(Debug, Clone)]
 enum VarBinding {
+    HttpImport(String),
     StringLiteral(String),
     DynamicString(String),
     HttpClientInstance {
@@ -272,6 +274,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Procesa sentencias con el ámbito activo para que los aliases no se filtren a otros ámbitos.
     fn process_statement(&mut self, stmt: &LogicalStmt) {
         let trimmed = stmt.text.trim();
         if trimmed.is_empty() {
@@ -281,8 +284,6 @@ impl<'a> PyFileExtractor<'a> {
         // Ignore decorators in consumer extraction (scope pop still applies at decorator indent).
         self.pop_scopes_for_indent(stmt.indent);
         if trimmed.starts_with('@')
-            || trimmed.starts_with("import ")
-            || trimmed.starts_with("from ")
             || trimmed == "pass"
             || trimmed == "break"
             || trimmed == "continue"
@@ -292,6 +293,9 @@ impl<'a> PyFileExtractor<'a> {
 
         // 1. `def` / `async def` / `class` header -> push new function/class scope.
         if let Some(header) = parse_def_or_class_header(trimmed) {
+            if let Some(name) = header.name {
+                self.bind_var(name, VarBinding::Unknown);
+            }
             self.push_scope(stmt.indent);
             for param in header.params {
                 self.bind_var(&param, VarBinding::Unknown);
@@ -342,9 +346,10 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Guarda imports y analiza el resto de las sentencias del ámbito actual.
     fn process_simple_stmt(&mut self, stmt: &LogicalStmt, text: &str, base_offset: usize) {
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || self.record_import(trimmed) {
             return;
         }
         let ws = text.len() - text.trim_start().len();
@@ -425,6 +430,60 @@ impl<'a> PyFileExtractor<'a> {
 
         // Plain expression statement
         self.eval_expr_binding(stmt, trimmed, offset);
+    }
+
+    // Registra módulos y símbolos HTTP importados y permite que otros imports oculten el nombre.
+    fn record_import(&mut self, text: &str) -> bool {
+        let (module, items) = if let Some(start) = strip_keyword_prefix(text, "import") {
+            (None, &text[start..])
+        } else if let Some(start) = strip_keyword_prefix(text, "from") {
+            let rest = text[start..].trim_start();
+            let Some((module, clause)) = rest.split_once(char::is_whitespace) else {
+                return true;
+            };
+            let clause = clause.trim_start();
+            let Some(start) = strip_keyword_prefix(clause, "import") else {
+                return true;
+            };
+            (Some(module), &clause[start..])
+        } else {
+            return false;
+        };
+
+        for item in items
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .split(',')
+        {
+            let mut words = item.split_whitespace();
+            let Some(name) = words.next() else {
+                continue;
+            };
+            let alias = if words.next() == Some("as") {
+                words.next()
+            } else {
+                None
+            };
+            let root = name.split('.').next().unwrap_or(name);
+            let binding = match module {
+                Some(module @ ("requests" | "httpx")) => Some(format!("{module}.{name}")),
+                None if matches!(root, "requests" | "httpx")
+                    && (alias.is_none() || name == root) =>
+                {
+                    Some(root.to_owned())
+                }
+                _ => None,
+            };
+            let local_name = alias.unwrap_or(if module.is_some() { name } else { root });
+            if is_simple_ident(local_name) {
+                self.bind_var(
+                    local_name,
+                    binding.map_or(VarBinding::Unknown, VarBinding::HttpImport),
+                );
+            }
+        }
+        true
     }
 
     /// Evaluates a Python expression, recording any HTTP calls, unresolved calls, and field reads,
@@ -757,8 +816,9 @@ impl<'a> PyFileExtractor<'a> {
         current_binding
     }
 
+    // Construye el cliente a partir del nombre importado del constructor.
     fn try_parse_client_ctor(&self, callee: Option<&str>, args: &[CallArg]) -> Option<VarBinding> {
-        match callee? {
+        match self.resolve_http_callee(callee?)?.as_ref() {
             "httpx.Client" | "httpx.AsyncClient" => {
                 let base_url = args
                     .iter()
@@ -777,6 +837,22 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Expande el alias de un import solo si su nombre sigue vinculado en el ámbito actual.
+    fn resolve_http_callee<'b>(&'b self, callee: &'b str) -> Option<Cow<'b, str>> {
+        let (root, tail) = callee
+            .split_once('.')
+            .map_or((callee, None), |(root, tail)| (root, Some(tail)));
+        match self.lookup_var(root) {
+            Some(VarBinding::HttpImport(symbol)) => Some(match tail {
+                Some(tail) => Cow::Owned(format!("{symbol}.{tail}")),
+                None => Cow::Borrowed(symbol),
+            }),
+            Some(_) => None,
+            None => Some(Cow::Borrowed(callee)),
+        }
+    }
+
+    // Clasifica llamadas al módulo, funciones importadas e instancias de cliente.
     fn classify_http_call(
         &self,
         callee: Option<&str>,
@@ -820,6 +896,9 @@ impl<'a> PyFileExtractor<'a> {
                 }
             }
         }
+
+        let canonical_callee = callee.and_then(|callee| self.resolve_http_callee(callee));
+        let callee = canonical_callee.as_deref();
 
         // 2. Built-in `requests.<method>` / `requests.request`
         if let Some(callee_str) = callee
@@ -1389,10 +1468,20 @@ fn measure_indent(prefix: &str) -> usize {
 }
 
 struct ScopeHeader<'a> {
+    name: Option<&'a str>,
     params: Vec<String>,
     inline_body: Option<(&'a str, usize)>,
 }
 
+// Identifica el nombre de una definición sin tomar su firma ni su cuerpo.
+fn scope_header_name(rest: &str) -> Option<&str> {
+    rest.trim_start()
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ':'))
+        .next()
+        .filter(|name| is_simple_ident(name))
+}
+
+// Extrae el nombre que se vincula en el ámbito exterior y los parámetros del nuevo ámbito.
 fn parse_def_or_class_header(trimmed: &str) -> Option<ScopeHeader<'_>> {
     if let Some(rest_rel) =
         strip_keyword_prefix(trimmed, "async def").or_else(|| strip_keyword_prefix(trimmed, "def"))
@@ -1409,6 +1498,7 @@ fn parse_def_or_class_header(trimmed: &str) -> Option<ScopeHeader<'_>> {
         };
         let inline_body = inline_body.map(|(b, rel)| (b, rest_rel + rel));
         return Some(ScopeHeader {
+            name: scope_header_name(rest),
             params,
             inline_body,
         });
@@ -1419,6 +1509,7 @@ fn parse_def_or_class_header(trimmed: &str) -> Option<ScopeHeader<'_>> {
         let (_, inline_body) = split_header_colon(rest);
         let inline_body = inline_body.map(|(b, rel)| (b, rest_rel + rel));
         return Some(ScopeHeader {
+            name: scope_header_name(rest),
             params: Vec::new(),
             inline_body,
         });
@@ -2026,6 +2117,68 @@ mod tests {
                 "https://api.internal".into(),
             ],
         }]
+    }
+
+    // Verifica aliases de módulo, métodos y constructores con ocultamiento de nombres.
+    #[test]
+    fn resolves_http_import_aliases_in_their_scope() {
+        let py = r#"import requests as rq, httpx as hx
+from requests import get as get_url
+from httpx import (
+    AsyncClient as Client,
+    post as send,
+)
+
+rq.get('http://customer-service/module')
+hx.request('PATCH', 'http://customer-service/request')
+get_url('http://customer-service/function')
+send('http://customer-service/post')
+
+async def use_client():
+    async with Client(base_url='http://customer-service') as client:
+        await client.get('/instance')
+    import requests as local
+    local.get('http://customer-service/local')
+
+def shadow(rq):
+    rq.get('http://customer-service/ignored')
+    get_url('http://customer-service/outer')
+    import other as get_url
+    get_url('http://customer-service/also-ignored')
+
+local.get('http://customer-service/outside-scope')
+def rq():
+    return None
+rq.get('http://customer-service/shadowed-definition')
+"#;
+        let services = sample_services();
+        let output = extract_python_file(
+            "app.py",
+            py,
+            PyExtractContext {
+                services: &services,
+                clients: &[],
+                env: &BTreeMap::new(),
+            },
+        );
+        let hits = output
+            .calls
+            .iter()
+            .map(|call| (call.normalized_path.as_str(), call.method))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hits,
+            [
+                ("/module", HttpMethod::Get),
+                ("/request", HttpMethod::Patch),
+                ("/function", HttpMethod::Get),
+                ("/post", HttpMethod::Post),
+                ("/instance", HttpMethod::Get),
+                ("/local", HttpMethod::Get),
+                ("/outer", HttpMethod::Get),
+            ]
+        );
+        assert!(output.unresolved_calls.is_empty());
     }
 
     #[test]

@@ -34,14 +34,14 @@ struct Cli {
 enum Commands {
     /// Initialize a laine.toml configuration file (optionally scanning a directory of Git repos)
     Init {
-        /// Destination path for the configuration file (defaults to laine.toml or laine.<workspace>.toml)
+        /// Destination path for the configuration file (defaults to ~/.laine/configs/<workspace>.toml when --workspace is set, else laine.toml)
         #[arg(long)]
         path: Option<PathBuf>,
         /// Overwrite an existing configuration file
         #[arg(long)]
         force: bool,
-        /// Scan a directory for local Git repositories and auto-detect stacks/routes/OpenAPI
-        #[arg(long)]
+        /// Scan a directory for local Git repositories (defaults to `.` when passed without a path)
+        #[arg(long, num_args = 0..=1, default_missing_value = ".")]
         scan: Option<PathBuf>,
         /// Comma-separated repository names to include from `--scan` (non-interactive)
         #[arg(long, value_delimiter = ',')]
@@ -404,10 +404,19 @@ fn handle_init(
     all: bool,
     workspace: Option<String>,
 ) -> ExitCode {
-    let dest = path.unwrap_or_else(|| match workspace.as_deref() {
-        Some(ws) => PathBuf::from(format!("laine.{ws}.toml")),
-        None => PathBuf::from("laine.toml"),
-    });
+    let dest = match path {
+        Some(explicit) => explicit,
+        None => match workspace.as_deref() {
+            Some(ws) => match WorkspaceRegistry::default_config_path(ws) {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("Workspace config path error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            None => PathBuf::from("laine.toml"),
+        },
+    };
 
     if dest.exists() && !force {
         eprintln!(
@@ -473,6 +482,23 @@ fn handle_init(
         );
         for repo in &selected {
             println!("  - {} ({})", repo.name, repo.detected_kind);
+        }
+        if !cfg.clients.is_empty() {
+            println!("Auto-detected HTTP client wrapper(s):");
+            for client in &cfg.clients {
+                let prefix_note = client
+                    .path_prefix
+                    .as_deref()
+                    .map(|p| format!(" (prefix: {p})"))
+                    .unwrap_or_default();
+                println!(
+                    "  - `{}` -> {}{prefix_note}",
+                    client.callee, client.target_service
+                );
+            }
+        }
+        if !cfg.env.is_empty() {
+            println!("Auto-detected {} API URL env var(s).", cfg.env.len());
         }
     } else if let Err(err) = fs::write(&dest, STARTER_CONFIG) {
         eprintln!("Failed to write {}: {err}", dest.display());

@@ -104,10 +104,9 @@ laine analyze \
 ### Initialize Your Own Workspace
 
 ```bash
-# Auto-discover Git repos in a folder and interactively pick only the ones that belong to this ecosystem
-laine init --scan ./projects --workspace corporativo
-
-# Or select explicitly (great for scripts and AI agents)
+# Auto-discover Git repos in the current folder (or pass a directory) and interactively pick the ones for this ecosystem.
+# Saves config cleanly under ~/.laine/configs/<workspace>.toml and auto-detects .env URLs & custom HTTP wrappers.
+laine init --scan --workspace corporativo
 laine init --scan ./projects --select cerebro-web,portal-corporativo --workspace corporativo
 
 # Register an existing laine.toml under a named workspace

@@ -70,6 +70,8 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 | `base_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Base commit before the change. |
 | `head_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Head commit after the change. |
 | `policy` | `object` | For CLI analysis | Omitted by reports produced without workspace policy | The policy decision for the reported findings and unresolved calls. |
+| `exit_code` | `integer` | For CLI analysis | `0` or `2`, matching the process | The effective exit code of a completed analysis. |
+| `workspace` | `object` | For CLI analysis | `repo_roots` is present only with `--include-repo-roots` | Local workspace identifier and optional checkout map. |
 | `coverage` | `object` | For CLI analysis | Omitted by reports produced without workspace extraction | `complete` and the counts for `producer_base`, `producer_head`, and `consumers`. |
 | `diagnostics` | `array` | No | Omitted when empty | Source extraction failures ordered by repository, revision, and file. |
 | `stats` | [`AnalysisStats`](#32-analysisstats) | Yes | — | Deterministic structural counts for the run. |
@@ -81,7 +83,9 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 
 `policy` contains `should_fail`, `exit_code`, `blocking_findings`, `blocking_unresolved_calls`, and `reason`. `exit_code` is `0` when policy passes or `2` when it blocks, matching the CLI process. A report can include findings below the configured threshold or be blocked by unresolved calls with zero findings.
 
-Coverage counts discovered, read, analyzed, and failed source files. When a known read or parse error leaves coverage incomplete, diagnostics include `repo`, `revision`, `file`, `stage`, and `code`. Route removals require complete route extraction on both sides. OpenAPI changes can still be reported if both OpenAPI snapshots were analyzed. The policy decision applies to the evidence collected.
+Coverage counts discovered, read, analyzed, and failed source files. When a known read or parse error leaves coverage incomplete, diagnostics include `repo`, `revision`, `file`, `stage`, `code`, and `remediation`. Route removals require complete route extraction on both sides. OpenAPI changes can still be reported if both OpenAPI snapshots were analyzed. The policy decision applies to the evidence collected.
+
+`workspace.id` is a stable identifier for the resolved configuration path on the local machine. Evidence paths are relative to their repositories. Add `--include-repo-roots` to a JSON analysis to map those repository names to absolute local checkouts.
 
 ### 3.2 `AnalysisStats`
 
@@ -362,6 +366,9 @@ Laine strictly separates **how sure we are** (`Confidence`) from **how severe th
 | `0` | **Compatible / Pass** | No breaking changes were detected, or all findings fell below the configured `[policy]` blocking thresholds. |
 | `2` | **Breaking Change / Policy Failure** | One or more findings triggered the active `[policy]` blocking rules (default: `fail_on = "low"`, meaning any breaking contract finding fails the check). |
 | `1` | **Configuration or Runtime Error** | Invalid `laine.toml`, missing service or Git revision, malformed OpenAPI spec, unreadable repository, or I/O error. |
+| `64` | **Invalid Command Usage** | An analysis flag is invalid or a required argument is missing. |
+
+In JSON mode, `analyze` and `check` write an error document on stdout for exit codes `1` and `64`. It has `schema_version`, `status: "error"`, `exit_code`, and `diagnostics`. Each diagnostic has a stable `code` and `remediation` plus a human-readable `message`. A completed analysis has the report fields above and an exit code of `0` or `2`.
 
 Policy behavior is controlled via the optional `[policy]` table in `laine.toml`:
 - `fail_on` (`"low"` | `"medium"` | `"high"` | `"critical"`, default `"low"`): Minimum finding `Severity` that triggers exit code `2`.
@@ -372,7 +379,7 @@ Policy behavior is controlled via the optional `[policy]` table in `laine.toml`:
 
 ## 7. Determinism Guarantees
 
-Laine enforces strict reproducibility for identical Git commits, `laine.toml`, and binary version:
+Laine enforces strict reproducibility for identical Git snapshots, workspace, `laine.toml` options, and binary version:
 
 1. **Ordered Collections:** OpenAPI endpoints (`BTreeMap<EndpointId, EndpointContract>`), response/request schemas, parameters, code route maps, indirect consumer maps, and deduplicated consumer hits (`BTreeMap`) eliminate `HashMap` iteration randomness.
 2. **Explicit Stable Sorting:** `consumers_of_endpoint`, `transitive_dependent_paths`, and `unresolved_calls` are explicitly sorted by `(repo, file, line, ...)` prior to report assembly.

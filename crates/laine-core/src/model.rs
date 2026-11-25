@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::policy::PolicyEvaluation;
@@ -246,6 +248,14 @@ impl ExtractionFailure {
             Self::FileParseFailed => "File could not be parsed",
         }
     }
+
+    // Identifica de forma estable la acción que puede resolver el fallo.
+    pub fn remediation(self) -> &'static str {
+        match self {
+            Self::FileReadFailed => "check_input_paths",
+            Self::FileParseFailed => "repair_source_syntax",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -263,6 +273,15 @@ pub struct ExtractionDiagnostic {
     pub file: String,
     pub stage: ExtractionStage,
     pub code: ExtractionFailure,
+    #[serde(default)]
+    pub remediation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceIdentity {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repo_roots: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -277,6 +296,10 @@ pub struct AnalysisReport {
     pub coverage: Option<AnalysisCoverage>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<ExtractionDiagnostic>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceIdentity>,
     pub stats: AnalysisStats,
     pub findings: Vec<ImpactFinding>,
     pub unresolved_calls: Vec<UnresolvedCall>,

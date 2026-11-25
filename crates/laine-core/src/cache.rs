@@ -119,7 +119,8 @@ struct ConfigFingerprint<'a> {
     env: &'a BTreeMap<String, String>,
 }
 
-/// Computes a deterministic 64-bit FNV-1a hex fingerprint over the extraction-relevant
+/// Calcula la huella de las opciones que pueden cambiar la extracción.
+/// Uses a deterministic 64-bit FNV-1a hex fingerprint over the extraction-relevant
 /// configuration fields (`services.base_urls`, `clients`, and `env`).
 ///
 /// Any change to service base URLs, custom clients, or environment variables produces a new
@@ -137,9 +138,13 @@ pub fn compute_config_hash(config: &WorkspaceConfig) -> String {
     };
 
     let canonical_json = serde_json::to_string(&fingerprint).unwrap_or_default();
+    stable_fingerprint(canonical_json.as_bytes())
+}
 
+// Genera un identificador hexadecimal determinista a partir de bytes.
+pub fn stable_fingerprint(bytes: &[u8]) -> String {
     let mut hash = FNV1A_64_OFFSET_BASIS;
-    for byte in canonical_json.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV1A_64_PRIME);
     }

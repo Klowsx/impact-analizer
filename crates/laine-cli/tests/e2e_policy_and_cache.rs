@@ -8,6 +8,100 @@ use laine_core::config::WorkspaceConfig;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::model::Severity;
 
+// Verifica que stdout JSON sea consumible tanto para resultados como para errores.
+#[test]
+fn reports_exit_codes_errors_and_optional_workspace_roots_in_json() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-json-contract-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let paths = create_demo_workspace(&tmp).unwrap();
+    let bin = env!("CARGO_BIN_EXE_laine");
+    let mut workspace_id = String::new();
+
+    for (head, expected, local_roots) in
+        [("main", 0, false), ("feature/split-customer-name", 2, true)]
+    {
+        let mut process = Command::new(bin);
+        process
+            .args(["analyze", "--config"])
+            .arg(&paths.config_path)
+            .args([
+                "--repo",
+                "customer-service",
+                "--base",
+                "main",
+                "--head",
+                head,
+                "--format=json",
+            ]);
+        if local_roots {
+            process.arg("--include-repo-roots");
+        }
+        let output = process.output().unwrap();
+        assert_eq!(output.status.code(), Some(expected));
+        assert!(output.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["exit_code"], expected);
+        assert_eq!(report["policy"]["exit_code"], expected);
+        assert_eq!(report["coverage"]["complete"], true);
+        let id = report["workspace"]["id"].as_str().unwrap();
+        if local_roots {
+            assert_eq!(id, workspace_id);
+            let producer = report["workspace"]["repo_roots"]["customer-service"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                fs::canonicalize(producer).unwrap(),
+                fs::canonicalize(&paths.customer_service).unwrap()
+            );
+        } else {
+            assert_eq!(id.len(), 16);
+            assert!(report["workspace"].get("repo_roots").is_none());
+            workspace_id = id.to_owned();
+        }
+    }
+
+    let usage = Command::new(bin)
+        .args(["analyze", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(usage.status.code(), Some(64));
+    assert!(usage.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&usage.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    assert_eq!(report["exit_code"], 64);
+    assert_eq!(report["diagnostics"][0]["code"], "invalid_arguments");
+    assert_eq!(
+        report["diagnostics"][0]["remediation"],
+        "check_command_help"
+    );
+
+    let malformed = tmp.join("invalid.toml");
+    fs::write(&malformed, "FICTITIOUS_CONFIG = [ @").unwrap();
+    for command in ["analyze", "check"] {
+        let result = Command::new(bin)
+            .args([command, "--config"])
+            .arg(&malformed)
+            .env("LAINE_HOME", tmp.join("laine-home"))
+            .args(["--repo", "customer-service", "--format=json"])
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert!(result.stderr.is_empty());
+        let text = String::from_utf8(result.stdout).unwrap();
+        assert!(!text.contains("FICTITIOUS_CONFIG"));
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["status"], "error");
+        assert_eq!(report["exit_code"], 1);
+        assert_eq!(report["diagnostics"][0]["code"], "invalid_config_syntax");
+        assert_eq!(
+            report["diagnostics"][0]["remediation"],
+            "repair_workspace_toml"
+        );
+    }
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
 // Verifica que dos productores con la misma URL den el mismo diagnóstico en cualquier orden.
 #[test]
 fn reports_ambiguous_service_urls_consistently_with_and_without_cache() {

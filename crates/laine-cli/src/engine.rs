@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use laine_core::cache::{IndexCache, compute_config_hash};
+use laine_core::cache::{IndexCache, compute_config_hash, stable_fingerprint};
 use laine_core::config::{RouteFramework, RouteSourceConfig, WorkspaceConfig};
 use laine_core::error::{LaineError, Result};
 use laine_core::git::GitRepo;
@@ -11,11 +11,12 @@ use laine_core::laravel::extract_laravel_routes;
 use laine_core::model::{
     AnalysisCoverage, AnalysisReport, AnalysisStats, Confidence, ContractChange,
     ContractDiscrepancy, Evidence, ExtractionDiagnostic, ExtractionFailure, ExtractionStage,
-    FileCoverage, HttpMethod, UnresolvedCall,
+    FileCoverage, HttpMethod, UnresolvedCall, WorkspaceIdentity,
 };
 use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
 use laine_core::policy::{evaluate_policy, filter_ignored_findings};
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
+use laine_core::workspace::normalize_absolute_path;
 use laine_py::{
     PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
 };
@@ -137,6 +138,7 @@ impl FileExtraction {
                     file: file.clone(),
                     stage,
                     code: *code,
+                    remediation: code.remediation().to_owned(),
                 }),
         );
     }
@@ -157,8 +159,17 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
 ///
 /// When `no_cache` is `false`, per-repository consumer AST extractions are served from and
 /// persisted to the SQLite incremental cache keyed by `(repo, commit_sha, config_hash, schema_version)`.
-// Analiza snapshots y registra qué partes pudieron examinarse antes de evaluar la política.
+// Ejecuta el análisis portable sin incluir rutas absolutas de los checkouts.
 pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result<AnalysisReport> {
+    run_analysis_with_local_paths(req, no_cache, false)
+}
+
+// Analiza el impacto y agrega el mapa local de repositorios si se solicitó.
+pub fn run_analysis_with_local_paths(
+    req: &AnalyzeRequest,
+    no_cache: bool,
+    include_repo_roots: bool,
+) -> Result<AnalysisReport> {
     let config = WorkspaceConfig::load_from_path(&req.config_path)?;
     let config_dir = config_directory(&req.config_path);
 
@@ -434,7 +445,27 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
         consumers,
     });
     report.diagnostics = diagnostics;
-    report.policy = Some(evaluate_policy(&report, &config.policy));
+    let policy = evaluate_policy(&report, &config.policy);
+    report.exit_code = Some(policy.exit_code);
+    report.policy = Some(policy);
+    let id = stable_fingerprint(
+        normalize_absolute_path(&req.config_path)
+            .as_os_str()
+            .as_encoded_bytes(),
+    );
+    let repo_roots = if include_repo_roots {
+        config
+            .services
+            .iter()
+            .map(|service| {
+                let path = normalize_absolute_path(&resolve_repo_path(config_dir, &service.path));
+                (service.name.clone(), path.to_string_lossy().into_owned())
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    report.workspace = Some(WorkspaceIdentity { id, repo_roots });
 
     Ok(report)
 }

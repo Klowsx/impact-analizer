@@ -72,6 +72,7 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 | `policy` | `object` | For CLI analysis | Omitted by reports produced without workspace policy | The policy decision for the reported findings and unresolved calls. |
 | `exit_code` | `integer` | For CLI analysis | `0` or `2`, matching the process | The effective exit code of a completed analysis. |
 | `workspace` | `object` | For CLI analysis | `repo_roots` is present only with `--include-repo-roots` | Local workspace identifier and optional checkout map. |
+| `consumer_revisions` | `object` | For CLI analysis | Map from service name to commit SHA, `STAGED`, or `WORKTREE` | Snapshots searched for client code, including the producer checkout. |
 | `coverage` | `object` | For CLI analysis | Omitted by reports produced without workspace extraction | `complete` and the counts for `producer_base`, `producer_head`, and `consumers`. |
 | `diagnostics` | `array` | No | Omitted when empty | Source extraction failures ordered by repository, revision, and file. |
 | `stats` | [`AnalysisStats`](#32-analysisstats) | Yes | — | Deterministic structural counts for the run. |

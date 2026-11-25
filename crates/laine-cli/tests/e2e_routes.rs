@@ -107,9 +107,9 @@ path = "./web"
     assert_eq!(
         coverage.consumers,
         FileCoverage {
-            discovered: 2,
-            read: 2,
-            analyzed: 1,
+            discovered: 3,
+            read: 3,
+            analyzed: 2,
             failed: 1
         }
     );

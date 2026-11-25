@@ -140,6 +140,8 @@ laine index --config laine.toml
 
 `repo add` resolves its path from your current directory and saves the Git checkout root. It accepts a subdirectory of an existing checkout.
 
+When Git detects a rename of the configured OpenAPI file, `analyze` compares both names and cites the file in each revision. Stage a local rename so Git can detect it.
+
 ---
 
 ## Configuration (`laine.toml`)

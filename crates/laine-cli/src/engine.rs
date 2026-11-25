@@ -130,6 +130,11 @@ impl ConsumerInputs {
     }
 }
 
+struct OpenApiSnapshot {
+    file: String,
+    contents: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct FileExtraction {
     coverage: FileCoverage,
@@ -220,7 +225,7 @@ pub fn run_analysis_with_local_paths(
     run_analysis_with_consumer_revision(req, no_cache, include_repo_roots, ConsumerRevision::Head)
 }
 
-// Analiza el productor y los consumidores de la revisión elegida, incluido el mismo checkout.
+// Analiza los snapshots elegidos y conserva la ruta de cada versión del contrato.
 pub fn run_analysis_with_consumer_revision(
     req: &AnalyzeRequest,
     no_cache: bool,
@@ -285,14 +290,15 @@ pub fn run_analysis_with_consumer_revision(
     let mut discrepancies: Vec<ContractDiscrepancy> = Vec::new();
     let mut route_locations: BTreeMap<(String, HttpMethod, String), (String, usize)> =
         BTreeMap::new();
-    let mut source_file_display = String::new();
+    let mut base_source_file = String::new();
+    let mut head_source_file = String::new();
 
     // 1. Optional OpenAPI producer contract analysis
     let mut head_openapi_contract = None;
     let mut base_openapi_contract = None;
     if let Some(openapi_rel) = target_service.openapi.as_deref() {
-        let base_raw = producer_git.read_file(&base_sha, openapi_rel)?;
-        let head_raw = producer_git.read_file(&head_sha, openapi_rel)?;
+        let (base_document, head_document) =
+            read_openapi_snapshots(&producer_git, &base_sha, &head_sha, openapi_rel)?;
         files_analyzed += 1;
         producer_base = FileCoverage {
             discovered: 1,
@@ -302,8 +308,8 @@ pub fn run_analysis_with_consumer_revision(
         };
         producer_head = producer_base;
 
-        let base_contract = extract_contract(&target_service.name, &base_raw)?;
-        let head_contract = extract_contract(&target_service.name, &head_raw)?;
+        let base_contract = extract_contract(&target_service.name, &base_document.contents)?;
+        let head_contract = extract_contract(&target_service.name, &head_document.contents)?;
         contract_changes.extend(diff_contracts(&base_contract, &head_contract));
 
         for (endpoint_id, endpoint) in &base_contract.endpoints {
@@ -324,7 +330,8 @@ pub fn run_analysis_with_consumer_revision(
             }
         }
 
-        source_file_display = openapi_rel.to_string_lossy().replace('\\', "/");
+        base_source_file = base_document.file;
+        head_source_file = head_document.file;
         base_openapi_contract = Some(base_contract);
         head_openapi_contract = Some(head_contract);
     }
@@ -495,7 +502,8 @@ pub fn run_analysis_with_consumer_revision(
             target_repo: &target_service.name,
             base_rev: &base_sha,
             head_rev: &head_sha,
-            source_file: &source_file_display,
+            base_source_file: &base_source_file,
+            head_source_file: &head_source_file,
             base_contract: base_openapi_contract.as_ref(),
             head_contract: head_openapi_contract.as_ref(),
             route_locations,
@@ -1017,6 +1025,74 @@ fn extract_producer_routes(
     }
 
     Ok((routes, extraction))
+}
+
+// Conserva archivos ilegibles como errores de lectura y sigue renombres detectados por Git.
+fn read_openapi_snapshots(
+    git: &GitRepo,
+    base: &str,
+    head: &str,
+    configured: &Path,
+) -> Result<(OpenApiSnapshot, OpenApiSnapshot)> {
+    let path = configured.to_string_lossy();
+    let path = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.into_owned()
+    };
+    let path = path.trim_start_matches("./");
+    let read = |revision| match read_openapi_snapshot(git, revision, path) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(_)
+            if git
+                .list_files(revision)?
+                .binary_search_by(|name| name.as_str().cmp(path))
+                .is_err() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    };
+
+    match (read(base)?, read(head)?) {
+        (Some(before), Some(after)) => Ok((before, after)),
+        (Some(before), None) => {
+            if let Some((_, destination)) = git
+                .renamed_files(base, head)?
+                .into_iter()
+                .find(|(source, _)| source == path)
+            {
+                return Ok((before, read_openapi_snapshot(git, head, &destination)?));
+            }
+            Err(openapi_missing(path, head))
+        }
+        (None, Some(after)) => {
+            if let Some((source, _)) = git
+                .renamed_files(base, head)?
+                .into_iter()
+                .find(|(_, destination)| destination == path)
+            {
+                return Ok((read_openapi_snapshot(git, base, &source)?, after));
+            }
+            Err(openapi_missing(path, base))
+        }
+        (None, None) => Err(openapi_missing(path, &format!("{base} and {head}"))),
+    }
+}
+
+// Lee el contrato y conserva la ruta exacta del archivo en su revisión.
+fn read_openapi_snapshot(git: &GitRepo, revision: &str, path: &str) -> Result<OpenApiSnapshot> {
+    Ok(OpenApiSnapshot {
+        file: path.to_owned(),
+        contents: git.read_file(revision, Path::new(path))?,
+    })
+}
+
+// Propone verificar la ruta o añadir el renombre al índice cuando falta el documento.
+fn openapi_missing(path: &str, revision: &str) -> LaineError {
+    LaineError::ConfigInvalid(format!(
+        "OpenAPI file '{path}' is absent in {revision}. Verify the configured path or stage the renamed file."
+    ))
 }
 
 fn config_directory(config_path: &Path) -> &Path {

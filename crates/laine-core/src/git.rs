@@ -85,7 +85,7 @@ impl GitRepo {
         self.run_git(&["show", &spec])
     }
 
-    /// Reads many files at a given commit, staged index, or local working tree.
+    /// Lee archivos de un commit, del índice o del árbol local, conservando sus rutas.
     ///
     /// For committed and staged revisions, uses a single `git cat-file --batch` process
     /// to avoid per-file process spawn overhead. Missing or non-blob paths are skipped cleanly.
@@ -111,6 +111,20 @@ impl GitRepo {
             return Ok(results);
         }
 
+        // El protocolo batch usa líneas. Las rutas con saltos se pasan como argumentos separados.
+        let (line_paths, unusual_paths): (Vec<_>, Vec<_>) = relative_paths
+            .iter()
+            .partition(|path| !path.contains(['\r', '\n']));
+        let mut results = BTreeMap::new();
+        for path in unusual_paths {
+            if let Ok(raw) = self.read_file(rev, Path::new(path)) {
+                results.insert(path.clone(), raw);
+            }
+        }
+        if line_paths.is_empty() {
+            return Ok(results);
+        }
+
         let mut child = Command::new("git")
             .current_dir(&self.root)
             .args(["cat-file", "--batch"])
@@ -133,7 +147,7 @@ impl GitRepo {
         })?;
 
         let staged = is_staged_rev(rev);
-        let specs: Vec<String> = relative_paths
+        let specs: Vec<String> = line_paths
             .iter()
             .map(|p| {
                 let posix = to_git_posix_path(Path::new(p));
@@ -146,7 +160,6 @@ impl GitRepo {
             .collect();
 
         // Write specs on a scoped thread so large batches never deadlock the pipe buffer.
-        let mut results = BTreeMap::new();
         let read_result: Result<()> = std::thread::scope(|scope| {
             let writer = scope.spawn(move || {
                 for spec in &specs {
@@ -159,7 +172,7 @@ impl GitRepo {
             let mut reader = BufReader::new(stdout);
             let mut header = String::new();
 
-            for path in relative_paths {
+            for path in line_paths {
                 header.clear();
                 let n = reader
                     .read_line(&mut header)
@@ -222,20 +235,24 @@ impl GitRepo {
         Ok(results)
     }
 
-    /// Lists file paths (POSIX-style) in the repository at a given commit, staged index,
-    /// or working tree (tracked + non-ignored untracked files existing on disk).
+    /// Enumera archivos de un commit, índice o árbol local con rutas delimitadas por NUL.
     pub fn list_files(&self, rev: &str) -> Result<Vec<String>> {
         let output = if is_worktree_rev(rev) {
-            self.run_git(&["ls-files", "--cached", "--others", "--exclude-standard"])?
+            self.run_git(&[
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ])?
         } else if is_staged_rev(rev) {
-            self.run_git(&["ls-files", "--cached"])?
+            self.run_git(&["ls-files", "-z", "--cached"])?
         } else {
-            self.run_git(&["ls-tree", "-r", "--name-only", rev])?
+            self.run_git(&["ls-tree", "-rz", "--name-only", rev])?
         };
         let worktree = is_worktree_rev(rev);
         let mut files: Vec<String> = output
-            .lines()
-            .map(str::trim)
+            .split_terminator('\0')
             .filter(|line| !line.is_empty())
             .filter(|line| !worktree || self.root.join(line).is_file())
             .map(ToOwned::to_owned)
@@ -243,6 +260,50 @@ impl GitRepo {
         files.sort();
         files.dedup();
         Ok(files)
+    }
+
+    // Obtiene los renombres detectados por Git entre revisiones, incluyendo índice y árbol local.
+    pub fn renamed_files(&self, base: &str, head: &str) -> Result<Vec<(String, String)>> {
+        let staged = is_staged_rev;
+        let worktree = is_worktree_rev;
+        if base == head {
+            return Ok(Vec::new());
+        }
+        let mut args = vec!["diff", "--name-status", "-z", "-M", "--no-ext-diff"];
+        let reverse = if staged(base) && worktree(head) {
+            false
+        } else if worktree(base) && staged(head) {
+            true
+        } else if staged(base) || staged(head) {
+            args.extend(["--cached", if staged(base) { head } else { base }]);
+            staged(base)
+        } else if worktree(base) || worktree(head) {
+            args.push(if worktree(base) { head } else { base });
+            worktree(base)
+        } else {
+            args.extend([base, head]);
+            false
+        };
+        args.push("--");
+        let raw = self.run_git(&args)?;
+        let mut entries = raw.split_terminator('\0');
+        let mut renamed = Vec::new();
+        while let (Some(status), Some(path)) = (entries.next(), entries.next()) {
+            if status.starts_with('R') || status.starts_with('C') {
+                let Some(destination) = entries.next() else {
+                    break;
+                };
+                if status.starts_with('R') {
+                    let (before, after) = if reverse {
+                        (destination, path)
+                    } else {
+                        (path, destination)
+                    };
+                    renamed.push((before.to_owned(), after.to_owned()));
+                }
+            }
+        }
+        Ok(renamed)
     }
 
     fn run_git(&self, args: &[&str]) -> Result<String> {
@@ -266,8 +327,13 @@ impl GitRepo {
     }
 }
 
+// Convierte separadores de Windows y conserva una barra invertida literal en Unix.
 fn to_git_posix_path(path: &Path) -> String {
-    let raw = path.to_string_lossy().replace('\\', "/");
+    let raw = if cfg!(windows) {
+        path.to_string_lossy().replace('\\', "/")
+    } else {
+        path.to_string_lossy().into_owned()
+    };
     raw.trim_start_matches("./").to_string()
 }
 

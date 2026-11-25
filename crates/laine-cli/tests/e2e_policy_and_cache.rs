@@ -196,3 +196,185 @@ fn policy_ignore_endpoints_and_fail_on_thresholds_control_filtering_and_cli_exit
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+// Comprueba que la evidencia conserve su ubicación sin guardar ni publicar literales sensibles.
+fn preserves_located_evidence_without_exporting_credentials() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-privacy-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let paths = create_demo_workspace(&tmp).expect("demo workspace should generate");
+    let mut config = WorkspaceConfig::load_from_path(&paths.config_path).unwrap();
+    config.services[0].base_urls = vec![
+        "https://user:FICTITIOUS_PASSWORD@api.example:8443/v1?sig=FICTITIOUS_SIGNATURE#FICTITIOUS_FRAGMENT".into(),
+    ];
+    config.env.insert(
+        "CUSTOMER_API".into(),
+        "https://api.example:8443/v1?sig=FICTITIOUS_ENV_SIGNATURE".into(),
+    );
+    config.save_to_path(&paths.config_path).unwrap();
+
+    let config_text = fs::read_to_string(&paths.config_path).unwrap();
+    assert!(config_text.contains("https://api.example:8443/v1"));
+    assert!(!config_text.contains("FICTITIOUS_"));
+
+    fs::write(
+        paths.billing_service.join("src/invoices/customer.ts"),
+        r#"export async function getInvoiceCustomer(id: string): Promise<string> {
+  const res = await fetch(`${process.env.CUSTOMER_API}/customers/${id}?sig=FICTITIOUS_QUERY`, { headers: { Authorization: 'FICTITIOUS_HEADER' } });
+  const customer = await res.json();
+  return customer.fullName; // FICTITIOUS_FIELD_READ
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        paths.billing_service.join("src/invoices/credentialed_url.ts"),
+        r#"export async function readCustomer() {
+  const res = await fetch('https://example:FICTITIOUS_TS_USERINFO@api.example:8443/v1/customers/42');
+  const customer = await res.json();
+  return customer.fullName;
+}
+fetch(`${process.env.FICTITIOUS_TS_ENV_KEY}/customers/42`);
+"#,
+    )
+    .unwrap();
+    fs::write(
+        paths.billing_service.join("credentialed_url.py"),
+        r#"import requests
+customer = requests.get('https://example:FICTITIOUS_PY_USERINFO@api.example:8443/v1/customers/42').json()
+name = customer['fullName']
+"#,
+    )
+    .unwrap();
+    fs::write(
+        paths.billing_service.join("private_call.py"),
+        r#"import requests
+requests.get(resolve_endpoint("FICTITIOUS_DYNAMIC_EXPRESSION"))
+requests.get(os.getenv("FICTITIOUS_ENV_KEY"))
+"#,
+    )
+    .unwrap();
+    for args in [
+        &["add", "."][..],
+        &[
+            "-c",
+            "user.name=Laine Test",
+            "-c",
+            "user.email=fixture@example.test",
+            "commit",
+            "-m",
+            "test: add privacy fixtures",
+        ],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&paths.billing_service)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let bin = env!("CARGO_BIN_EXE_laine");
+    let index_output = Command::new(bin)
+        .arg("index")
+        .arg("--config")
+        .arg(&paths.config_path)
+        .output()
+        .unwrap();
+    assert!(index_output.status.success(), "{index_output:?}");
+    let sqlite = fs::read(tmp.join(".laine-cache.db")).unwrap();
+    let payload = String::from_utf8_lossy(&sqlite);
+    assert!(payload.contains("src/invoices/customer.ts"));
+    assert!(payload.contains("src/invoices/credentialed_url.ts"));
+    assert!(payload.contains("credentialed_url.py"));
+    assert!(!payload.contains("FICTITIOUS_"));
+
+    // Compara resultados con las tres opciones de salida y con y sin caché.
+    for format in ["terminal", "markdown", "json"] {
+        for flags in [
+            &[][..],
+            &["--no-cache"],
+            &["--no-snippets"],
+            &["--no-cache", "--no-snippets"],
+        ] {
+            let output = Command::new(bin)
+                .arg("analyze")
+                .arg("--config")
+                .arg(&paths.config_path)
+                .args([
+                    "--repo",
+                    "customer-service",
+                    "--base",
+                    "main",
+                    "--head",
+                    "feature/split-customer-name",
+                    "--format",
+                    format,
+                ])
+                .args(flags)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(2), "{output:?}");
+            let report = String::from_utf8(output.stdout).unwrap();
+            assert!(!report.contains("FICTITIOUS_"), "{report}");
+            assert!(report.contains("src/invoices/customer.ts"), "{report}");
+            assert!(
+                report.contains("src/invoices/credentialed_url.ts"),
+                "{report}"
+            );
+            assert!(report.contains("credentialed_url.py"), "{report}");
+            assert!(report.contains("fullName"), "{report}");
+            assert!(
+                report.contains("dynamic URL expression cannot be resolved statically"),
+                "{report}"
+            );
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("FICTITIOUS_"));
+
+            let omit = flags.contains(&"--no-snippets");
+            assert_eq!(
+                report.contains("Response field: fullName"),
+                !omit,
+                "{report}"
+            );
+            if format == "json" {
+                let parsed: serde_json::Value = serde_json::from_str(&report).unwrap();
+                let finding = &parsed["findings"][0];
+                let consumers = finding["consumers"].as_array().unwrap();
+                for file in [
+                    "src/invoices/customer.ts",
+                    "src/invoices/credentialed_url.ts",
+                    "credentialed_url.py",
+                ] {
+                    assert!(
+                        consumers
+                            .iter()
+                            .any(|item| item["evidence"]["file"] == file),
+                        "{report}"
+                    );
+                }
+                if omit {
+                    assert_eq!(finding["producer_evidence"]["snippet"], "");
+                    assert_eq!(consumers[0]["evidence"]["snippet"], "");
+                    assert_eq!(parsed["unresolved_calls"][0]["evidence"]["snippet"], "");
+                }
+            }
+        }
+    }
+
+    // Los errores de parseo del TOML pueden incluir la línea que los originó.
+    let invalid_path = tmp.join("invalid.toml");
+    fs::write(&invalid_path, "FICTITIOUS_INVALID_CONFIG = [ @").unwrap();
+    let output = Command::new(bin)
+        .args(["analyze", "--config"])
+        .arg(invalid_path)
+        .args(["--repo", "customer-service", "--no-snippets"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("Analysis failed"));
+    assert!(!error.contains("FICTITIOUS_"));
+
+    let _ = fs::remove_dir_all(&tmp);
+}

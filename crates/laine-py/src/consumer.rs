@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use laine_core::config::{CustomClientConfig, ServiceConfig};
+use laine_core::config::{
+    CustomClientConfig, ServiceConfig, is_absolute_http_url, matching_http_url,
+};
 use laine_core::model::HttpMethod;
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +12,8 @@ use crate::routes::{
     split_top_level_comma, strip_python_comments_and_docstrings, try_skip_string_literal,
     unescape_python_string,
 };
+
+const UNMAPPED_ENV: &str = "unmapped environment variable (configure under `[env]` in laine.toml)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -530,6 +534,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Sigue llamadas y accesos encadenados sin incluir claves de texto en los diagnósticos.
     fn eval_postfix_chain(
         &mut self,
         stmt: &LogicalStmt,
@@ -707,9 +712,7 @@ impl<'a> PyFileExtractor<'a> {
                         if let Some(key) = parse_python_string_literal(&raw_index) {
                             current_binding = match self.ctx.env.get(&key) {
                                 Some(val) => Some(VarBinding::StringLiteral(val.clone())),
-                                None => Some(VarBinding::DynamicString(format!(
-                                    "unmapped environment variable `{key}` (configure under `[env]` in laine.toml)"
-                                ))),
+                                None => Some(VarBinding::DynamicString(UNMAPPED_ENV.into())),
                             };
                         } else {
                             current_binding = Some(VarBinding::DynamicString(
@@ -1033,6 +1036,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Resuelve las URL estáticas y describe las dinámicas sin copiar su expresión.
     fn eval_url_expr(&self, raw_expr: &str) -> UrlEval {
         let (expr, _) = unwrap_await_and_parens(raw_expr, 0);
         if expr.is_empty() {
@@ -1088,9 +1092,7 @@ impl<'a> PyFileExtractor<'a> {
             };
         }
 
-        UrlEval::Dynamic(format!(
-            "dynamic URL expression `{expr}` cannot be resolved statically"
-        ))
+        UrlEval::Dynamic("dynamic URL expression cannot be resolved statically".into())
     }
 
     fn eval_fstring_url(&self, fstr: &str) -> UrlEval {
@@ -1204,6 +1206,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Resuelve el acceso a variables de entorno sin publicar argumentos literales.
     fn try_eval_env_expr(&self, expr: &str) -> Option<UrlEval> {
         let trimmed = expr.trim();
 
@@ -1231,9 +1234,7 @@ impl<'a> PyFileExtractor<'a> {
                 if let Some(key) = parse_python_string_literal(key_raw) {
                     return Some(match self.ctx.env.get(&key) {
                         Some(val) => UrlEval::Resolved(val.clone()),
-                        None => UrlEval::Dynamic(format!(
-                            "unmapped environment variable `{key}` (configure under `[env]` in laine.toml)"
-                        )),
+                        None => UrlEval::Dynamic(UNMAPPED_ENV.into()),
                     });
                 }
                 return Some(UrlEval::Dynamic(
@@ -1245,6 +1246,7 @@ impl<'a> PyFileExtractor<'a> {
         None
     }
 
+    // Usa el valor configurado o por defecto y omite la clave literal en caso de fallo.
     fn eval_env_call_args(&self, args: &[CallArg]) -> UrlEval {
         let key_arg = args
             .iter()
@@ -1273,9 +1275,7 @@ impl<'a> PyFileExtractor<'a> {
             return UrlEval::Resolved(val);
         }
 
-        UrlEval::Dynamic(format!(
-            "unmapped environment variable `{key}` (configure under `[env]` in laine.toml)"
-        ))
+        UrlEval::Dynamic(UNMAPPED_ENV.into())
     }
 }
 
@@ -2013,31 +2013,22 @@ fn join_base_and_relative(base: &str, rel: &str) -> String {
     }
 }
 
-fn is_absolute_http_url(url: &str) -> bool {
-    let trimmed = url.trim();
-    trimmed.starts_with("http://") || trimmed.starts_with("https://")
-}
-
+// Compara URL y bases saneadas sin ampliar los límites del host o del montaje.
 fn resolve_url_against_services(
     raw_url: &str,
     services: &[ServiceConfig],
 ) -> Option<ServiceEndpointMatch> {
-    let without_fragment = raw_url.split('#').next().unwrap_or(raw_url);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment)
-        .trim();
+    let url = matching_http_url(raw_url)?;
 
     let mut best_match: Option<(usize, ServiceEndpointMatch)> = None;
 
     for service in services {
         for base_url in &service.base_urls {
-            let trimmed_base = base_url.trim().trim_end_matches('/');
-            if trimmed_base.is_empty() {
+            let Some(base) = matching_http_url(base_url) else {
                 continue;
-            }
-            if let Some(rest) = strip_base_prefix(without_query, trimmed_base) {
+            };
+            let trimmed_base = base.trim_end_matches('/');
+            if let Some(rest) = strip_base_prefix(&url, trimmed_base) {
                 let normalized_path = normalize_consumer_path(rest);
                 let score = trimmed_base.len();
                 let should_replace = best_match
@@ -2245,6 +2236,7 @@ async def load_async(order_id: str):
     }
 
     #[test]
+    // Verifica las variables ausentes sin publicar sus claves literales.
     fn resolves_os_getenv_and_os_environ_and_reports_missing_env_as_unresolved() {
         let py = r#"import os
 import requests
@@ -2289,13 +2281,9 @@ def missing_env_calls():
 
         assert_eq!(extracted.unresolved_calls.len(), 2);
         assert_eq!(extracted.unresolved_calls[0].line, 12);
-        assert!(extracted.unresolved_calls[0].reason.contains("MISSING_URL"));
+        assert_eq!(extracted.unresolved_calls[0].reason, UNMAPPED_ENV);
         assert_eq!(extracted.unresolved_calls[1].line, 13);
-        assert!(
-            extracted.unresolved_calls[1]
-                .reason
-                .contains("ALSO_MISSING")
-        );
+        assert_eq!(extracted.unresolved_calls[1].reason, UNMAPPED_ENV);
     }
 
     #[test]
@@ -2401,6 +2389,7 @@ def dynamic_calls(url: str):
     }
 
     #[test]
+    // Verifica los campos y el diagnóstico saneado de una URL base sin configurar.
     fn tracks_nested_fields_raise_for_status_concatenation_and_unmapped_httpx_base_url() {
         let py = r#"import os
 import requests
@@ -2475,10 +2464,6 @@ def broken_httpx():
             PyHttpClientKind::Httpx
         );
         assert_eq!(extracted.unresolved_calls[0].line, 26);
-        assert!(
-            extracted.unresolved_calls[0]
-                .reason
-                .contains("UNMAPPED_BASE")
-        );
+        assert_eq!(extracted.unresolved_calls[0].reason, UNMAPPED_ENV);
     }
 }

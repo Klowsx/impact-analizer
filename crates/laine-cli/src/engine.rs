@@ -49,7 +49,6 @@ struct CachedConsumeEdge {
     method: HttpMethod,
     normalized_path: String,
     line: usize,
-    snippet: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,7 +59,6 @@ struct CachedFieldReadEdge {
     normalized_path: String,
     field_path: String,
     line: usize,
-    snippet: String,
     call_file: String,
     call_line: usize,
     confidence: Confidence,
@@ -72,7 +70,6 @@ struct CachedFieldReadEdge {
 struct CachedUnresolvedCall {
     file: String,
     line: usize,
-    snippet: String,
     reason: String,
 }
 
@@ -360,6 +357,7 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
     })
 }
 
+// Extrae hechos estructurados sin guardar fragmentos del código en los snapshots.
 fn extract_consumer_repo(
     git: &GitRepo,
     rev: &str,
@@ -445,7 +443,6 @@ fn extract_consumer_repo(
                         method: call.method,
                         normalized_path: call.normalized_path.clone(),
                         line: call.line,
-                        snippet: call.snippet.clone(),
                     });
                 }
 
@@ -458,7 +455,6 @@ fn extract_consumer_repo(
                             normalized_path: call.normalized_path.clone(),
                             field_path: read.field_path.clone(),
                             line: read.line,
-                            snippet: read.snippet.clone(),
                             call_file: file_path.clone(),
                             call_line: call.line,
                             confidence: Confidence::Confirmed,
@@ -471,7 +467,6 @@ fn extract_consumer_repo(
                     unresolved.push(CachedUnresolvedCall {
                         file: file_path.clone(),
                         line: item.line,
-                        snippet: item.snippet,
                         reason: item.reason,
                     });
                 }
@@ -498,7 +493,6 @@ fn extract_consumer_repo(
                     method: call.method,
                     normalized_path: call.normalized_path.clone(),
                     line: call.line,
-                    snippet: call.snippet.clone(),
                 });
 
                 if let Some(ref response_type) = call.response_type {
@@ -511,7 +505,6 @@ fn extract_consumer_repo(
                             normalized_path: call.normalized_path.clone(),
                             field_path: field_def.field_path,
                             line: field_def.line,
-                            snippet: field_def.snippet,
                             call_file: file_path.clone(),
                             call_line: call.line,
                             confidence: Confidence::Likely,
@@ -530,7 +523,6 @@ fn extract_consumer_repo(
                         normalized_path: call.normalized_path.clone(),
                         field_path: read.field_path.clone(),
                         line: read.line,
-                        snippet: read.snippet.clone(),
                         call_file: file_path.clone(),
                         call_line: call.line,
                         confidence: Confidence::Confirmed,
@@ -543,7 +535,6 @@ fn extract_consumer_repo(
                 unresolved.push(CachedUnresolvedCall {
                     file: file_path.clone(),
                     line: item.line,
-                    snippet: item.snippet,
                     reason: item.reason,
                 });
             }
@@ -588,7 +579,6 @@ fn extract_consumer_repo(
                 normalized_path: item.normalized_path,
                 field_path: item.field_path,
                 line: item.read_line,
-                snippet: item.read_snippet,
                 call_file: item.origin_file,
                 call_line: item.origin_line,
                 confidence: item.confidence,
@@ -604,7 +594,6 @@ fn extract_consumer_repo(
             &a.target_service,
             a.method,
             &a.normalized_path,
-            &a.snippet,
         )
             .cmp(&(
                 &b.file,
@@ -612,7 +601,6 @@ fn extract_consumer_repo(
                 &b.target_service,
                 b.method,
                 &b.normalized_path,
-                &b.snippet,
             ))
     });
 
@@ -627,7 +615,6 @@ fn extract_consumer_repo(
             &a.normalized_path,
             &a.field_path,
             a.confidence,
-            &a.snippet,
         )
             .cmp(&(
                 &b.file,
@@ -639,13 +626,11 @@ fn extract_consumer_repo(
                 &b.normalized_path,
                 &b.field_path,
                 b.confidence,
-                &b.snippet,
             ))
     });
 
-    unresolved_calls.sort_by(|a, b| {
-        (&a.file, a.line, &a.reason, &a.snippet).cmp(&(&b.file, b.line, &b.reason, &b.snippet))
-    });
+    unresolved_calls
+        .sort_by(|a, b| (&a.file, a.line, &a.reason).cmp(&(&b.file, b.line, &b.reason)));
 
     Ok(CachedConsumerRepo {
         files_analyzed: file_contents.len(),
@@ -655,6 +640,7 @@ fn extract_consumer_repo(
     })
 }
 
+// Genera descripciones a partir de los hechos y conserva la ubicación de cada evidencia.
 fn apply_cached_consumer_repo(
     service_name: &str,
     consumer_rev: &str,
@@ -674,7 +660,7 @@ fn apply_cached_consumer_repo(
             edge.method,
             &edge.normalized_path,
             edge.line,
-            &edge.snippet,
+            "HTTP call",
         );
     }
 
@@ -688,7 +674,7 @@ fn apply_cached_consumer_repo(
             &read.normalized_path,
             &read.field_path,
             read.line,
-            &read.snippet,
+            &format!("Response field: {}", read.field_path),
             &read.call_file,
             read.call_line,
             read.confidence,
@@ -704,7 +690,7 @@ fn apply_cached_consumer_repo(
                 revision: consumer_rev.to_string(),
                 file: unresolved.file.clone(),
                 line: unresolved.line,
-                snippet: unresolved.snippet.clone(),
+                snippet: "Unresolved HTTP call".into(),
             },
             reason: unresolved.reason.clone(),
         });

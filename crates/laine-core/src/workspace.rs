@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
-    WorkspaceConfig,
+    WorkspaceConfig, matching_http_url,
 };
 use crate::error::{LaineError, Result};
 use crate::git::GitRepo;
@@ -370,6 +370,7 @@ fn path_equals_ci(a: &Path, b: &Path) -> bool {
     path_starts_with_ci(a, b) && path_starts_with_ci(b, a)
 }
 
+// Lee las URL sugeridas y guarda solo los componentes necesarios para resolver rutas.
 fn detect_env_urls_in_repo(repo_root: &Path) -> BTreeMap<String, String> {
     let mut env_map = BTreeMap::new();
     for filename in [".env.example", ".env.development"] {
@@ -398,10 +399,8 @@ fn detect_env_urls_in_repo(repo_root: &Path) -> BTreeMap<String, String> {
                 continue;
             }
             let val = raw_val.trim().trim_matches('"').trim_matches('\'').trim();
-            if val.starts_with("http://") || val.starts_with("https://") {
-                env_map
-                    .entry(key.to_string())
-                    .or_insert_with(|| val.to_string());
+            if let Some(url) = matching_http_url(val) {
+                env_map.entry(key.to_string()).or_insert(url);
             }
         }
     }
@@ -1278,6 +1277,7 @@ mod tests {
     }
 
     #[test]
+    // Verifica que la configuración detectada mantenga la ruta base y omita las credenciales.
     fn build_workspace_config_detects_env_urls_and_maps_custom_clients_to_matching_producer() {
         let tmp =
             std::env::temp_dir().join(format!("laine-ws-autodetect-test-{}", std::process::id()));
@@ -1312,7 +1312,7 @@ mod tests {
         fs::write(portal.join("nuxt.config.ts"), "export default {}\n").unwrap();
         fs::write(
             portal.join(".env.example"),
-            "# comment\nNUXT_PUBLIC_API=https://api.cerebro.local/api\nRECAPTCHA_KEY=secret-should-be-ignored\nEMPTY_URL=\n",
+            "# comment\nNUXT_PUBLIC_API=https://example:FICTITIOUS_PASSWORD@api.cerebro.local:8443/api?sig=FICTITIOUS_SIGNATURE#FICTITIOUS_FRAGMENT\nRECAPTCHA_KEY=secret-should-be-ignored\nEMPTY_URL=\n",
         )
         .unwrap();
         fs::create_dir_all(portal.join("app/services")).unwrap();
@@ -1333,9 +1333,13 @@ export function reset() {
 
         assert_eq!(
             cfg.env.get("NUXT_PUBLIC_API").map(String::as_str),
-            Some("https://api.cerebro.local/api")
+            Some("https://api.cerebro.local:8443/api")
         );
         assert!(!cfg.env.contains_key("RECAPTCHA_KEY"));
+        let config_path = tmp.join("laine.toml");
+        cfg.save_to_path(&config_path).unwrap();
+        let raw = fs::read_to_string(config_path).unwrap();
+        assert!(!raw.contains("FICTITIOUS_"));
 
         assert_eq!(
             cfg.clients.len(),

@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use laine_cli::engine::{AnalyzeRequest, index_workspace, run_analysis_with_options};
-use laine_cli::report::{render_json, render_markdown, render_terminal};
+use laine_cli::report::{omit_snippets, render_json, render_markdown, render_terminal};
 use laine_core::config::{
     PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig,
 };
@@ -105,6 +105,9 @@ enum Commands {
         /// Bypass the SQLite incremental extraction cache
         #[arg(long)]
         no_cache: bool,
+        /// Suppress evidence snippets and detailed errors in publishable reports
+        #[arg(long)]
+        no_snippets: bool,
     },
     /// Analyze cross-repository impact between two Git revisions
     Analyze {
@@ -126,6 +129,9 @@ enum Commands {
         /// Bypass the SQLite incremental extraction cache
         #[arg(long)]
         no_cache: bool,
+        /// Suppress evidence snippets and detailed errors in publishable reports
+        #[arg(long)]
+        no_snippets: bool,
     },
 }
 
@@ -234,6 +240,7 @@ version = 1
 # target_service = "customer-service"
 "#;
 
+// Interpreta los argumentos y ejecuta el comando seleccionado.
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -304,6 +311,7 @@ fn main() -> ExitCode {
             staged,
             format,
             no_cache,
+            no_snippets,
         } => {
             let cwd = match env::current_dir() {
                 Ok(dir) => dir,
@@ -328,7 +336,7 @@ fn main() -> ExitCode {
             ) {
                 Ok(ctx) => ctx,
                 Err(err) => {
-                    eprintln!("Check error: {err}");
+                    print_analysis_error("Check", &err, no_snippets);
                     return ExitCode::FAILURE;
                 }
             };
@@ -341,6 +349,7 @@ fn main() -> ExitCode {
                 effective_head,
                 format,
                 no_cache,
+                no_snippets,
             )
         }
         Commands::Analyze {
@@ -350,7 +359,8 @@ fn main() -> ExitCode {
             head,
             format,
             no_cache,
-        } => execute_analysis(config, repo, base, head, format, no_cache),
+            no_snippets,
+        } => execute_analysis(config, repo, base, head, format, no_cache, no_snippets),
     }
 }
 
@@ -876,6 +886,7 @@ fn filter_selected_repos(
     Ok(selected)
 }
 
+// Ejecuta el análisis y aplica la opción de privacidad antes de imprimir resultados y errores.
 fn execute_analysis(
     config: PathBuf,
     repo: String,
@@ -883,12 +894,13 @@ fn execute_analysis(
     head: String,
     format: OutputFormat,
     no_cache: bool,
+    no_snippets: bool,
 ) -> ExitCode {
     let started = Instant::now();
     let workspace_cfg = match WorkspaceConfig::load_from_path(&config) {
         Ok(cfg) => cfg,
         Err(err) => {
-            eprintln!("Analysis error: {err}");
+            print_analysis_error("Analysis", &err, no_snippets);
             return ExitCode::FAILURE;
         }
     };
@@ -900,7 +912,10 @@ fn execute_analysis(
     };
 
     match run_analysis_with_options(&req, no_cache) {
-        Ok(report) => {
+        Ok(mut report) => {
+            if no_snippets {
+                omit_snippets(&mut report);
+            }
             let elapsed_ms = started.elapsed().as_millis();
             let policy_eval = evaluate_policy(&report, &workspace_cfg.policy);
 
@@ -927,8 +942,17 @@ fn execute_analysis(
             }
         }
         Err(err) => {
-            eprintln!("Analysis error: {err}");
+            print_analysis_error("Analysis", &err, no_snippets);
             ExitCode::FAILURE
         }
+    }
+}
+
+// Evita que un error con texto de entrada termine en un reporte compartido.
+fn print_analysis_error(command: &str, error: &impl std::fmt::Display, no_snippets: bool) {
+    if no_snippets {
+        eprintln!("{command} failed. Run locally without --no-snippets for details.");
+    } else {
+        eprintln!("{command} error: {error}");
     }
 }

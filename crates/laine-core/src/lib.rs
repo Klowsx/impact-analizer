@@ -10,3 +10,4 @@ pub mod model;
 pub mod openapi;
 pub mod policy;
 pub mod routes;
+pub mod workspace;

@@ -104,6 +104,25 @@ laine analyze \
 ### Initialize Your Own Workspace
 
 ```bash
+# Auto-discover Git repos in a folder and interactively pick only the ones that belong to this ecosystem
+laine init --scan ./projects --workspace corporativo
+
+# Or select explicitly (great for scripts and AI agents)
+laine init --scan ./projects --select cerebro-web,portal-corporativo --workspace corporativo
+
+# Register an existing laine.toml under a named workspace
+laine workspace add corporativo ./laine.corporativo.toml
+laine workspace list
+
+# Run zero-flag impact checks from inside any registered repository (defaults to HEAD -> WORKTREE)
+cd ./projects/cerebro-web
+laine check
+laine check --staged
+```
+
+You can also configure a workspace manually:
+
+```bash
 laine init
 laine repo add ./customer-service --openapi openapi.yaml --base-url http://customer-service
 laine repo add ./billing-service --base-url http://billing-service

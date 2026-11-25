@@ -1,0 +1,191 @@
+use std::fs;
+use std::path::Path;
+use std::process::Command;
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_DATE", "2026-02-02T12:00:00Z")
+        .env("GIT_COMMITTER_DATE", "2026-02-02T12:00:00Z")
+        .output()
+        .expect("git command should run");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn init_repo(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    git(dir, &["init", "-b", "main"]);
+    git(dir, &["config", "user.name", "Laine Test"]);
+    git(dir, &["config", "user.email", "test@laine.local"]);
+}
+
+#[test]
+fn init_scan_registers_isolated_workspaces_and_laine_check_runs_zero_flag_from_repo_cwd() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-workspaces-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    let laine_home = tmp.join("laine-home");
+    let projects = tmp.join("Projects");
+    fs::create_dir_all(&projects).unwrap();
+
+    // Ecosystem A: laravel-a + portal-a
+    let laravel_a = projects.join("laravel-a");
+    init_repo(&laravel_a);
+    fs::write(laravel_a.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    fs::create_dir_all(laravel_a.join("routes")).unwrap();
+    fs::write(
+        laravel_a.join("routes/api.php"),
+        "<?php\nRoute::post('/orders/create', 'OrderController@create');\n",
+    )
+    .unwrap();
+    git(&laravel_a, &["add", "."]);
+    git(&laravel_a, &["commit", "-m", "init laravel-a"]);
+
+    let portal_a = projects.join("portal-a");
+    init_repo(&portal_a);
+    fs::write(portal_a.join("package.json"), r#"{"name": "portal-a"}"#).unwrap();
+    fs::create_dir_all(portal_a.join("src")).unwrap();
+    fs::write(
+        portal_a.join("src/orders.ts"),
+        "export function createOrder() {\n  return fetch('http://laravel-a/api/orders/create', { method: 'POST' });\n}\n",
+    )
+    .unwrap();
+    git(&portal_a, &["add", "."]);
+    git(&portal_a, &["commit", "-m", "init portal-a"]);
+
+    // Ecosystem B (unrelated repos living in the same Projects/ folder): laravel-b + portal-b
+    let laravel_b = projects.join("laravel-b");
+    init_repo(&laravel_b);
+    fs::write(laravel_b.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    fs::create_dir_all(laravel_b.join("routes")).unwrap();
+    fs::write(
+        laravel_b.join("routes/api.php"),
+        "<?php\nRoute::get('/status', 'StatusController@index');\n",
+    )
+    .unwrap();
+    git(&laravel_b, &["add", "."]);
+    git(&laravel_b, &["commit", "-m", "init laravel-b"]);
+
+    let portal_b = projects.join("portal-b");
+    init_repo(&portal_b);
+    fs::write(portal_b.join("package.json"), r#"{"name": "portal-b"}"#).unwrap();
+    fs::create_dir_all(portal_b.join("src")).unwrap();
+    fs::write(
+        portal_b.join("src/status.ts"),
+        "export function checkStatus() {\n  return fetch('http://laravel-b/api/status');\n}\n",
+    )
+    .unwrap();
+    git(&portal_b, &["add", "."]);
+    git(&portal_b, &["commit", "-m", "init portal-b"]);
+
+    let bin = env!("CARGO_BIN_EXE_laine");
+    let cfg_a = tmp.join("laine.eco-a.toml");
+    let cfg_b = tmp.join("laine.eco-b.toml");
+
+    // 1. Scan Projects/ and create two separate named workspaces selecting only their respective repos
+    let scan_a = Command::new(bin)
+        .env("LAINE_HOME", &laine_home)
+        .args([
+            "init",
+            "--scan",
+            projects.to_str().unwrap(),
+            "--select",
+            "laravel-a,portal-a",
+            "--workspace",
+            "eco-a",
+            "--path",
+            cfg_a.to_str().unwrap(),
+        ])
+        .output()
+        .expect("laine init --scan should run for eco-a");
+    assert!(
+        scan_a.status.success(),
+        "eco-a init --scan failed: {}",
+        String::from_utf8_lossy(&scan_a.stderr)
+    );
+
+    let scan_b = Command::new(bin)
+        .env("LAINE_HOME", &laine_home)
+        .args([
+            "init",
+            "--scan",
+            projects.to_str().unwrap(),
+            "--select",
+            "laravel-b,portal-b",
+            "--workspace",
+            "eco-b",
+            "--path",
+            cfg_b.to_str().unwrap(),
+        ])
+        .output()
+        .expect("laine init --scan should run for eco-b");
+    assert!(
+        scan_b.status.success(),
+        "eco-b init --scan failed: {}",
+        String::from_utf8_lossy(&scan_b.stderr)
+    );
+
+    // 2. Verify `laine workspace list` shows both workspaces
+    let list_out = Command::new(bin)
+        .env("LAINE_HOME", &laine_home)
+        .args(["workspace", "list"])
+        .output()
+        .expect("laine workspace list should run");
+    assert!(list_out.status.success());
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    assert!(list_stdout.contains("eco-a"), "got:\n{list_stdout}");
+    assert!(list_stdout.contains("eco-b"), "got:\n{list_stdout}");
+
+    // 3. Remove `/orders/create` locally in laravel-a (uncommitted WORKTREE)
+    fs::write(laravel_a.join("routes/api.php"), "<?php\n").unwrap();
+
+    // 4. Run `laine check` with ZERO flags from inside laravel-a!
+    let check_out = Command::new(bin)
+        .current_dir(&laravel_a)
+        .env("LAINE_HOME", &laine_home)
+        .args(["check"])
+        .output()
+        .expect("laine check should run");
+    let check_stdout = String::from_utf8_lossy(&check_out.stdout);
+    let check_stderr = String::from_utf8_lossy(&check_out.stderr);
+    assert_eq!(
+        check_out.status.code(),
+        Some(2),
+        "expected exit code 2 from zero-flag `laine check`.\nstdout:\n{check_stdout}\nstderr:\n{check_stderr}"
+    );
+    assert!(
+        check_stdout.contains("Analyzed: 2 repos"),
+        "eco-a should only analyze its 2 repos (never eco-b), got:\n{check_stdout}"
+    );
+    assert!(
+        check_stdout.contains("portal-a/src/orders.ts:2"),
+        "expected portal-a consumer hit, got:\n{check_stdout}"
+    );
+    assert!(
+        !check_stdout.contains("portal-b") && !check_stdout.contains("laravel-b"),
+        "eco-b repos must not leak into eco-a check, got:\n{check_stdout}"
+    );
+
+    // 5. `laine check --staged` should pass (exit 0) because the deletion is unstaged
+    let staged_out = Command::new(bin)
+        .current_dir(&laravel_a)
+        .env("LAINE_HOME", &laine_home)
+        .args(["check", "--staged"])
+        .output()
+        .expect("laine check --staged should run");
+    assert_eq!(
+        staged_out.status.code(),
+        Some(0),
+        "expected exit code 0 for --staged, got:\n{}",
+        String::from_utf8_lossy(&staged_out.stdout)
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}

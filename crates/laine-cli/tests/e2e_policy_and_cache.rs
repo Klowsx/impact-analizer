@@ -8,6 +8,84 @@ use laine_core::config::WorkspaceConfig;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::model::Severity;
 
+// Verifica que dos productores con la misma URL den el mismo diagnóstico en cualquier orden.
+#[test]
+fn reports_ambiguous_service_urls_consistently_with_and_without_cache() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-ambiguous-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let paths = create_demo_workspace(&tmp).unwrap();
+    let mut config = WorkspaceConfig::load_from_path(&paths.config_path).unwrap();
+    let duplicate = config.services[0].base_urls.clone();
+    config
+        .services
+        .iter_mut()
+        .find(|s| s.name == "shipping-service")
+        .unwrap()
+        .base_urls = duplicate;
+    config.save_to_path(&paths.config_path).unwrap();
+
+    fs::write(
+        paths.billing_service.join("ambiguous_url.py"),
+        "import requests\nrequests.get('http://customer-service/customers/42')\n",
+    )
+    .unwrap();
+    for args in [
+        &["add", "ambiguous_url.py"][..],
+        &["commit", "-m", "test: add Python call"][..],
+    ] {
+        let output = Command::new("git")
+            .current_dir(&paths.billing_service)
+            .args([
+                "-c",
+                "user.name=Laine Test",
+                "-c",
+                "user.email=test@laine.local",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    let request = AnalyzeRequest {
+        config_path: paths.config_path.clone(),
+        target_repo: "customer-service".into(),
+        base_rev: "main".into(),
+        head_rev: "feature/split-customer-name".into(),
+    };
+    let original = run_analysis_with_options(&request, false).unwrap();
+    let ambiguous: Vec<_> = original
+        .unresolved_calls
+        .iter()
+        .filter(|c| {
+            c.reason
+                == "ambiguous service base URL (candidates: customer-service, shipping-service)"
+        })
+        .collect();
+    assert!(
+        ambiguous
+            .iter()
+            .any(|call| call.evidence.file.ends_with(".ts"))
+    );
+    assert!(
+        ambiguous
+            .iter()
+            .any(|call| call.evidence.file == "ambiguous_url.py")
+    );
+    assert!(original.findings.iter().all(|f| f.consumers.is_empty()));
+
+    config.services.reverse();
+    config.save_to_path(&paths.config_path).unwrap();
+    for bypass in [false, true] {
+        let reordered = run_analysis_with_options(&request, bypass).unwrap();
+        assert_eq!(
+            render_json(&original).unwrap(),
+            render_json(&reordered).unwrap()
+        );
+    }
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
 #[test]
 fn index_workspace_populates_sqlite_cache_and_matches_uncached_json_byte_for_byte() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-cache-{}", std::process::id()));

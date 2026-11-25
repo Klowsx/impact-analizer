@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use laine_core::config::{CustomClientConfig, ServiceConfig};
+use laine_core::config::{CustomClientConfig, ServiceConfig, resolve_http_service_url};
 use laine_core::model::HttpMethod;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
@@ -15,7 +15,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
 use serde::{Deserialize, Serialize};
 
-use crate::url::{is_absolute_http_url, normalize_relative_path, resolve_url_against_services};
+use crate::url::{is_absolute_http_url, normalize_relative_path};
 use crate::vue::{extract_vue_scripts_with_setup, extract_vue_template_expressions};
 
 const UNMAPPED_ENV: &str = "unmapped environment variable (configure under `[env]` in laine.toml)";
@@ -866,6 +866,7 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
+    // Extrae llamadas HTTP y registra diagnósticos para bases ambiguas.
     fn process_http_call(&mut self, call: &CallExpression<'_>) -> Option<(CallResultShape, usize)> {
         let target = self.classify_http_call(call)?;
         if !self.seen_call_spans.insert(call.span.start) {
@@ -924,7 +925,7 @@ impl<'s> FileExtractor<'s> {
             UrlEval::Resolved(url_str) => {
                 let matched = match &target {
                     CallTarget::Fetch(_) | CallTarget::UseFetch(_) | CallTarget::Axios(_) => {
-                        resolve_url_against_services(&url_str, self.ctx.services)
+                        resolve_http_service_url(&url_str, self.ctx.services)
                     }
                     CallTarget::AxiosInstance { base_url, .. } => {
                         let full_url = if is_absolute_http_url(&url_str) {
@@ -934,7 +935,7 @@ impl<'s> FileExtractor<'s> {
                             let rel = url_str.trim_start_matches('/');
                             format!("{base}/{rel}")
                         };
-                        resolve_url_against_services(&full_url, self.ctx.services)
+                        resolve_http_service_url(&full_url, self.ctx.services)
                     }
                     CallTarget::Custom {
                         target_service,
@@ -942,34 +943,44 @@ impl<'s> FileExtractor<'s> {
                         ..
                     } => {
                         if is_absolute_http_url(&url_str) {
-                            resolve_url_against_services(&url_str, self.ctx.services)
+                            resolve_http_service_url(&url_str, self.ctx.services)
                         } else {
-                            Some(crate::url::ServiceEndpointMatch {
+                            Ok(Some(crate::url::ServiceEndpointMatch {
                                 service: target_service.clone(),
                                 normalized_path: normalize_relative_path(
                                     &url_str,
                                     path_prefix.as_deref(),
                                 ),
-                            })
+                            }))
                         }
                     }
                 };
 
-                if let Some(matched) = matched {
-                    let id = self.calls.len();
-                    self.calls.push(ExtractedHttpCall {
-                        id,
-                        client: client_kind,
-                        service: matched.service,
-                        method,
-                        normalized_path: matched.normalized_path,
-                        response_type,
-                        line,
-                        snippet,
-                    });
-                    Some((result_shape, id))
-                } else {
-                    None
+                match matched {
+                    Ok(Some(matched)) => {
+                        let id = self.calls.len();
+                        self.calls.push(ExtractedHttpCall {
+                            id,
+                            client: client_kind,
+                            service: matched.service,
+                            method,
+                            normalized_path: matched.normalized_path,
+                            response_type,
+                            line,
+                            snippet,
+                        });
+                        Some((result_shape, id))
+                    }
+                    Ok(None) => None,
+                    Err(reason) => {
+                        self.unresolved_calls.push(ExtractedUnresolvedCall {
+                            client: client_kind,
+                            line,
+                            snippet,
+                            reason,
+                        });
+                        None
+                    }
                 }
             }
             UrlEval::Dynamic(reason) => {

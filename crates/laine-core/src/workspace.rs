@@ -10,6 +10,7 @@ use crate::config::{
     WorkspaceConfig,
 };
 use crate::error::{LaineError, Result};
+use crate::git::GitRepo;
 use crate::graph::routes_match;
 use crate::laravel::extract_laravel_routes;
 use crate::model::Severity;
@@ -343,21 +344,17 @@ pub fn merge_workspace_config(
     }
 
     // Preserve existing `[[clients]]` whose `target_service` is still selected,
-    // without duplicating clients already auto-detected by `build_workspace_config`.
+    // without duplicating a `callee` already auto-detected by `build_workspace_config`.
     let kept_service_names: BTreeSet<&str> =
         merged.services.iter().map(|s| s.name.as_str()).collect();
-    let mut existing_client_keys: BTreeSet<(String, String)> = merged
-        .clients
-        .iter()
-        .map(|c| (c.callee.clone(), c.target_service.clone()))
-        .collect();
+    let mut existing_callees: BTreeSet<String> =
+        merged.clients.iter().map(|c| c.callee.clone()).collect();
 
     for old_client in &existing.clients {
         if !kept_service_names.contains(old_client.target_service.as_str()) {
             continue;
         }
-        let key = (old_client.callee.clone(), old_client.target_service.clone());
-        if existing_client_keys.insert(key) {
+        if existing_callees.insert(old_client.callee.clone()) {
             merged.clients.push(old_client.clone());
         }
     }
@@ -453,11 +450,21 @@ fn detect_custom_clients(repos: &[DiscoveredRepo]) -> Vec<CustomClientConfig> {
     clients
 }
 
+fn read_repo_file_preferring_head(repo_root: &Path, rel: &Path) -> Option<String> {
+    let git = GitRepo::new(repo_root);
+    if let Ok(committed) = git.read_file("HEAD", rel) {
+        return Some(committed);
+    }
+    fs::read(repo_root.join(rel))
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn build_producer_catalog(repo: &DiscoveredRepo) -> ProducerCatalog {
     let mut routes = BTreeSet::new();
 
     if let Some(openapi_rel) = repo.openapi.as_deref()
-        && let Ok(raw) = fs::read_to_string(repo.path.join(openapi_rel))
+        && let Some(raw) = read_repo_file_preferring_head(&repo.path, openapi_rel)
         && let Ok(contract) = extract_contract(&repo.name, &raw)
     {
         for ep in contract.endpoints.keys() {
@@ -467,8 +474,7 @@ fn build_producer_catalog(repo: &DiscoveredRepo) -> ProducerCatalog {
 
     if repo.framework == Some(RouteFramework::Laravel) {
         for rel in &repo.route_files {
-            if let Ok(bytes) = fs::read(repo.path.join(rel)) {
-                let raw = String::from_utf8_lossy(&bytes);
+            if let Some(raw) = read_repo_file_preferring_head(&repo.path, rel) {
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
                 for extracted in
                     extract_laravel_routes(&repo.name, &rel_str, &raw, repo.route_prefix.as_deref())
@@ -1446,6 +1452,92 @@ export function reset() {
                 && c.target_service == "cerebro-web"
                 && c.path_prefix.as_deref() == Some("/api")
         }));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn autodetects_correct_producer_from_head_even_when_worktree_renames_route() {
+        let tmp =
+            std::env::temp_dir().join(format!("laine-ws-head-catalog-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let commit_all = |dir: &Path| {
+            for args in [
+                vec!["config", "user.name", "Laine Test"],
+                vec!["config", "user.email", "test@laine.local"],
+                vec!["add", "."],
+                vec!["commit", "-m", "init"],
+            ] {
+                let status = Command::new("git")
+                    .current_dir(dir)
+                    .args(&args)
+                    .status()
+                    .expect("git should run");
+                assert!(status.success());
+            }
+        };
+
+        // Producer 1 (competing backend): also exposes `corp/{accion}`
+        let servicios = tmp.join("cerebro-servicios");
+        init_git_repo(&servicios);
+        fs::write(servicios.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+        fs::create_dir_all(servicios.join("routes")).unwrap();
+        fs::write(
+            servicios.join("routes/api.php"),
+            "<?php\nRoute::post('corp/{accion}', [Servicios::class, 'accion']);\n",
+        )
+        .unwrap();
+        commit_all(&servicios);
+
+        // Producer 2 (true backend): exposes `corp/{accion}/{param?}`, `web/{accion}/{param?}`, `/reset_password`
+        let web = tmp.join("cerebro-web");
+        init_git_repo(&web);
+        fs::write(web.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+        fs::create_dir_all(web.join("routes")).unwrap();
+        fs::write(
+            web.join("routes/api.php"),
+            "<?php\nRoute::post('corp/{accion}/{param?}', [Corp::class, 'accion']);\nRoute::post('web/{accion}/{param?}', [Web::class, 'accion']);\nRoute::post('/reset_password', 'Auth@reset');\n",
+        )
+        .unwrap();
+        commit_all(&web);
+
+        // Simulate uncommitted breaking rename in cerebro-web's working tree
+        fs::write(
+            web.join("routes/api.php"),
+            "<?php\nRoute::post('corp2/{accion}/{param?}', [Corp::class, 'accion']);\nRoute::post('web/{accion}/{param?}', [Web::class, 'accion']);\nRoute::post('/reset_password', 'Auth@reset');\n",
+        )
+        .unwrap();
+
+        // Consumer calls 3 `/corp/*` routes + `/web/getRateCars` + `/reset_password`
+        let portal = tmp.join("portal");
+        init_git_repo(&portal);
+        fs::write(portal.join("nuxt.config.ts"), "export default {}\n").unwrap();
+        fs::create_dir_all(portal.join("app/services")).unwrap();
+        fs::write(
+            portal.join("app/services/api.ts"),
+            r#"export const api = {
+  login: () => getClient().fetch('/corp/loginCorp', { method: 'POST' }),
+  me: () => getClient().fetch('/corp/me', { method: 'POST' }),
+  list: () => getClient().fetch('/corp/listBooking', { method: 'POST' }),
+  rates: () => getClient().fetch('/web/getRateCars', { method: 'POST' }),
+  reset: () => getClient().fetch('/reset_password', { method: 'POST' }),
+};
+"#,
+        )
+        .unwrap();
+        commit_all(&portal);
+
+        let repos = scan_directory(&tmp).unwrap();
+        let cfg = build_workspace_config(&repos, &tmp, false);
+
+        assert_eq!(cfg.clients.len(), 1);
+        assert_eq!(cfg.clients[0].callee, "getClient().fetch");
+        assert_eq!(
+            cfg.clients[0].target_service, "cerebro-web",
+            "must match committed HEAD routes (5 hits) instead of losing to cerebro-servicios (3 hits) due to uncommitted worktree rename"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

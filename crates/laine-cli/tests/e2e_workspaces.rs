@@ -189,3 +189,93 @@ fn init_scan_registers_isolated_workspaces_and_laine_check_runs_zero_flag_from_r
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn init_scan_defaults_to_cwd_saves_in_laine_home_configs_and_autodetects_custom_client() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-scan-ux-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    let laine_home = tmp.join("laine-home");
+    let projects = tmp.join("Projects");
+    fs::create_dir_all(&projects).unwrap();
+
+    // Backend Laravel repo
+    let backend = projects.join("cerebro-web");
+    init_repo(&backend);
+    fs::write(backend.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    fs::create_dir_all(backend.join("routes")).unwrap();
+    fs::write(
+        backend.join("routes/api.php"),
+        "<?php\nRoute::post('corp/{accion}/{param?}', [Corporativo::class, 'accion']);\n",
+    )
+    .unwrap();
+    git(&backend, &["add", "."]);
+    git(&backend, &["commit", "-m", "init backend"]);
+
+    // Frontend Nuxt repo using custom wrapper `getClient().fetch('/corp/loginCorp')`
+    let frontend = projects.join("portal-web");
+    init_repo(&frontend);
+    fs::write(frontend.join("nuxt.config.ts"), "export default {}\n").unwrap();
+    fs::create_dir_all(frontend.join("app/services")).unwrap();
+    fs::write(
+        frontend.join("app/services/auth.ts"),
+        "export function login() {\n  return getClient().fetch('/corp/loginCorp', { method: 'POST' });\n}\n",
+    )
+    .unwrap();
+    git(&frontend, &["add", "."]);
+    git(&frontend, &["commit", "-m", "init frontend"]);
+
+    let bin = env!("CARGO_BIN_EXE_laine");
+
+    // 1. Run `laine init --scan --all --workspace corp` from inside `Projects/`
+    //    WITHOUT passing a path after `--scan` and WITHOUT passing `--path`!
+    let init_out = Command::new(bin)
+        .current_dir(&projects)
+        .env("LAINE_HOME", &laine_home)
+        .args(["init", "--scan", "--all", "--workspace", "corp"])
+        .output()
+        .expect("laine init --scan should run");
+    assert!(
+        init_out.status.success(),
+        "laine init --scan failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&init_out.stdout),
+        String::from_utf8_lossy(&init_out.stderr)
+    );
+
+    // Config must be stored cleanly inside `$LAINE_HOME/configs/corp.toml`, NOT in `Projects/`
+    let expected_cfg = laine_home.join("configs").join("corp.toml");
+    assert!(
+        expected_cfg.is_file(),
+        "expected config at {}",
+        expected_cfg.display()
+    );
+    assert!(
+        !projects.join("laine.corp.toml").exists(),
+        "should not clutter cwd with laine.corp.toml"
+    );
+
+    // 2. Remove the route locally (uncommitted WORKTREE) and run zero-flag `laine check`
+    //    WITHOUT manually editing the generated config!
+    fs::write(backend.join("routes/api.php"), "<?php\n").unwrap();
+
+    let check_out = Command::new(bin)
+        .current_dir(&backend)
+        .env("LAINE_HOME", &laine_home)
+        .args(["check"])
+        .output()
+        .expect("laine check should run");
+    let stdout = String::from_utf8_lossy(&check_out.stdout);
+    let stderr = String::from_utf8_lossy(&check_out.stderr);
+    assert_eq!(
+        check_out.status.code(),
+        Some(2),
+        "expected exit code 2 via auto-detected custom client.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("portal-web/app/services/auth.ts:2"),
+        "expected auto-detected custom client consumer hit, got:\n{stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}

@@ -139,6 +139,14 @@ impl WorkspaceConfig {
     }
 
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|source| LaineError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
         let serialized = toml::to_string_pretty(self)
             .map_err(|err| LaineError::ConfigInvalid(err.to_string()))?;
         fs::write(path, serialized).map_err(|source| LaineError::Io {

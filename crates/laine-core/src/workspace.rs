@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,10 +6,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
-    PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig,
+    CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
+    WorkspaceConfig,
 };
 use crate::error::{LaineError, Result};
+use crate::graph::routes_match;
+use crate::laravel::extract_laravel_routes;
 use crate::model::Severity;
+use crate::openapi::{canonical_route_key, extract_contract};
 
 /// Registry mapping named workspaces (e.g. `corporativo`, `proyecto-b`) to their
 /// `laine.toml` file paths so developers can maintain multiple isolated ecosystems
@@ -49,12 +53,12 @@ impl WorkspaceRegistry {
         }
     }
 
-    /// Returns the default registry path (`$LAINE_HOME/workspaces.toml` or `~/.laine/workspaces.toml`).
-    pub fn default_path() -> Result<PathBuf> {
+    /// Returns the base directory for Laine user state (`$LAINE_HOME` or `~/.laine`).
+    pub fn default_home_dir() -> Result<PathBuf> {
         if let Ok(custom_home) = env::var("LAINE_HOME")
             && !custom_home.trim().is_empty()
         {
-            return Ok(PathBuf::from(custom_home).join("workspaces.toml"));
+            return Ok(PathBuf::from(custom_home));
         }
 
         let home = env::var("USERPROFILE")
@@ -67,7 +71,20 @@ impl WorkspaceRegistry {
                 )
             })?;
 
-        Ok(home.join(".laine").join("workspaces.toml"))
+        Ok(home.join(".laine"))
+    }
+
+    /// Returns the default registry path (`$LAINE_HOME/workspaces.toml` or `~/.laine/workspaces.toml`).
+    pub fn default_path() -> Result<PathBuf> {
+        Ok(Self::default_home_dir()?.join("workspaces.toml"))
+    }
+
+    /// Returns the default managed config path for a named workspace
+    /// (`$LAINE_HOME/configs/<name>.toml` or `~/.laine/configs/<name>.toml`).
+    pub fn default_config_path(workspace_name: &str) -> Result<PathBuf> {
+        Ok(Self::default_home_dir()?
+            .join("configs")
+            .join(format!("{workspace_name}.toml")))
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self> {
@@ -201,11 +218,20 @@ pub fn build_workspace_config(
         })
         .collect();
 
+    let mut env_vars = BTreeMap::new();
+    for repo in repos {
+        for (key, value) in detect_env_urls_in_repo(&repo.path) {
+            env_vars.entry(key).or_insert(value);
+        }
+    }
+
+    let clients = detect_custom_clients(repos);
+
     WorkspaceConfig {
         version: 1,
         services,
-        clients: Vec::new(),
-        env: BTreeMap::new(),
+        clients,
+        env: env_vars,
         policy: PolicyConfig {
             fail_on: Severity::High,
             ignore_endpoints: Vec::new(),
@@ -213,6 +239,334 @@ pub fn build_workspace_config(
         },
         cache_path: None,
     }
+}
+
+fn detect_env_urls_in_repo(repo_root: &Path) -> BTreeMap<String, String> {
+    let mut env_map = BTreeMap::new();
+    for filename in [".env.example", ".env.development"] {
+        let path = repo_root.join(filename);
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((raw_key, raw_val)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let key = raw_key.trim().trim_start_matches("export ").trim();
+            if key.is_empty() {
+                continue;
+            }
+            let key_upper = key.to_ascii_uppercase();
+            if key_upper.contains("SECRET")
+                || key_upper.contains("PASSWORD")
+                || key_upper.contains("TOKEN")
+                || key_upper.contains("KEY")
+            {
+                continue;
+            }
+            let val = raw_val.trim().trim_matches('"').trim_matches('\'').trim();
+            if val.starts_with("http://") || val.starts_with("https://") {
+                env_map
+                    .entry(key.to_string())
+                    .or_insert_with(|| val.to_string());
+            }
+        }
+    }
+    env_map
+}
+
+struct ProducerCatalog {
+    name: String,
+    prefix: Option<String>,
+    canonical_routes: Vec<String>,
+}
+
+fn detect_custom_clients(repos: &[DiscoveredRepo]) -> Vec<CustomClientConfig> {
+    let producers: Vec<ProducerCatalog> = repos
+        .iter()
+        .filter(|r| r.openapi.is_some() || r.framework.is_some())
+        .map(build_producer_catalog)
+        .collect();
+
+    if producers.is_empty() {
+        return Vec::new();
+    }
+
+    let mut observed_by_callee: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for repo in repos {
+        if repo.openapi.is_some() || repo.framework.is_some() {
+            continue;
+        }
+        collect_consumer_wrapper_paths(&repo.path, 0, &mut observed_by_callee);
+    }
+
+    let mut clients = Vec::new();
+    for (callee, paths) in observed_by_callee {
+        if paths.is_empty() {
+            continue;
+        }
+        if let Some(best) = select_best_producer(&producers, &paths) {
+            clients.push(CustomClientConfig {
+                callee,
+                target_service: best.name.clone(),
+                path_prefix: best.prefix.clone(),
+            });
+        }
+    }
+
+    clients
+}
+
+fn build_producer_catalog(repo: &DiscoveredRepo) -> ProducerCatalog {
+    let mut routes = BTreeSet::new();
+
+    if let Some(openapi_rel) = repo.openapi.as_deref()
+        && let Ok(raw) = fs::read_to_string(repo.path.join(openapi_rel))
+        && let Ok(contract) = extract_contract(&repo.name, &raw)
+    {
+        for ep in contract.endpoints.keys() {
+            routes.insert(canonical_route_key(&ep.normalized_path));
+        }
+    }
+
+    if repo.framework == Some(RouteFramework::Laravel) {
+        for rel in &repo.route_files {
+            if let Ok(bytes) = fs::read(repo.path.join(rel)) {
+                let raw = String::from_utf8_lossy(&bytes);
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                for extracted in
+                    extract_laravel_routes(&repo.name, &rel_str, &raw, repo.route_prefix.as_deref())
+                {
+                    routes.insert(canonical_route_key(&extracted.endpoint.normalized_path));
+                }
+            }
+        }
+    }
+
+    ProducerCatalog {
+        name: repo.name.clone(),
+        prefix: repo.route_prefix.clone(),
+        canonical_routes: routes.into_iter().collect(),
+    }
+}
+
+fn select_best_producer<'a>(
+    producers: &'a [ProducerCatalog],
+    consumer_paths: &BTreeSet<String>,
+) -> Option<&'a ProducerCatalog> {
+    let mut best: Option<(usize, &'a ProducerCatalog)> = None;
+
+    for producer in producers {
+        let mut hits = 0usize;
+        for raw_path in consumer_paths {
+            let prefixed = match producer.prefix.as_deref() {
+                Some(prefix) if !raw_path.starts_with(prefix) => {
+                    format!(
+                        "{}/{}",
+                        prefix.trim_end_matches('/'),
+                        raw_path.trim_start_matches('/')
+                    )
+                }
+                _ => raw_path.clone(),
+            };
+            let canonical_consumer = canonical_route_key(&prefixed);
+            if producer
+                .canonical_routes
+                .iter()
+                .any(|prod_key| routes_match(prod_key, &canonical_consumer))
+            {
+                hits += 1;
+            }
+        }
+
+        if hits > 0 && best.as_ref().is_none_or(|(best_hits, _)| hits > *best_hits) {
+            best = Some((hits, producer));
+        }
+    }
+
+    if let Some((_, producer)) = best {
+        return Some(producer);
+    }
+
+    // If there is only one producer and it has no statically scanned routes yet (e.g. Express),
+    // map the custom client to it as the single backend in this workspace.
+    if producers.len() == 1 {
+        return Some(&producers[0]);
+    }
+
+    None
+}
+
+fn collect_consumer_wrapper_paths(
+    dir: &Path,
+    depth: usize,
+    out: &mut BTreeMap<String, BTreeSet<String>>,
+) {
+    if depth > 5 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name_os) = path.file_name() else {
+            continue;
+        };
+        let name = name_os.to_string_lossy();
+        if path.is_dir() {
+            if name.starts_with('.')
+                || matches!(
+                    name.as_ref(),
+                    "node_modules" | "dist" | "build" | "coverage" | "vendor" | "target"
+                )
+            {
+                continue;
+            }
+            collect_consumer_wrapper_paths(&path, depth + 1, out);
+        } else if is_scannable_ts_source(&name)
+            && let Ok(bytes) = fs::read(&path)
+        {
+            let source = String::from_utf8_lossy(&bytes);
+            extract_wrapper_calls_from_source(&source, out);
+        }
+    }
+}
+
+fn is_scannable_ts_source(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.ends_with(".d.ts") {
+        return false;
+    }
+    lower.ends_with(".ts")
+        || lower.ends_with(".tsx")
+        || lower.ends_with(".js")
+        || lower.ends_with(".jsx")
+        || lower.ends_with(".vue")
+        || lower.ends_with(".mjs")
+}
+
+fn extract_wrapper_calls_from_source(source: &str, out: &mut BTreeMap<String, BTreeSet<String>>) {
+    const PATTERNS: &[(&str, &str)] = &[
+        ("getClient().fetch", "getClient().fetch"),
+        ("$fetch", "$fetch"),
+        ("apiClient.get", "apiClient"),
+        ("apiClient.post", "apiClient"),
+        ("apiClient.put", "apiClient"),
+        ("apiClient.patch", "apiClient"),
+        ("apiClient.delete", "apiClient"),
+        ("apiClient.fetch", "apiClient"),
+        ("httpClient.get", "httpClient"),
+        ("httpClient.post", "httpClient"),
+        ("httpClient.put", "httpClient"),
+        ("httpClient.patch", "httpClient"),
+        ("httpClient.delete", "httpClient"),
+        ("httpClient.fetch", "httpClient"),
+    ];
+
+    for (needle, callee) in PATTERNS {
+        let mut search_from = 0usize;
+        while let Some(rel_idx) = source[search_from..].find(needle) {
+            let start = search_from + rel_idx;
+            let after = start + needle.len();
+            search_from = after;
+
+            // Avoid matching inside a longer identifier (e.g. `my$fetch` or `xapiClient.get`)
+            if start > 0 {
+                let prev = source.as_bytes()[start - 1];
+                if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' {
+                    continue;
+                }
+            }
+
+            if let Some(path) = extract_first_relative_path_arg(&source[after..]) {
+                out.entry((*callee).to_string()).or_default().insert(path);
+            }
+        }
+    }
+}
+
+fn extract_first_relative_path_arg(rest: &str) -> Option<String> {
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+
+    // Skip whitespace
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    // Optional TypeScript generic type argument `<...>` before `(`
+    if bytes.get(i) == Some(&b'<') {
+        let mut depth = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'<' => depth += 1,
+                b'>' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+    }
+
+    if bytes.get(i) != Some(&b'(') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+
+    let quote = *bytes.get(i)?;
+    if quote != b'\'' && quote != b'"' && quote != b'`' {
+        return None;
+    }
+    i += 1;
+    let start = i;
+    while i < bytes.len() && bytes[i] != quote {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'\n' {
+            return None;
+        }
+        i += 1;
+    }
+    if bytes.get(i) != Some(&quote) {
+        return None;
+    }
+
+    let raw = &rest[start..i];
+    if !raw.starts_with('/') || raw.starts_with("//") {
+        return None;
+    }
+
+    // Strip query string and replace template interpolations `${...}` with `:param`
+    let without_query = raw.split('?').next().unwrap_or(raw);
+    let mut normalized = String::new();
+    let mut cursor = 0usize;
+    while let Some(pos) = without_query[cursor..].find("${") {
+        normalized.push_str(&without_query[cursor..cursor + pos]);
+        normalized.push_str(":param");
+        let after_open = cursor + pos + 2;
+        let close = without_query[after_open..].find('}')?;
+        cursor = after_open + close + 1;
+    }
+    normalized.push_str(&without_query[cursor..]);
+    Some(normalized)
 }
 
 /// Resolves the target workspace configuration file and service repository name from `cwd`,
@@ -781,6 +1135,79 @@ mod tests {
             resolve_context_from_cwd(&shared_api, None, Some("ws2"), None, &registry_path).unwrap();
         assert_eq!(explicit.workspace_name.as_deref(), Some("ws2"));
         assert_eq!(explicit.repo_name, "shared-api");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn build_workspace_config_detects_env_urls_and_maps_custom_clients_to_matching_producer() {
+        let tmp =
+            std::env::temp_dir().join(format!("laine-ws-autodetect-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Producer 1: unrelated Laravel API
+        let other_api = tmp.join("other-api");
+        init_git_repo(&other_api);
+        fs::write(other_api.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+        fs::create_dir_all(other_api.join("routes")).unwrap();
+        fs::write(
+            other_api.join("routes/api.php"),
+            "<?php\nRoute::get('/other/ping', 'PingController@ping');\n",
+        )
+        .unwrap();
+
+        // Producer 2: target Laravel API with optional param route
+        let cerebro_web = tmp.join("cerebro-web");
+        init_git_repo(&cerebro_web);
+        fs::write(cerebro_web.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+        fs::create_dir_all(cerebro_web.join("routes")).unwrap();
+        fs::write(
+            cerebro_web.join("routes/api.php"),
+            "<?php\nRoute::post('corp/{accion}/{param?}', [Corp::class, 'accion']);\nRoute::post('/reset_password', 'Auth@reset');\n",
+        )
+        .unwrap();
+
+        // Consumer: Nuxt/TS portal with .env.example URL + custom wrapper `getClient().fetch`
+        let portal = tmp.join("portal-web");
+        init_git_repo(&portal);
+        fs::write(portal.join("nuxt.config.ts"), "export default {}\n").unwrap();
+        fs::write(
+            portal.join(".env.example"),
+            "# comment\nNUXT_PUBLIC_API=https://api.cerebro.local/api\nRECAPTCHA_KEY=secret-should-be-ignored\nEMPTY_URL=\n",
+        )
+        .unwrap();
+        fs::create_dir_all(portal.join("app/services")).unwrap();
+        fs::write(
+            portal.join("app/services/auth.ts"),
+            r#"export function login() {
+  return getClient().fetch<LoginResp>('/corp/loginCorp', { method: 'POST' });
+}
+export function reset() {
+  return getClient().fetch('/reset_password', { method: 'POST' });
+}
+"#,
+        )
+        .unwrap();
+
+        let repos = scan_directory(&tmp).expect("scan should succeed");
+        let cfg = build_workspace_config(&repos, &tmp, false);
+
+        assert_eq!(
+            cfg.env.get("NUXT_PUBLIC_API").map(String::as_str),
+            Some("https://api.cerebro.local/api")
+        );
+        assert!(!cfg.env.contains_key("RECAPTCHA_KEY"));
+
+        assert_eq!(
+            cfg.clients.len(),
+            1,
+            "expected 1 auto-detected client: {:?}",
+            cfg.clients
+        );
+        assert_eq!(cfg.clients[0].callee, "getClient().fetch");
+        assert_eq!(cfg.clients[0].target_service, "cerebro-web");
+        assert_eq!(cfg.clients[0].path_prefix.as_deref(), Some("/api"));
 
         let _ = fs::remove_dir_all(&tmp);
     }

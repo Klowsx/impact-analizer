@@ -96,7 +96,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
 ///
 /// When `no_cache` is `false`, per-repository consumer AST extractions are served from and
 /// persisted to the SQLite incremental cache keyed by `(repo, commit_sha, config_hash, schema_version)`.
-// Analiza un productor con su política u ofrece alternativas si el servicio solo consume APIs.
+// Analiza dos snapshots del productor, conserva la evidencia y evalúa la política.
 pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result<AnalysisReport> {
     let config = WorkspaceConfig::load_from_path(&req.config_path)?;
     let config_dir = config_directory(&req.config_path);
@@ -153,11 +153,10 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     let mut route_locations: BTreeMap<(String, HttpMethod, String), (String, usize)> =
         BTreeMap::new();
     let mut source_file_display = String::new();
-    let mut base_source_raw = String::new();
-    let mut head_source_raw = String::new();
 
     // 1. Optional OpenAPI producer contract analysis
     let mut head_openapi_contract = None;
+    let mut base_openapi_contract = None;
     if let Some(openapi_rel) = target_service.openapi.as_deref() {
         let base_raw = producer_git.read_file(&base_sha, openapi_rel)?;
         let head_raw = producer_git.read_file(&head_sha, openapi_rel)?;
@@ -186,16 +185,15 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
         }
 
         source_file_display = openapi_rel.to_string_lossy().replace('\\', "/");
-        base_source_raw = base_raw;
-        head_source_raw = head_raw;
+        base_openapi_contract = Some(base_contract);
         head_openapi_contract = Some(head_contract);
     }
 
     // 2. Optional code-based producer route extraction (Express / Laravel / FastAPI / Flask)
     if let Some(route_cfg) = target_service.routes.as_ref() {
-        let (base_routes, base_files_count, sample_file, sample_raw) =
+        let (base_routes, base_files_count) =
             extract_producer_routes(&producer_git, &target_service.name, &base_sha, route_cfg)?;
-        let (head_routes, _, _, _) =
+        let (head_routes, _) =
             extract_producer_routes(&producer_git, &target_service.name, &head_sha, route_cfg)?;
         files_analyzed += base_files_count;
 
@@ -242,11 +240,6 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
 
         if let Some(head_openapi) = head_openapi_contract.as_ref() {
             discrepancies = detect_openapi_discrepancies(head_openapi, &head_routes);
-        }
-
-        if source_file_display.is_empty() {
-            source_file_display = sample_file;
-            base_source_raw = sample_raw;
         }
     }
 
@@ -321,8 +314,8 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
             base_rev: &base_sha,
             head_rev: &head_sha,
             source_file: &source_file_display,
-            base_source_raw: &base_source_raw,
-            head_source_raw: &head_source_raw,
+            base_contract: base_openapi_contract.as_ref(),
+            head_contract: head_openapi_contract.as_ref(),
             route_locations,
             changes: contract_changes,
             unresolved_calls,
@@ -721,12 +714,13 @@ fn apply_cached_consumer_repo(
     }
 }
 
+// Extrae las rutas y el número de archivos leídos en una revisión.
 fn extract_producer_routes(
     git: &GitRepo,
     service_name: &str,
     rev: &str,
     route_cfg: &RouteSourceConfig,
-) -> Result<(Vec<ExtractedRoute>, usize, String, String)> {
+) -> Result<(Vec<ExtractedRoute>, usize)> {
     let candidate_files: Vec<String> = if !route_cfg.files.is_empty() {
         route_cfg
             .files
@@ -752,19 +746,10 @@ fn extract_producer_routes(
     };
 
     let mut routes = Vec::new();
-    let mut files_count = 0usize;
-    let mut first_file = String::new();
-    let mut first_raw = String::new();
-
     let batch_contents = git.read_files_batch(rev, &candidate_files)?;
+    let files_count = batch_contents.len();
 
     for (file, raw) in batch_contents {
-        files_count += 1;
-        if first_file.is_empty() {
-            first_file = file.clone();
-            first_raw = raw.clone();
-        }
-
         match route_cfg.framework {
             RouteFramework::Laravel => {
                 routes.extend(extract_laravel_routes(
@@ -800,7 +785,7 @@ fn extract_producer_routes(
         }
     }
 
-    Ok((routes, files_count, first_file, first_raw))
+    Ok((routes, files_count))
 }
 
 fn config_directory(config_path: &Path) -> &Path {

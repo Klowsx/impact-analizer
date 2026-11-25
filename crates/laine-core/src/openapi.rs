@@ -1,25 +1,44 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
+use saphyr::{LoadableYamlNode, MarkedYaml, Scalar, YamlData};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{LaineError, Result};
-use crate::model::{ContractChange, EndpointId, HttpMethod};
+use crate::model::{ContractChange, EndpointId, HttpMethod, SourceSpan};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractSource {
+    pub pointer: String,
+    pub span: Option<SourceSpan>,
+}
+
+type SourceIndex = HashMap<*const Value, ContractSource>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FieldSchema {
     pub field_type: String,
     pub required: bool,
+    #[serde(skip)]
+    source: Option<ContractSource>,
+    #[serde(skip)]
+    type_source: Option<ContractSource>,
+    #[serde(skip)]
+    required_source: Option<ContractSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParameterSchema {
     pub param_type: String,
     pub required: bool,
+    #[serde(skip)]
+    source: Option<ContractSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EndpointContract {
+    #[serde(skip)]
+    source: Option<ContractSource>,
     /// HTTP status code (e.g. "200") -> flattened field path (e.g. "fullName", "address.city") -> schema.
     pub responses: BTreeMap<String, BTreeMap<String, FieldSchema>>,
     /// Flattened JSON request body field path -> schema.
@@ -34,6 +53,118 @@ pub struct EndpointContract {
 pub struct ApiContract {
     /// Ordered map guarantees deterministic diff output across runs.
     pub endpoints: BTreeMap<EndpointId, EndpointContract>,
+}
+
+impl ApiContract {
+    // Encuentra la declaración concreta usada para un cambio dentro de este snapshot.
+    pub fn source_for_change(&self, change: &ContractChange) -> Option<&ContractSource> {
+        let endpoint = find_matching_endpoint(self, change.endpoint())?;
+        match change {
+            ContractChange::EndpointRemoved { .. } => endpoint.source.as_ref(),
+            ContractChange::ResponseFieldRemoved {
+                status_code,
+                field_path,
+                ..
+            } => endpoint
+                .responses
+                .get(status_code)?
+                .get(field_path)?
+                .source
+                .as_ref(),
+            ContractChange::ResponseFieldTypeChanged {
+                status_code,
+                field_path,
+                ..
+            } => {
+                let field = endpoint.responses.get(status_code)?.get(field_path)?;
+                field.type_source.as_ref().or(field.source.as_ref())
+            }
+            ContractChange::RequestFieldAddedRequired { field_path, .. } => {
+                let field = endpoint.request_fields.get(field_path)?;
+                field.required_source.as_ref().or(field.source.as_ref())
+            }
+            ContractChange::RequestFieldTypeChanged { field_path, .. } => {
+                let field = endpoint.request_fields.get(field_path)?;
+                field.type_source.as_ref().or(field.source.as_ref())
+            }
+            ContractChange::RequiredParameterAdded { location, name, .. } => endpoint
+                .parameters
+                .get(&(location.clone(), name.clone()))?
+                .source
+                .as_ref(),
+        }
+    }
+}
+
+// Asocia el árbol semántico con las posiciones de claves y elementos del documento original.
+fn index_sources(root: &Value, raw: &str) -> SourceIndex {
+    let marked = MarkedYaml::load_from_str(raw).ok();
+    let mut sources = HashMap::new();
+    index_source_node(
+        root,
+        marked.as_ref().and_then(|nodes| nodes.first()),
+        None,
+        "",
+        &mut sources,
+    );
+    sources
+}
+
+// Conserva el JSON Pointer aunque el parser auxiliar no pueda ubicar el nodo.
+fn index_source_node(
+    node: &Value,
+    marked: Option<&MarkedYaml<'_>>,
+    key: Option<&MarkedYaml<'_>>,
+    pointer: &str,
+    sources: &mut SourceIndex,
+) {
+    let span = key
+        .or(marked)
+        .map(|node| node.span)
+        .filter(|span| span.start.line() > 0)
+        .map(|span| SourceSpan {
+            line: span.start.line(),
+            column: span.start.col() + 1,
+            end_line: span.end.line().max(span.start.line()),
+            end_column: if span.end.line() > 0 {
+                span.end.col() + 1
+            } else {
+                span.start.col() + 1
+            },
+        });
+    sources.insert(
+        node,
+        ContractSource {
+            pointer: pointer.into(),
+            span,
+        },
+    );
+
+    if let Some(object) = node.as_object() {
+        let mapping = marked.and_then(|node| node.data.as_mapping());
+        for (name, value) in object {
+            let pair = mapping.and_then(|entries| {
+                entries
+                    .get_key_value(&MarkedYaml::from(YamlData::Value(Scalar::String(
+                        name.as_str().into(),
+                    ))))
+                    .or_else(|| entries.get_key_value(&MarkedYaml::value_from_str(name)))
+            });
+            let escaped = name.replace('~', "~0").replace('/', "~1");
+            index_source_node(
+                value,
+                pair.map(|(_, value)| value),
+                pair.map(|(key, _)| key),
+                &format!("{pointer}/{escaped}"),
+                sources,
+            );
+        }
+    } else if let Some(array) = node.as_array() {
+        for (index, value) in array.iter().enumerate() {
+            let item = marked.and_then(|node| node.data.as_sequence_get(index));
+            index_source_node(value, item, None, &format!("{pointer}/{index}"), sources);
+        }
+    }
 }
 
 /// Normalizes an OpenAPI path template such as `/customers/{id}/` into `/customers/:id`.
@@ -84,8 +215,7 @@ pub fn canonical_route_key(normalized_path: &str) -> String {
     }
 }
 
-/// Parses an OpenAPI 3.0/3.1 document (YAML or JSON) and extracts its endpoints,
-/// JSON response fields, JSON request body fields, and parameters.
+/// Extrae operaciones, campos, parámetros y sus ubicaciones de un contrato YAML o JSON.
 pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
     let root: Value = serde_yaml_ng::from_str(raw_spec)
         .map_err(|err| LaineError::OpenApiParse(err.to_string()))?;
@@ -96,6 +226,7 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
         .ok_or_else(|| LaineError::OpenApiParse("missing top-level `paths` object".into()))?;
 
     let mut endpoints = BTreeMap::new();
+    let sources = index_sources(&root, raw_spec);
 
     for (raw_path, path_item) in paths_obj {
         let mut path_visited = HashSet::new();
@@ -110,7 +241,7 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
             .get("parameters")
             .and_then(Value::as_array)
         {
-            collect_parameters(&root, params, &mut path_level_params);
+            collect_parameters(&root, params, &mut path_level_params, &sources);
         }
 
         for (method_key, operation) in path_map {
@@ -119,12 +250,13 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
             };
 
             let mut endpoint_contract = EndpointContract {
+                source: sources.get(&std::ptr::from_ref(operation)).cloned(),
                 parameters: path_level_params.clone(),
                 ..EndpointContract::default()
             };
 
             if let Some(params) = operation.get("parameters").and_then(Value::as_array) {
-                collect_parameters(&root, params, &mut endpoint_contract.parameters);
+                collect_parameters(&root, params, &mut endpoint_contract.parameters, &sources);
             }
 
             if let Some(request_body_val) = operation.get("requestBody") {
@@ -138,6 +270,7 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
                         "",
                         &mut visited,
                         &mut endpoint_contract.request_fields,
+                        &sources,
                     );
                 }
             }
@@ -153,7 +286,14 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
 
                     if let Some(schema) = extract_json_schema(resolved_response) {
                         let mut fields = BTreeMap::new();
-                        collect_schema_fields(&root, schema, "", &mut visited, &mut fields);
+                        collect_schema_fields(
+                            &root,
+                            schema,
+                            "",
+                            &mut visited,
+                            &mut fields,
+                            &sources,
+                        );
                         endpoint_contract
                             .responses
                             .insert(status_code.clone(), fields);
@@ -265,63 +405,12 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
     changes
 }
 
-/// Best-effort 1-based line lookup in the raw OpenAPI file for reporting producer evidence.
-pub fn find_field_line(raw_spec: &str, field_name: &str) -> usize {
-    let leaf = field_name
-        .rsplit('.')
-        .next()
-        .unwrap_or(field_name)
-        .trim_end_matches("[]");
-    let yaml_key = format!("{leaf}:");
-    let json_key = format!("\"{leaf}\"");
-
-    raw_spec
-        .lines()
-        .enumerate()
-        .find_map(|(idx, line)| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with(&yaml_key) || trimmed.starts_with(&json_key) {
-                Some(idx + 1)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(1)
-}
-
-/// Best-effort 1-based line lookup for an OpenAPI parameter definition (`name: <param>`).
-pub fn find_parameter_line(raw_spec: &str, param_name: &str) -> usize {
-    let yaml_plain = format!("name: {param_name}");
-    let yaml_double = format!("name: \"{param_name}\"");
-    let yaml_single = format!("name: '{param_name}'");
-    let json_val = format!("\"name\": \"{param_name}\"");
-
-    raw_spec
-        .lines()
-        .enumerate()
-        .find_map(|(idx, line)| {
-            let trimmed = line.trim_start();
-            let normalized = trimmed
-                .strip_prefix("- ")
-                .map(str::trim_start)
-                .unwrap_or(trimmed);
-            if normalized == yaml_plain
-                || normalized == yaml_double
-                || normalized == yaml_single
-                || normalized.starts_with(&json_val)
-            {
-                Some(idx + 1)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_else(|| find_field_line(raw_spec, param_name))
-}
-
+// Extrae cada parámetro y conserva el origen de su declaración resuelta.
 fn collect_parameters(
     root: &Value,
     params: &[Value],
     out: &mut BTreeMap<(String, String), ParameterSchema>,
+    sources: &SourceIndex,
 ) {
     for param_val in params {
         let mut visited = HashSet::new();
@@ -355,6 +444,10 @@ fn collect_parameters(
             ParameterSchema {
                 param_type,
                 required,
+                source: resolved
+                    .get("name")
+                    .and_then(|node| sources.get(&std::ptr::from_ref(node)))
+                    .cloned(),
             },
         );
     }
@@ -413,12 +506,14 @@ fn resolve_ref<'a>(root: &'a Value, node: &'a Value, visited: &mut HashSet<Strin
     resolve_ref(root, current, visited)
 }
 
+// Combina las propiedades del esquema y conserva su origen aun cuando provengan de referencias.
 fn collect_schema_fields(
     root: &Value,
     schema: &Value,
     prefix: &str,
     visited: &mut HashSet<String>,
     out: &mut BTreeMap<String, FieldSchema>,
+    sources: &SourceIndex,
 ) {
     let mut local_visited = visited.clone();
     let resolved = resolve_ref(root, schema, &mut local_visited);
@@ -426,13 +521,13 @@ fn collect_schema_fields(
     // Support `allOf` composition by merging sub-schemas.
     if let Some(all_of) = resolved.get("allOf").and_then(Value::as_array) {
         for sub in all_of {
-            collect_schema_fields(root, sub, prefix, &mut local_visited, out);
+            collect_schema_fields(root, sub, prefix, &mut local_visited, out, sources);
         }
         // Apply `required` constraints declared in any `allOf` branch to sibling-defined fields.
         for sub in all_of {
             let mut sub_visited = local_visited.clone();
             let resolved_sub = resolve_ref(root, sub, &mut sub_visited);
-            apply_required_flags(resolved_sub, prefix, out);
+            apply_required_flags(resolved_sub, prefix, out, sources);
         }
     }
 
@@ -455,22 +550,40 @@ fn collect_schema_fields(
 
             let field_type = extract_type_label(resolved_prop);
             let is_required = required_set.contains(prop_name.as_str());
+            let source = sources.get(&std::ptr::from_ref(prop_schema)).cloned();
+            let type_source = if std::ptr::eq(resolved_prop, prop_schema) {
+                None
+            } else {
+                sources.get(&std::ptr::from_ref(resolved_prop)).cloned()
+            };
             out.entry(full_path.clone())
                 .and_modify(|existing| {
                     existing.field_type = field_type.clone();
                     existing.required |= is_required;
+                    existing.source = source.clone();
+                    existing.type_source = type_source.clone();
                 })
                 .or_insert(FieldSchema {
                     field_type,
                     required: is_required,
+                    source,
+                    type_source,
+                    required_source: None,
                 });
 
             // Recurse into nested objects and arrays of objects.
             if resolved_prop.get("properties").is_some() || resolved_prop.get("allOf").is_some() {
-                collect_schema_fields(root, resolved_prop, &full_path, &mut prop_visited, out);
+                collect_schema_fields(
+                    root,
+                    resolved_prop,
+                    &full_path,
+                    &mut prop_visited,
+                    out,
+                    sources,
+                );
             } else if let Some(items) = resolved_prop.get("items") {
                 let array_prefix = format!("{full_path}[]");
-                collect_schema_fields(root, items, &array_prefix, &mut prop_visited, out);
+                collect_schema_fields(root, items, &array_prefix, &mut prop_visited, out, sources);
             }
         }
     } else if let Some(items) = resolved.get("items") {
@@ -479,15 +592,24 @@ fn collect_schema_fields(
         } else {
             format!("{prefix}[]")
         };
-        collect_schema_fields(root, items, &array_prefix, &mut local_visited, out);
+        collect_schema_fields(root, items, &array_prefix, &mut local_visited, out, sources);
     }
 
-    apply_required_flags(resolved, prefix, out);
+    apply_required_flags(resolved, prefix, out, sources);
 }
 
-fn apply_required_flags(schema: &Value, prefix: &str, out: &mut BTreeMap<String, FieldSchema>) {
+// Vincula cada restricción required con el nombre exacto en el documento.
+fn apply_required_flags(
+    schema: &Value,
+    prefix: &str,
+    out: &mut BTreeMap<String, FieldSchema>,
+    sources: &SourceIndex,
+) {
     if let Some(arr) = schema.get("required").and_then(Value::as_array) {
-        for req_name in arr.iter().filter_map(Value::as_str) {
+        for item in arr {
+            let Some(req_name) = item.as_str() else {
+                continue;
+            };
             let full_path = if prefix.is_empty() {
                 req_name.to_string()
             } else {
@@ -495,6 +617,7 @@ fn apply_required_flags(schema: &Value, prefix: &str, out: &mut BTreeMap<String,
             };
             if let Some(field) = out.get_mut(&full_path) {
                 field.required = true;
+                field.required_source = sources.get(&std::ptr::from_ref(item)).cloned();
             }
         }
     }
@@ -662,8 +785,8 @@ components:
             }
         );
 
-        let line = find_field_line(&base_spec, "fullName");
-        assert!(line > 1);
+        let source = base_contract.source_for_change(&changes[0]).unwrap();
+        assert!(source.span.as_ref().unwrap().line > 1);
 
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -1040,8 +1163,8 @@ components:
             ]
         );
 
-        let param_line = find_parameter_line(head_yaml, "X-Tenant-Id");
-        assert!(param_line > 1);
+        let source = head.source_for_change(&changes[2]).unwrap();
+        assert!(source.span.as_ref().unwrap().line > 1);
     }
 
     #[test]

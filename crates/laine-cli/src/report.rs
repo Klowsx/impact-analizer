@@ -1,11 +1,18 @@
 use std::fmt::Write;
 
-use laine_core::model::{AnalysisReport, Confidence, ContractChange, EndpointId, Severity};
+use laine_core::model::{
+    AnalysisReport, Confidence, ContractChange, EndpointId, ProducerEvidence, Severity,
+};
 
 // Quita las descripciones de evidencia conservando sus ubicaciones y el contrato JSON.
 pub fn omit_snippets(report: &mut AnalysisReport) {
     for finding in &mut report.findings {
         finding.producer_evidence.snippet.clear();
+        finding.producer_evidence.description.clear();
+        if let Some(comparison) = finding.producer_evidence_comparison.as_mut() {
+            comparison.snippet.clear();
+            comparison.description.clear();
+        }
         for consumer in &mut finding.consumers {
             consumer.evidence.snippet.clear();
         }
@@ -15,7 +22,7 @@ pub fn omit_snippets(report: &mut AnalysisReport) {
     }
 }
 
-// Muestra la evidencia localizada y la decisión de política del análisis.
+// Muestra las revisiones de la evidencia y la decisión de política del análisis.
 pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
     let mut out = String::new();
 
@@ -151,12 +158,18 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
 
             let _ = writeln!(
                 out,
-                "  Source:   {}/{}:{} (commit {})",
-                finding.producer_evidence.repo,
-                finding.producer_evidence.file,
-                finding.producer_evidence.line,
+                "  Source:   {} (revision {})",
+                producer_location(&finding.producer_evidence),
                 short_sha(&finding.producer_evidence.revision)
             );
+            if let Some(comparison) = &finding.producer_evidence_comparison {
+                let _ = writeln!(
+                    out,
+                    "  Compared: {} (revision {})",
+                    producer_location(comparison),
+                    short_sha(&comparison.revision)
+                );
+            }
             let _ = writeln!(out);
 
             if finding.consumers.is_empty() {
@@ -255,7 +268,7 @@ pub fn render_json(report: &AnalysisReport) -> Result<String, serde_json::Error>
 }
 
 /// Renders a GitHub-flavored Markdown report designed for pull request comments.
-// Genera un reporte Markdown con la decisión de política y el resumen de hallazgos.
+// Genera un reporte Markdown con la decisión de política y ambos lados de la evidencia de tipo.
 pub fn render_markdown(report: &AnalysisReport) -> String {
     let mut out = String::new();
 
@@ -353,12 +366,18 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
             let _ = writeln!(out);
             let _ = writeln!(
                 out,
-                "- **Producer:** `{}/{}:{}` (commit `{}`)",
-                finding.producer_evidence.repo,
-                finding.producer_evidence.file,
-                finding.producer_evidence.line,
+                "- **Producer:** `{}` (revision `{}`)",
+                escape_inline_code(&producer_location(&finding.producer_evidence)),
                 short_sha(&finding.producer_evidence.revision)
             );
+            if let Some(comparison) = &finding.producer_evidence_comparison {
+                let _ = writeln!(
+                    out,
+                    "- **Compared:** `{}` (revision `{}`)",
+                    escape_inline_code(&producer_location(comparison)),
+                    short_sha(&comparison.revision)
+                );
+            }
 
             if finding.consumers.is_empty() {
                 let _ = writeln!(out, "- **Affected consumers:** 0 detected");
@@ -478,6 +497,21 @@ fn describe_policy(report: &AnalysisReport) -> String {
     )
 }
 
+// Formatea solo las coordenadas verificadas y conserva el pointer cuando está disponible.
+fn producer_location(evidence: &ProducerEvidence) -> String {
+    let mut location = format!("{}/{}", evidence.repo, evidence.file);
+    if let Some(line) = evidence.line {
+        let _ = write!(location, ":{line}");
+        if let Some(span) = &evidence.span {
+            let _ = write!(location, ":{}", span.column);
+        }
+    }
+    if let Some(pointer) = &evidence.json_pointer {
+        let _ = write!(location, " ({pointer})");
+    }
+    location
+}
+
 fn change_endpoint(change: &ContractChange) -> &EndpointId {
     match change {
         ContractChange::EndpointRemoved { endpoint }
@@ -577,12 +611,13 @@ mod tests {
             method: HttpMethod::Post,
             normalized_path: "/customers".into(),
         };
-        let evidence = Evidence {
+        let evidence = ProducerEvidence {
             repo: "customer-service".into(),
             revision: "abcdef123456".into(),
             file: "openapi.yaml".into(),
-            line: 12,
+            line: Some(12),
             snippet: "taxId".into(),
+            ..ProducerEvidence::default()
         };
 
         let report = AnalysisReport {
@@ -603,6 +638,7 @@ mod tests {
                     severity: Severity::High,
                     confidence: Confidence::Confirmed,
                     producer_evidence: evidence.clone(),
+                    producer_evidence_comparison: None,
                     consumers: Vec::new(),
                     indirect_consumers: Vec::new(),
                 },
@@ -617,6 +653,7 @@ mod tests {
                     severity: Severity::High,
                     confidence: Confidence::Confirmed,
                     producer_evidence: evidence.clone(),
+                    producer_evidence_comparison: None,
                     consumers: Vec::new(),
                     indirect_consumers: Vec::new(),
                 },
@@ -631,6 +668,7 @@ mod tests {
                     severity: Severity::Medium,
                     confidence: Confidence::Confirmed,
                     producer_evidence: evidence,
+                    producer_evidence_comparison: None,
                     consumers: Vec::new(),
                     indirect_consumers: Vec::new(),
                 },
@@ -680,13 +718,15 @@ mod tests {
                 },
                 severity: Severity::High,
                 confidence: Confidence::Confirmed,
-                producer_evidence: Evidence {
+                producer_evidence: ProducerEvidence {
                     repo: "customer-service".into(),
                     revision: "2222222bbbb".into(),
                     file: "openapi.yaml".into(),
-                    line: 14,
+                    line: Some(14),
                     snippet: "field `fullName`".into(),
+                    ..ProducerEvidence::default()
                 },
+                producer_evidence_comparison: None,
                 consumers: vec![AffectedConsumer {
                     repo: "billing-service".into(),
                     evidence: Evidence {

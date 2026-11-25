@@ -331,7 +331,8 @@ Route::get('/health', 'HealthController@check');\n",
     assert_eq!(finding.severity, Severity::Critical);
     assert_eq!(finding.producer_evidence.file, "routes/api.php");
     assert_eq!(
-        finding.producer_evidence.line, 6,
+        finding.producer_evidence.line,
+        Some(6),
         "expected exact route definition line 6"
     );
     assert_eq!(

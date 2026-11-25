@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Path, PathBuf, is_separator};
 use std::process::Command;
 
 use crate::error::{LaineError, Result};
@@ -17,19 +18,9 @@ pub struct DemoWorkspacePaths {
     pub shipping_service: PathBuf,
 }
 
-/// Materializes the 4 independent Git repositories described in PLAN.md under `root`.
-/// Safe to re-run: removes an existing directory at `root` before regenerating.
+/// Crea los cuatro repositorios Git de la demo en un destino nuevo.
 pub fn create_demo_workspace(root: &Path) -> Result<DemoWorkspacePaths> {
-    if root.exists() {
-        fs::remove_dir_all(root).map_err(|source| LaineError::Io {
-            path: root.to_path_buf(),
-            source,
-        })?;
-    }
-    fs::create_dir_all(root).map_err(|source| LaineError::Io {
-        path: root.to_path_buf(),
-        source,
-    })?;
+    create_demo_destination(root)?;
 
     let customer = root.join("customer-service");
     let billing = root.join("billing-service");
@@ -74,6 +65,45 @@ path = "./shipping-service"
         billing_service: billing,
         notification_service: notification,
         shipping_service: shipping,
+    })
+}
+
+// Crea los padres necesarios y reserva el destino sin reutilizar rutas existentes.
+fn create_demo_destination(root: &Path) -> Result<()> {
+    // Path normaliza los puntos finales al consultar file_name, así que se revisa la ruta original.
+    let last_component = root
+        .as_os_str()
+        .as_encoded_bytes()
+        .rsplit(|byte| is_separator(char::from(*byte)))
+        .find(|component| !component.is_empty());
+    if root.file_name().is_none() || matches!(last_component, Some(b"." | b"..")) {
+        return Err(LaineError::Io {
+            path: root.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "choose a new directory by name as the demo destination",
+            ),
+        });
+    }
+
+    if let Some(parent) = root.parent().filter(|path| !path.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|source| LaineError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+
+    // create_dir falla si el destino ya existe, incluidas las ejecuciones simultáneas.
+    fs::create_dir(root).map_err(|source| LaineError::Io {
+        path: root.to_path_buf(),
+        source: if source.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "demo destination already exists; choose a new directory",
+            )
+        } else {
+            source
+        },
     })
 }
 
@@ -343,12 +373,42 @@ fn write_file(path: &Path, content: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::WorkspaceConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        // Reserva un directorio temporal exclusivo para cada prueba.
+        fn new() -> Self {
+            static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+
+            loop {
+                let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+                let path = std::env::temp_dir()
+                    .join(format!("laine-fixture-test-{}-{id}", std::process::id()));
+                match fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("could not create temporary directory: {error}"),
+                }
+            }
+        }
+    }
+
+    impl Drop for TestDirectory {
+        // Limpia el directorio reservado para la prueba.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Comprueba la configuración y los repositorios generados en un destino nuevo.
     #[test]
     fn generates_four_reproducible_git_repos_and_valid_config() {
-        let tmp = std::env::temp_dir().join(format!("laine-fixture-test-{}", std::process::id()));
+        let tmp = TestDirectory::new();
+        let root = tmp.0.join("fixtures/demo");
 
-        let paths = create_demo_workspace(&tmp).expect("demo workspace should generate");
+        let paths = create_demo_workspace(&root).expect("demo workspace should generate");
         let cfg = WorkspaceConfig::load_from_path(&paths.config_path)
             .expect("generated laine.toml should parse");
 
@@ -366,7 +426,60 @@ mod tests {
         )
         .unwrap();
         assert_ne!(base_ref, head_ref);
+    }
 
-        let _ = fs::remove_dir_all(&tmp);
+    // Comprueba que el comando rechaza un directorio o archivo ajeno sin modificarlo.
+    #[test]
+    fn rejects_existing_destinations_without_changing_them() {
+        let tmp = TestDirectory::new();
+        let file = tmp.0.join("keep.txt");
+        fs::write(&file, b"keep this content").unwrap();
+
+        for root in [&tmp.0, &file] {
+            let error = create_demo_workspace(root).unwrap_err();
+            assert!(
+                matches!(error, LaineError::Io { source, .. } if source.kind() == io::ErrorKind::AlreadyExists)
+            );
+        }
+
+        assert_eq!(fs::read(&file).unwrap(), b"keep this content");
+        assert!(!tmp.0.join("laine.toml").exists());
+        assert!(!tmp.0.join("customer-service").exists());
+    }
+
+    // Comprueba que una segunda ejecución preserva los cambios dentro de la demo.
+    #[test]
+    fn rejects_reruns_without_changing_the_existing_demo() {
+        let tmp = TestDirectory::new();
+        let root = tmp.0.join("demo");
+        let paths = create_demo_workspace(&root).unwrap();
+        let file = paths.customer_service.join("local-notes.txt");
+        fs::write(&file, b"local edits").unwrap();
+        let head = run_git(&paths.customer_service, &["rev-parse", "HEAD"]).unwrap();
+
+        let error = create_demo_workspace(&root).unwrap_err();
+        assert!(
+            matches!(error, LaineError::Io { source, .. } if source.kind() == io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"local edits");
+        assert_eq!(
+            run_git(&paths.customer_service, &["rev-parse", "HEAD"]).unwrap(),
+            head
+        );
+    }
+
+    // Comprueba que un destino terminado en punto no crea directorios intermedios.
+    #[test]
+    fn rejects_dot_destinations_before_creating_parents() {
+        let tmp = TestDirectory::new();
+        let missing = tmp.0.join("missing");
+
+        for suffix in [".", ".."] {
+            let error = create_demo_workspace(&missing.join(suffix)).unwrap_err();
+            assert!(
+                matches!(error, LaineError::Io { source, .. } if source.kind() == io::ErrorKind::InvalidInput)
+            );
+        }
+        assert!(!missing.exists());
     }
 }

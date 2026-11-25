@@ -19,7 +19,7 @@ use oxc_semantic::ScopeFlags;
 use oxc_span::{GetSpan, SourceType, Span};
 use serde::{Deserialize, Serialize};
 
-use crate::extractor::ExtractContext;
+use crate::extractor::{ExtractContext, options_http_method};
 use crate::url::{
     ServiceEndpointMatch, is_absolute_http_url, normalize_relative_path,
     resolve_url_against_services,
@@ -5025,6 +5025,7 @@ fn detect_axios_create_with_lookup(
     None
 }
 
+// Usa la misma resolución de métodos que la extracción local y omite las llamadas indeterminadas.
 fn classify_http_call_with_lookup(
     call: &CallExpression<'_>,
     ctx: ExtractContext<'_>,
@@ -5033,7 +5034,7 @@ fn classify_http_call_with_lookup(
     if let Some(callee_str) = format_callee_expr(unwrap_expr(&call.callee)) {
         for client in ctx.clients {
             if callee_str == client.callee {
-                let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+                let method = options_http_method(call)?;
                 return Some(CallTarget::Custom {
                     target_service: client.target_service.clone(),
                     path_prefix: client.path_prefix.clone(),
@@ -5045,7 +5046,7 @@ fn classify_http_call_with_lookup(
                 && let Some(method_name) = rest.strip_prefix('.')
             {
                 if method_name == "fetch" || is_use_fetch_callee(method_name) {
-                    let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+                    let method = options_http_method(call)?;
                     return Some(CallTarget::Custom {
                         target_service: client.target_service.clone(),
                         path_prefix: client.path_prefix.clone(),
@@ -5067,13 +5068,13 @@ fn classify_http_call_with_lookup(
 
     match unwrap_expr(&call.callee) {
         Expression::Identifier(ident) if ident.name == "fetch" => {
-            let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+            let method = options_http_method(call)?;
             Some(CallTarget::Fetch(method))
         }
         Expression::Identifier(ident)
             if ident.name == "useFetch" || ident.name == "useLazyFetch" =>
         {
-            let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+            let method = options_http_method(call)?;
             Some(CallTarget::UseFetch(method))
         }
         Expression::StaticMemberExpression(member) => {
@@ -5365,24 +5366,6 @@ fn extract_env_var_name(expr: &Expression<'_>) -> Option<String> {
         Expression::ImportMeta(_) => Some(env_name),
         _ => None,
     }
-}
-
-fn extract_options_method(call: &CallExpression<'_>) -> Option<HttpMethod> {
-    let second_arg = call.arguments.get(1)?;
-    let Argument::ObjectExpression(obj) = second_arg else {
-        return None;
-    };
-    for prop in &obj.properties {
-        let ObjectPropertyKind::ObjectProperty(kv) = prop else {
-            continue;
-        };
-        if property_key_name(&kv.key).as_deref() == Some("method")
-            && let Expression::StringLiteral(lit) = unwrap_expr(&kv.value)
-        {
-            return HttpMethod::parse(lit.value.as_str()?);
-        }
-    }
-    None
 }
 
 fn property_key_name(key: &PropertyKey<'_>) -> Option<String> {

@@ -9,8 +9,9 @@ use laine_core::graph::DependencyGraph;
 use laine_core::impact::{ImpactInput, analyze_impact};
 use laine_core::laravel::extract_laravel_routes;
 use laine_core::model::{
-    AnalysisReport, AnalysisStats, Confidence, ContractChange, ContractDiscrepancy, Evidence,
-    HttpMethod, UnresolvedCall,
+    AnalysisCoverage, AnalysisReport, AnalysisStats, Confidence, ContractChange,
+    ContractDiscrepancy, Evidence, ExtractionDiagnostic, ExtractionFailure, ExtractionStage,
+    FileCoverage, HttpMethod, UnresolvedCall,
 };
 use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
 use laine_core::policy::{evaluate_policy, filter_ignored_findings};
@@ -75,10 +76,70 @@ struct CachedUnresolvedCall {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct CachedConsumerRepo {
-    files_analyzed: usize,
+    extraction: FileExtraction,
     consumes: Vec<CachedConsumeEdge>,
     field_reads: Vec<CachedFieldReadEdge>,
     unresolved_calls: Vec<CachedUnresolvedCall>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct FileExtraction {
+    coverage: FileCoverage,
+    failures: BTreeMap<String, ExtractionFailure>,
+}
+
+impl FileExtraction {
+    // Cuenta los candidatos y detecta cuáles no llegaron de la lectura por lotes.
+    fn from_reads(files: &[String], contents: &BTreeMap<String, String>) -> Self {
+        let failures = files
+            .iter()
+            .filter(|file| !contents.contains_key(*file))
+            .map(|file| (file.clone(), ExtractionFailure::FileReadFailed))
+            .collect::<BTreeMap<_, _>>();
+        let read = contents.len();
+        Self {
+            coverage: FileCoverage {
+                discovered: files.len(),
+                read,
+                analyzed: read,
+                failed: failures.len(),
+            },
+            failures,
+        }
+    }
+
+    // Descuenta un archivo que se pudo leer, pero cuya extracción falló.
+    fn record_parse_failure(&mut self, file: &str) {
+        if self
+            .failures
+            .insert(file.to_owned(), ExtractionFailure::FileParseFailed)
+            .is_none()
+        {
+            self.coverage.analyzed -= 1;
+            self.coverage.failed += 1;
+        }
+    }
+
+    // Añade el contexto de repositorio y revisión a fallos portables que también se cachean.
+    fn append_diagnostics(
+        &self,
+        diagnostics: &mut Vec<ExtractionDiagnostic>,
+        repo: &str,
+        revision: &str,
+        stage: ExtractionStage,
+    ) {
+        diagnostics.extend(
+            self.failures
+                .iter()
+                .map(|(file, code)| ExtractionDiagnostic {
+                    repo: repo.to_owned(),
+                    revision: revision.to_owned(),
+                    file: file.clone(),
+                    stage,
+                    code: *code,
+                }),
+        );
+    }
 }
 
 /// Runs a full cross-repository impact analysis without mutating any repository's working tree,
@@ -96,7 +157,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
 ///
 /// When `no_cache` is `false`, per-repository consumer AST extractions are served from and
 /// persisted to the SQLite incremental cache keyed by `(repo, commit_sha, config_hash, schema_version)`.
-// Analiza dos snapshots del productor, conserva la evidencia y evalúa la política.
+// Analiza snapshots y registra qué partes pudieron examinarse antes de evaluar la política.
 pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result<AnalysisReport> {
     let config = WorkspaceConfig::load_from_path(&req.config_path)?;
     let config_dir = config_directory(&req.config_path);
@@ -148,6 +209,10 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     graph.add_repository(&target_service.name);
 
     let mut files_analyzed = 0usize;
+    let mut producer_base = FileCoverage::default();
+    let mut producer_head = FileCoverage::default();
+    let mut consumers = FileCoverage::default();
+    let mut diagnostics = Vec::new();
     let mut contract_changes: Vec<ContractChange> = Vec::new();
     let mut discrepancies: Vec<ContractDiscrepancy> = Vec::new();
     let mut route_locations: BTreeMap<(String, HttpMethod, String), (String, usize)> =
@@ -161,6 +226,13 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
         let base_raw = producer_git.read_file(&base_sha, openapi_rel)?;
         let head_raw = producer_git.read_file(&head_sha, openapi_rel)?;
         files_analyzed += 1;
+        producer_base = FileCoverage {
+            discovered: 1,
+            read: 1,
+            analyzed: 1,
+            failed: 0,
+        };
+        producer_head = producer_base;
 
         let base_contract = extract_contract(&target_service.name, &base_raw)?;
         let head_contract = extract_contract(&target_service.name, &head_raw)?;
@@ -191,11 +263,25 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
 
     // 2. Optional code-based producer route extraction (Express / Laravel / FastAPI / Flask)
     if let Some(route_cfg) = target_service.routes.as_ref() {
-        let (base_routes, base_files_count) =
+        let (base_routes, base_extraction) =
             extract_producer_routes(&producer_git, &target_service.name, &base_sha, route_cfg)?;
-        let (head_routes, _) =
+        let (head_routes, head_extraction) =
             extract_producer_routes(&producer_git, &target_service.name, &head_sha, route_cfg)?;
-        files_analyzed += base_files_count;
+        files_analyzed += base_extraction.coverage.analyzed;
+        producer_base.accumulate(base_extraction.coverage);
+        producer_head.accumulate(head_extraction.coverage);
+        base_extraction.append_diagnostics(
+            &mut diagnostics,
+            &target_service.name,
+            &base_sha,
+            ExtractionStage::ProducerBase,
+        );
+        head_extraction.append_diagnostics(
+            &mut diagnostics,
+            &target_service.name,
+            &head_sha,
+            ExtractionStage::ProducerHead,
+        );
 
         for route in &base_routes {
             graph.add_endpoint(
@@ -212,7 +298,13 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
                 .or_insert_with(|| (route.file.clone(), route.line));
         }
 
-        let route_changes = diff_routes(&base_routes, &head_routes);
+        // Con rutas incompletas no hay evidencia suficiente para afirmar que se eliminó un montaje.
+        let complete = base_extraction.coverage.failed == 0 && head_extraction.coverage.failed == 0;
+        let route_changes = if complete {
+            diff_routes(&base_routes, &head_routes)
+        } else {
+            Vec::new()
+        };
         let existing_removed: HashSet<_> = contract_changes
             .iter()
             .filter_map(|c| match c {
@@ -238,7 +330,9 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
             }
         }
 
-        if let Some(head_openapi) = head_openapi_contract.as_ref() {
+        if head_extraction.coverage.failed == 0
+            && let Some(head_openapi) = head_openapi_contract.as_ref()
+        {
             discrepancies = detect_openapi_discrepancies(head_openapi, &head_routes);
         }
     }
@@ -296,7 +390,14 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
             &snapshot,
             &mut graph,
             &mut unresolved_calls,
-            &mut files_analyzed,
+        );
+        files_analyzed += snapshot.extraction.coverage.analyzed;
+        consumers.accumulate(snapshot.extraction.coverage);
+        snapshot.extraction.append_diagnostics(
+            &mut diagnostics,
+            &service.name,
+            &consumer_rev,
+            ExtractionStage::Consumer,
         );
     }
 
@@ -325,6 +426,14 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     );
 
     filter_ignored_findings(&mut report, &config.policy);
+    diagnostics.sort();
+    report.coverage = Some(AnalysisCoverage {
+        complete: diagnostics.is_empty(),
+        producer_base,
+        producer_head,
+        consumers,
+    });
+    report.diagnostics = diagnostics;
     report.policy = Some(evaluate_policy(&report, &config.policy));
 
     Ok(report)
@@ -394,36 +503,43 @@ fn extract_consumer_repo(
         .collect();
     let tsconfig_sources = git.read_files_batch(rev, &tsconfig_files)?;
 
-    let file_contents: Vec<(String, String)> = git
-        .read_files_batch(rev, &candidate_files)?
-        .into_iter()
-        .collect();
+    let contents = git.read_files_batch(rev, &candidate_files)?;
+    let mut extraction = FileExtraction::from_reads(&candidate_files, &contents);
+    let file_contents: Vec<(String, String)> = contents.into_iter().collect();
 
     // Pass 1 (parallel): build repo-wide TypeScript interface/type & Zod schema registry for
     // generic calls (`fetch<ReserveResponse>`), return-type annotations (`: Promise<UserDTO>`),
     // and Zod validators (`UserSchema.parse(data)` / `type User = z.infer<typeof UserSchema>`).
-    let per_file_types: Vec<(Vec<TypeContractDef>, Vec<TypeContractDef>)> = file_contents
+    let per_file_types: Vec<_> = file_contents
         .par_iter()
         .map(|(file_path, source)| {
             if is_analyzable_ts_or_js(file_path) {
-                let ts_defs = extract_type_definitions(file_path, source).unwrap_or_default();
-                let zod_defs = extract_zod_schemas(file_path, source).unwrap_or_default();
-                (ts_defs, zod_defs)
+                let ts_defs = extract_type_definitions(file_path, source);
+                let zod_defs = extract_zod_schemas(file_path, source);
+                let failed = ts_defs.is_err() || zod_defs.is_err();
+                (
+                    ts_defs.unwrap_or_default(),
+                    zod_defs.unwrap_or_default(),
+                    failed,
+                )
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), false)
             }
         })
         .collect();
 
     let mut type_registry: BTreeMap<String, TypeContractDef> = BTreeMap::new();
-    for (ts_defs, _) in &per_file_types {
+    for ((file, _), (ts_defs, _, failed)) in file_contents.iter().zip(&per_file_types) {
+        if *failed {
+            extraction.record_parse_failure(file);
+        }
         for def in ts_defs {
             type_registry
                 .entry(def.name.clone())
                 .or_insert_with(|| def.clone());
         }
     }
-    for (_, zod_defs) in per_file_types {
+    for (_, zod_defs, _) in per_file_types {
         for def in zod_defs {
             // Zod definitions take precedence over placeholder `z.infer` aliases from `types.rs`.
             type_registry.insert(def.name.clone(), def);
@@ -431,11 +547,7 @@ fn extract_consumer_repo(
     }
 
     // Pass 2 (parallel): extract HTTP calls, direct field reads (CONFIRMED), and generic type contracts (LIKELY).
-    let per_file_extracted: Vec<(
-        Vec<CachedConsumeEdge>,
-        Vec<CachedFieldReadEdge>,
-        Vec<CachedUnresolvedCall>,
-    )> = file_contents
+    let per_file_extracted: Vec<_> = file_contents
         .par_iter()
         .map(|(file_path, source)| {
             let mut consumes = Vec::new();
@@ -488,7 +600,7 @@ fn extract_consumer_repo(
                     });
                 }
 
-                return (consumes, field_reads, unresolved);
+                return Some((consumes, field_reads, unresolved));
             }
 
             let Ok(extracted) = extract_file_with_context(
@@ -500,7 +612,7 @@ fn extract_consumer_repo(
                     env: &config.env,
                 },
             ) else {
-                return (consumes, field_reads, unresolved);
+                return None;
             };
 
             for call in &extracted.calls {
@@ -556,7 +668,7 @@ fn extract_consumer_repo(
                 });
             }
 
-            (consumes, field_reads, unresolved)
+            Some((consumes, field_reads, unresolved))
         })
         .collect();
 
@@ -564,17 +676,21 @@ fn extract_consumer_repo(
     let mut field_reads = Vec::new();
     let mut unresolved_calls = Vec::new();
 
-    for (file_consumes, file_reads, file_unresolved) in per_file_extracted {
-        consumes.extend(file_consumes);
-        field_reads.extend(file_reads);
-        unresolved_calls.extend(file_unresolved);
+    for ((file, _), result) in file_contents.iter().zip(per_file_extracted) {
+        if let Some((file_consumes, file_reads, file_unresolved)) = result {
+            consumes.extend(file_consumes);
+            field_reads.extend(file_reads);
+            unresolved_calls.extend(file_unresolved);
+        } else {
+            extraction.record_parse_failure(file);
+        }
     }
 
     // Pass 3: Summary-based cross-file interprocedural dataflow across TS/JS/Vue modules
     // (`services/` -> `hooks`/`composables`/`stores` -> `components/`, JSX props, `useQuery`, etc.).
     let ts_files: Vec<(String, String)> = file_contents
         .iter()
-        .filter(|(p, _)| is_analyzable_ts_or_js(p))
+        .filter(|(p, _)| is_analyzable_ts_or_js(p) && !extraction.failures.contains_key(p))
         .cloned()
         .collect();
     if !ts_files.is_empty() {
@@ -650,7 +766,7 @@ fn extract_consumer_repo(
         .sort_by(|a, b| (&a.file, a.line, &a.reason).cmp(&(&b.file, b.line, &b.reason)));
 
     Ok(CachedConsumerRepo {
-        files_analyzed: file_contents.len(),
+        extraction,
         consumes,
         field_reads,
         unresolved_calls,
@@ -664,10 +780,7 @@ fn apply_cached_consumer_repo(
     snapshot: &CachedConsumerRepo,
     graph: &mut DependencyGraph,
     unresolved_calls: &mut Vec<UnresolvedCall>,
-    files_analyzed: &mut usize,
 ) {
-    *files_analyzed += snapshot.files_analyzed;
-
     for edge in &snapshot.consumes {
         graph.link_consumes(
             service_name,
@@ -714,19 +827,29 @@ fn apply_cached_consumer_repo(
     }
 }
 
-// Extrae las rutas y el número de archivos leídos en una revisión.
+// Extrae las rutas y conserva los fallos de lectura o parseo de esa revisión.
 fn extract_producer_routes(
     git: &GitRepo,
     service_name: &str,
     rev: &str,
     route_cfg: &RouteSourceConfig,
-) -> Result<(Vec<ExtractedRoute>, usize)> {
+) -> Result<(Vec<ExtractedRoute>, FileExtraction)> {
     let candidate_files: Vec<String> = if !route_cfg.files.is_empty() {
-        route_cfg
+        let present: HashSet<_> = git.list_files(rev)?.into_iter().collect();
+        let mut files: Vec<_> = route_cfg
             .files
             .iter()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .collect()
+            .map(|p| {
+                p.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .to_owned()
+            })
+            .filter(|file| present.contains(file))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
     } else {
         let all_files = git.list_files(rev)?;
         match route_cfg.framework {
@@ -747,7 +870,7 @@ fn extract_producer_routes(
 
     let mut routes = Vec::new();
     let batch_contents = git.read_files_batch(rev, &candidate_files)?;
-    let files_count = batch_contents.len();
+    let mut extraction = FileExtraction::from_reads(&candidate_files, &batch_contents);
 
     for (file, raw) in batch_contents {
         match route_cfg.framework {
@@ -760,10 +883,10 @@ fn extract_producer_routes(
                 ));
             }
             RouteFramework::Express => {
-                if let Ok(extracted) =
-                    extract_express_routes(service_name, &file, &raw, route_cfg.prefix.as_deref())
+                match extract_express_routes(service_name, &file, &raw, route_cfg.prefix.as_deref())
                 {
-                    routes.extend(extracted);
+                    Ok(extracted) => routes.extend(extracted),
+                    Err(_) => extraction.record_parse_failure(&file),
                 }
             }
             RouteFramework::FastApi => {
@@ -785,7 +908,7 @@ fn extract_producer_routes(
         }
     }
 
-    Ok((routes, files_count))
+    Ok((routes, extraction))
 }
 
 fn config_directory(config_path: &Path) -> &Path {

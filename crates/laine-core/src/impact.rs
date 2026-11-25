@@ -179,6 +179,8 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
         base_rev: input.base_rev.to_string(),
         head_rev: input.head_rev.to_string(),
         policy: None,
+        coverage: None,
+        diagnostics: Vec::new(),
         stats: input.stats,
         findings,
         unresolved_calls,

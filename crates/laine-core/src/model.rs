@@ -205,6 +205,66 @@ pub struct AnalysisStats {
     pub graph_edges: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileCoverage {
+    pub discovered: usize,
+    pub read: usize,
+    pub analyzed: usize,
+    pub failed: usize,
+}
+
+impl FileCoverage {
+    // Agrega los conteos de otro repositorio o fuente del mismo snapshot.
+    pub fn accumulate(&mut self, other: Self) {
+        self.discovered += other.discovered;
+        self.read += other.read;
+        self.analyzed += other.analyzed;
+        self.failed += other.failed;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnalysisCoverage {
+    pub complete: bool,
+    pub producer_base: FileCoverage,
+    pub producer_head: FileCoverage,
+    pub consumers: FileCoverage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionFailure {
+    FileReadFailed,
+    FileParseFailed,
+}
+
+impl ExtractionFailure {
+    // Resume el fallo sin copiar texto del archivo o del parser.
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::FileReadFailed => "File could not be read",
+            Self::FileParseFailed => "File could not be parsed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionStage {
+    ProducerBase,
+    ProducerHead,
+    Consumer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ExtractionDiagnostic {
+    pub repo: String,
+    pub revision: String,
+    pub file: String,
+    pub stage: ExtractionStage,
+    pub code: ExtractionFailure,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnalysisReport {
     pub schema_version: u32,
@@ -213,6 +273,10 @@ pub struct AnalysisReport {
     pub head_rev: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<PolicyEvaluation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<AnalysisCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ExtractionDiagnostic>,
     pub stats: AnalysisStats,
     pub findings: Vec<ImpactFinding>,
     pub unresolved_calls: Vec<UnresolvedCall>,

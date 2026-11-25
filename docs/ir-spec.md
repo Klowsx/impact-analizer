@@ -70,6 +70,8 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 | `base_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Base commit before the change. |
 | `head_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Head commit after the change. |
 | `policy` | `object` | For CLI analysis | Omitted by reports produced without workspace policy | The policy decision for the reported findings and unresolved calls. |
+| `coverage` | `object` | For CLI analysis | Omitted by reports produced without workspace extraction | `complete` and the counts for `producer_base`, `producer_head`, and `consumers`. |
+| `diagnostics` | `array` | No | Omitted when empty | Source extraction failures ordered by repository, revision, and file. |
 | `stats` | [`AnalysisStats`](#32-analysisstats) | Yes | — | Deterministic structural counts for the run. |
 | `findings` | `Array<`[`ImpactFinding`](#35-impactfinding)`>` | Yes | May be empty `[]` | Detected breaking contract changes and their direct/indirect consumers. |
 | `unresolved_calls` | `Array<`[`UnresolvedCall`](#38-unresolvedcall)`>` | Yes | Sorted by `(repo, file, line, reason)` | Dynamic or unresolvable consumer HTTP calls (`UNKNOWN`). |
@@ -78,6 +80,8 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 > **Note on volatile metrics:** Wall-clock timings (such as `elapsed_ms`) are intentionally excluded from `AnalysisReport` JSON and rendered only in terminal output so repeated runs on identical commits remain byte-for-byte identical.
 
 `policy` contains `should_fail`, `exit_code`, `blocking_findings`, `blocking_unresolved_calls`, and `reason`. `exit_code` is `0` when policy passes or `2` when it blocks, matching the CLI process. A report can include findings below the configured threshold or be blocked by unresolved calls with zero findings.
+
+Coverage counts discovered, read, analyzed, and failed source files. When a known read or parse error leaves coverage incomplete, diagnostics include `repo`, `revision`, `file`, `stage`, and `code`. Route removals require complete route extraction on both sides. OpenAPI changes can still be reported if both OpenAPI snapshots were analyzed. The policy decision applies to the evidence collected.
 
 ### 3.2 `AnalysisStats`
 

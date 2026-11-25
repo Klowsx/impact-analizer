@@ -2,8 +2,12 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use laine_cli::engine::{AnalyzeRequest, run_analysis};
-use laine_core::model::{Confidence, ContractChange, HttpMethod, Severity};
+use laine_cli::engine::{AnalyzeRequest, run_analysis, run_analysis_with_options};
+use laine_cli::report::{render_json, render_markdown, render_terminal};
+use laine_core::model::{
+    Confidence, ContractChange, ExtractionFailure, ExtractionStage, FileCoverage, HttpMethod,
+    Severity,
+};
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -26,6 +30,118 @@ fn init_repo(dir: &Path) {
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.name", "Laine Test"]);
     git(dir, &["config", "user.email", "test@laine.local"]);
+}
+
+// Verifica que un archivo malformado reste cobertura sin simular una eliminación de rutas.
+#[test]
+fn reports_partial_extraction_without_asserting_route_removal() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp =
+        std::env::temp_dir().join(format!("laine-e2e-partial-{}-{nanos}", std::process::id()));
+    fs::create_dir(&tmp).unwrap();
+    let api = tmp.join("api");
+    let web = tmp.join("web");
+    init_repo(&api);
+    init_repo(&web);
+    fs::write(
+        api.join("app.ts"),
+        "const app = express(); app.get('/users', handler);\n",
+    )
+    .unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "test: add api"]);
+    fs::write(api.join("app.ts"), "const app = {\n").unwrap();
+    fs::write(web.join("good.ts"), "fetch('http://api/users');\n").unwrap();
+    fs::write(web.join("bad.ts"), "const invalid = {\n").unwrap();
+    git(&web, &["add", "."]);
+    git(&web, &["commit", "-m", "test: add consumer sources"]);
+
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+[[services]]
+name = "api"
+path = "./api"
+base_urls = ["http://api"]
+[services.routes]
+framework = "express"
+files = ["./app.ts"]
+[[services]]
+name = "web"
+path = "./web"
+"#,
+    )
+    .unwrap();
+    let request = AnalyzeRequest {
+        config_path,
+        target_repo: "api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "WORKTREE".into(),
+    };
+    let result = run_analysis(&request).unwrap();
+    assert!(result.findings.is_empty());
+    let coverage = result.coverage.as_ref().unwrap();
+    assert!(!coverage.complete);
+    assert_eq!(
+        coverage.producer_base,
+        FileCoverage {
+            discovered: 1,
+            read: 1,
+            analyzed: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(
+        coverage.producer_head,
+        FileCoverage {
+            discovered: 1,
+            read: 1,
+            analyzed: 0,
+            failed: 1
+        }
+    );
+    assert_eq!(
+        coverage.consumers,
+        FileCoverage {
+            discovered: 2,
+            read: 2,
+            analyzed: 1,
+            failed: 1
+        }
+    );
+    assert_eq!(result.diagnostics.len(), 2);
+    assert_eq!(result.diagnostics[0].file, "app.ts");
+    assert_eq!(result.diagnostics[0].stage, ExtractionStage::ProducerHead);
+    assert_eq!(result.diagnostics[0].revision, "WORKTREE");
+    assert_eq!(result.diagnostics[1].file, "bad.ts");
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .all(|item| item.code == ExtractionFailure::FileParseFailed)
+    );
+    assert!(render_terminal(&result, 0).contains("Coverage: INCOMPLETE"));
+    assert!(render_markdown(&result).contains("**Coverage:** INCOMPLETE"));
+    for bypass in [false, true] {
+        assert_eq!(
+            render_json(&result).unwrap(),
+            render_json(&run_analysis_with_options(&request, bypass).unwrap()).unwrap()
+        );
+    }
+
+    // Quitar de verdad el archivo del checkout sí produce un hallazgo del catálogo base.
+    fs::remove_file(api.join("app.ts")).unwrap();
+    let removed = run_analysis(&request).unwrap();
+    assert!(matches!(
+        removed.findings[0].change,
+        ContractChange::EndpointRemoved { .. }
+    ));
+    assert_eq!(removed.coverage.unwrap().producer_head.failed, 0);
+    fs::remove_dir_all(&tmp).unwrap();
 }
 
 // Comprueba que la evidencia y las excepciones conservan la identidad de las rutas de base.

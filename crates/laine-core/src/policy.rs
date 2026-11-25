@@ -163,6 +163,8 @@ mod tests {
             schema_version: 1,
             target_repo: "customer-service".into(),
             policy: None,
+            coverage: None,
+            diagnostics: Vec::new(),
             base_rev: "base".into(),
             head_rev: "head".into(),
             stats: AnalysisStats::default(),

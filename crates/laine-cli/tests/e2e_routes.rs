@@ -151,6 +151,67 @@ path = "./web"
     fs::remove_dir_all(&tmp).unwrap();
 }
 
+// Comprueba que el diff incluye rutas encadenadas y que una declaración dinámica señala su línea.
+#[test]
+fn compares_laravel_resources_and_reports_dynamic_declarations() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-laravel-chain-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let api = tmp.join("api");
+    init_repo(&api);
+    fs::create_dir(api.join("routes")).unwrap();
+    let routes = api.join("routes/api.php");
+    fs::write(
+        &routes,
+        "<?php\nRoute::middleware('auth')->get('/año', Handler::class);\nRoute::apiResource('orders', Order::class);\n",
+    ).unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "test: register resource routes"]);
+    fs::write(&routes, "<?php\n").unwrap();
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+[[services]]
+name = "api"
+path = "./api"
+[services.routes]
+framework = "laravel"
+files = ["routes/api.php"]
+"#,
+    )
+    .unwrap();
+    let request = AnalyzeRequest {
+        config_path,
+        target_repo: "api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "WORKTREE".into(),
+    };
+    let removed = run_analysis(&request).unwrap();
+    assert_eq!(removed.findings.len(), 7);
+    assert!(
+        removed
+            .findings
+            .iter()
+            .any(|finding| finding.change.endpoint().normalized_path == "/año")
+    );
+    assert!(removed.coverage.unwrap().complete);
+
+    fs::write(&routes, "<?php\nRoute::get($path, Handler::class);\n").unwrap();
+    let partial = run_analysis(&request).unwrap();
+    assert!(partial.findings.is_empty());
+    assert!(!partial.coverage.as_ref().unwrap().complete);
+    assert_eq!(partial.diagnostics.len(), 1);
+    let diagnostic = &partial.diagnostics[0];
+    assert_eq!(
+        diagnostic.code,
+        ExtractionFailure::RouteDeclarationUnresolved
+    );
+    assert_eq!(diagnostic.stage, ExtractionStage::ProducerHead);
+    assert_eq!(diagnostic.line, Some(2));
+    assert!(render_markdown(&partial).contains("api/routes/api.php:2"));
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
 // Comprueba que la evidencia y las excepciones conservan la identidad de las rutas de base.
 #[test]
 fn keeps_literal_calls_and_policy_ignores_separate_from_removed_templates() {

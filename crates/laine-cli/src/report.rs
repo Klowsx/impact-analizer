@@ -569,12 +569,17 @@ fn empty_findings_message(report: &AnalysisReport) -> &'static str {
 }
 
 // Identifica el archivo y el snapshot que fallaron sin imprimir el texto de entrada.
+// Incluye la línea cuando el extractor tiene la posición de una declaración incompleta.
 fn describe_extraction_diagnostic(diagnostic: &ExtractionDiagnostic) -> String {
+    let line = diagnostic
+        .line
+        .map_or_else(String::new, |line| format!(":{line}"));
     format!(
-        "{}: {}/{} ({})",
+        "{}: {}/{}{} ({})",
         diagnostic.code.message(),
         diagnostic.repo,
         diagnostic.file,
+        line,
         short_sha(&diagnostic.revision)
     )
 }

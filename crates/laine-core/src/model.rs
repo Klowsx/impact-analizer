@@ -239,6 +239,7 @@ pub enum ExtractionFailure {
     FileReadFailed,
     FileParseFailed,
     DataflowLimitReached,
+    RouteDeclarationUnresolved,
 }
 
 impl ExtractionFailure {
@@ -248,6 +249,9 @@ impl ExtractionFailure {
             Self::FileReadFailed => "File could not be read",
             Self::FileParseFailed => "File could not be parsed",
             Self::DataflowLimitReached => "Cross-file analysis reached the propagation limit",
+            Self::RouteDeclarationUnresolved => {
+                "Route declaration could not be resolved statically"
+            }
         }
     }
 
@@ -257,6 +261,7 @@ impl ExtractionFailure {
             Self::FileReadFailed => "check_input_paths",
             Self::FileParseFailed => "repair_source_syntax",
             Self::DataflowLimitReached => "check_remaining_dependency_hops",
+            Self::RouteDeclarationUnresolved => "review_dynamic_route_declaration",
         }
     }
 }
@@ -276,6 +281,8 @@ pub struct ExtractionDiagnostic {
     pub file: String,
     pub stage: ExtractionStage,
     pub code: ExtractionFailure,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
     #[serde(default)]
     pub remediation: String,
 }

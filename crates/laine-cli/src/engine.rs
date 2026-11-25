@@ -8,7 +8,7 @@ use laine_core::error::{LaineError, Result};
 use laine_core::git::{GitRepo, STAGED_REV, WORKTREE_REV};
 use laine_core::graph::DependencyGraph;
 use laine_core::impact::{ImpactInput, analyze_impact};
-use laine_core::laravel::extract_laravel_routes;
+use laine_core::laravel::analyze_laravel_routes;
 use laine_core::model::{
     AnalysisCoverage, AnalysisReport, AnalysisStats, Confidence, ContractChange,
     ContractDiscrepancy, Evidence, ExtractionDiagnostic, ExtractionFailure, ExtractionStage,
@@ -139,6 +139,8 @@ struct OpenApiSnapshot {
 struct FileExtraction {
     coverage: FileCoverage,
     failures: BTreeMap<String, ExtractionFailure>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    failure_lines: BTreeMap<String, Vec<usize>>,
 }
 
 impl FileExtraction {
@@ -158,6 +160,7 @@ impl FileExtraction {
                 failed: failures.len(),
             },
             failures,
+            failure_lines: BTreeMap::new(),
         }
     }
 
@@ -182,18 +185,24 @@ impl FileExtraction {
         revision: &str,
         stage: ExtractionStage,
     ) {
-        diagnostics.extend(
-            self.failures
-                .iter()
-                .map(|(file, code)| ExtractionDiagnostic {
-                    repo: repo.to_owned(),
-                    revision: revision.to_owned(),
-                    file: file.clone(),
-                    stage,
-                    code: *code,
-                    remediation: code.remediation().to_owned(),
-                }),
-        );
+        for (file, code) in &self.failures {
+            let lines = self.failure_lines.get(file);
+            let positions = lines
+                .into_iter()
+                .flatten()
+                .copied()
+                .map(Some)
+                .chain(lines.is_none().then_some(None));
+            diagnostics.extend(positions.map(|line| ExtractionDiagnostic {
+                repo: repo.to_owned(),
+                revision: revision.to_owned(),
+                file: file.clone(),
+                stage,
+                code: *code,
+                line,
+                remediation: code.remediation().to_owned(),
+            }));
+        }
     }
 }
 
@@ -995,12 +1004,14 @@ fn extract_producer_routes(
     for (file, raw) in batch_contents {
         match route_cfg.framework {
             RouteFramework::Laravel => {
-                routes.extend(extract_laravel_routes(
-                    service_name,
-                    &file,
-                    &raw,
-                    route_cfg.prefix.as_deref(),
-                ));
+                let (found, unresolved) =
+                    analyze_laravel_routes(service_name, &file, &raw, route_cfg.prefix.as_deref());
+                routes.extend(found);
+                if !unresolved.is_empty() {
+                    extraction
+                        .record_incomplete(&file, ExtractionFailure::RouteDeclarationUnresolved);
+                    extraction.failure_lines.insert(file, unresolved);
+                }
             }
             RouteFramework::Express => {
                 match extract_express_routes(service_name, &file, &raw, route_cfg.prefix.as_deref())

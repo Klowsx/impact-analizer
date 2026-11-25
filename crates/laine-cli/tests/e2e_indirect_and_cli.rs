@@ -30,8 +30,9 @@ fn init_repo(dir: &Path) {
     git(dir, &["config", "user.email", "test@laine.local"]);
 }
 
+// Comprueba las cadenas indirectas con un diamante, un ciclo y procesos independientes.
 #[test]
-fn propagates_indirect_possible_consumers_across_three_repos_with_cycles() {
+fn propagates_indirect_possible_consumers_with_diamonds_and_cycles() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-indirect-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).unwrap();
@@ -108,6 +109,7 @@ paths:
         accounting.join("src/ledger.ts"),
         r#"export async function syncLedger(invoiceId: string) {
   const res = await fetch(`http://billing-service/invoices/${invoiceId}`);
+  await fetch(`http://shipping-service/shipments/${invoiceId}`);
   return res.json();
 }
 "#,
@@ -115,6 +117,22 @@ paths:
     .unwrap();
     git(&accounting, &["add", "."]);
     git(&accounting, &["commit", "-m", "init accounting"]);
+
+    // El segundo consumidor directo también lleva a accounting-service.
+    let shipping = tmp.join("shipping-service");
+    init_repo(&shipping);
+    fs::write(
+        shipping.join("ship.ts"),
+        r#"export async function ship(id: string) {
+  const res = await fetch(`http://customer-service/customers/${id}`);
+  const customer = await res.json();
+  return customer.fullName;
+}
+"#,
+    )
+    .unwrap();
+    git(&shipping, &["add", "."]);
+    git(&shipping, &["commit", "-m", "init shipping"]);
 
     // Introduce a cycle back from billing-service to accounting-service to prove cycle safety!
     fs::write(
@@ -154,6 +172,13 @@ paths:
                 routes: None,
                 base_urls: vec!["http://accounting-service".into()],
             },
+            ServiceConfig {
+                name: "shipping-service".into(),
+                path: "./shipping-service".into(),
+                openapi: None,
+                routes: None,
+                base_urls: vec!["http://shipping-service".into()],
+            },
         ],
         clients: Vec::new(),
         env: Default::default(),
@@ -164,7 +189,7 @@ paths:
         .expect("save_to_path should work");
 
     let report = run_analysis(&AnalyzeRequest {
-        config_path: cfg_path,
+        config_path: cfg_path.clone(),
         target_repo: "customer-service".into(),
         base_rev: "main".into(),
         head_rev: "v2".into(),
@@ -178,10 +203,12 @@ paths:
         ContractChange::ResponseFieldRemoved { field_path, .. } if field_path == "fullName"
     ));
 
-    // Direct confirmed consumer: billing-service
-    assert_eq!(finding.consumers.len(), 1);
+    // Ambos consumidores directos leen el campo eliminado.
+    assert_eq!(finding.consumers.len(), 2);
     assert_eq!(finding.consumers[0].repo, "billing-service");
     assert_eq!(finding.consumers[0].confidence, Confidence::Confirmed);
+    assert_eq!(finding.consumers[1].repo, "shipping-service");
+    assert_eq!(finding.consumers[1].confidence, Confidence::Confirmed);
 
     // Indirect possible consumer: accounting-service (via billing-service)
     assert_eq!(finding.indirect_consumers.len(), 1);
@@ -199,6 +226,28 @@ paths:
     assert!(json.contains("\"schema_version\": 1"));
     assert!(json.contains("\"indirect_consumers\""));
     assert!(json.contains("\"POSSIBLE\""));
+
+    // Cada proceso vuelve a construir el grafo y debe elegir la misma cadena.
+    for _ in 0..8 {
+        let output = Command::new(env!("CARGO_BIN_EXE_laine"))
+            .args(["analyze", "--config"])
+            .arg(&cfg_path)
+            .args([
+                "--repo",
+                "customer-service",
+                "--base",
+                "main",
+                "--head",
+                "v2",
+                "--format",
+                "json",
+                "--no-cache",
+            ])
+            .output()
+            .expect("laine process should run");
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim_end(), json);
+    }
 
     let term = render_terminal(&report, 5);
     assert!(term.contains("Indirectly affected consumers (1 possible):"));

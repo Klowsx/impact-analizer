@@ -50,8 +50,7 @@ fn consumers_for_endpoint(graph: &DependencyGraph, endpoint: &EndpointId) -> Vec
         .collect()
 }
 
-/// Crosses breaking contract changes from the producer against the populated dependency graph
-/// to produce a deterministic `AnalysisReport` with verifiable evidence.
+/// Cruza los cambios de contrato con el grafo para producir un informe reproducible.
 pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> AnalysisReport {
     let mut findings = Vec::new();
     let head_or_base_raw = if input.head_source_raw.is_empty() {
@@ -196,7 +195,7 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
         };
 
         let direct_repo_set: HashSet<String> = consumers.iter().map(|c| c.repo.clone()).collect();
-        let mut indirect_map: BTreeMap<String, IndirectConsumer> = BTreeMap::new();
+        let mut indirect_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for direct_repo in &direct_repo_set {
             for (downstream_repo, chain) in graph.transitive_dependent_paths(direct_repo) {
                 if downstream_repo == input.target_repo
@@ -204,17 +203,24 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                 {
                     continue;
                 }
-                indirect_map
-                    .entry(downstream_repo.clone())
-                    .or_insert_with(|| IndirectConsumer {
-                        repo: downstream_repo,
-                        confidence: Confidence::Possible,
-                        via_repo: direct_repo.clone(),
-                        dependency_chain: chain,
-                    });
+                // Prioriza la cadena más corta y desempata por orden lexicográfico.
+                if indirect_paths
+                    .get(&downstream_repo)
+                    .is_none_or(|previous| (chain.len(), &chain) < (previous.len(), previous))
+                {
+                    indirect_paths.insert(downstream_repo, chain);
+                }
             }
         }
-        let indirect_consumers: Vec<IndirectConsumer> = indirect_map.into_values().collect();
+        let indirect_consumers = indirect_paths
+            .into_iter()
+            .map(|(repo, dependency_chain)| IndirectConsumer {
+                repo,
+                confidence: Confidence::Possible,
+                via_repo: dependency_chain[0].clone(),
+                dependency_chain,
+            })
+            .collect();
 
         findings.push(ImpactFinding {
             id: format!("LAINE-{:03}", idx + 1),

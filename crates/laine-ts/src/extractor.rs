@@ -93,6 +93,7 @@ pub fn extract_file(
 /// Extracts HTTP consumer calls (`fetch`, `axios`, `axios.create`, and configured custom wrappers),
 /// field reads (direct, destructured, aliased, optional chaining, and 1-level local helpers),
 /// TypeScript generic response types, and unresolved dynamic URLs (`UNKNOWN`).
+// Extrae llamadas con el lenguaje original de cada bloque Vue.
 pub fn extract_file_with_context(
     file_path: &str,
     source: &str,
@@ -107,11 +108,7 @@ pub fn extract_file_with_context(
         let mut template_bindings: HashMap<String, VarBinding> = HashMap::new();
 
         for (block, is_setup) in blocks {
-            let source_type = if block.is_ts {
-                SourceType::ts().with_module(true)
-            } else {
-                SourceType::mjs()
-            };
+            let source_type = block.lang.source_type();
             let (extracted, top_bindings) =
                 extract_source_block_with_bindings(file_path, &block.code, source_type, ctx)?;
             let call_offset = merged.calls.len();

@@ -18,6 +18,7 @@ use crate::vue::extract_vue_scripts;
 /// `.pick(...)` / `.omit(...)` / modifiers) and inferred type aliases
 /// (`type User = z.infer<typeof UserSchema>`, `z.output<...>`, `z.input<...>`)
 /// from a `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`, or `.vue` file.
+// Busca esquemas Zod sin perder el modo JSX de un bloque Vue.
 pub fn extract_zod_schemas(
     file_path: &str,
     source: &str,
@@ -28,11 +29,7 @@ pub fn extract_zod_schemas(
         let blocks = extract_vue_scripts(source);
         let mut defs = Vec::new();
         for block in blocks {
-            let source_type = if block.is_ts {
-                SourceType::ts()
-            } else {
-                SourceType::mjs()
-            };
+            let source_type = block.lang.source_type();
             defs.extend(extract_zod_from_block(
                 file_path,
                 &block.code,

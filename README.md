@@ -124,6 +124,8 @@ laine check
 laine check --staged
 ```
 
+Use `laine workspace add <name> <config> --replace` to replace an existing registration. Use `laine init --workspace <name> --force` to replace a managed workspace config.
+
 Consumer scans read `HEAD` by default. Use `--consumer-revision staged` to search the Git index or `--consumer-revision worktree` to search local files. For example, `laine check --staged --consumer-revision staged` uses the index for both producer and consumers, including client code in the producer checkout.
 
 From a consumer-only checkout, `laine check` prints commands for the producers configured in its workspace. For example, run `laine check --workspace corporativo --repo cerebro-web` to check the producer.

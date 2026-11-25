@@ -1,11 +1,88 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LaineError, Result};
 use crate::model::Severity;
+
+// Adquiere un bloqueo de escritura compartido por todos los procesos que actualizan un TOML.
+pub fn lock_config_update(path: &Path) -> Result<File> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let parent = config_parent(&path);
+    let Some(name) = path.file_name() else {
+        return Err(LaineError::ConfigInvalid(
+            "expected a TOML file path".into(),
+        ));
+    };
+    let mut lock_name = name.to_os_string();
+    lock_name.push(".lock");
+    let lock_path = parent.join(lock_name);
+    let io_error = |source| LaineError::Io {
+        path: lock_path.clone(),
+        source,
+    };
+    fs::create_dir_all(parent).map_err(&io_error)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(&io_error)?;
+    file.lock().map_err(io_error)?;
+    Ok(file)
+}
+
+// Escribe un archivo temporal junto al destino y lo renombra para evitar TOML parciales.
+pub fn write_config_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let parent = config_parent(&path);
+    let io_error = |source| LaineError::Io {
+        path: path.clone(),
+        source,
+    };
+    fs::create_dir_all(parent).map_err(&io_error)?;
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(io_error(error)),
+    };
+    let (temporary_path, mut file) = loop {
+        let seq = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".laine-{}-{seq}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => break (tmp, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io_error(error)),
+        }
+    };
+    let write = (|| -> io::Result<()> {
+        file.write_all(bytes)?;
+        if let Some(metadata) = metadata {
+            file.set_permissions(metadata.permissions())?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    let result = write.and_then(|_| fs::rename(&temporary_path, &path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary_path);
+    }
+    result.map_err(io_error)
+}
+
+// Trata los nombres relativos sin directorio padre como archivos del directorio actual.
+fn config_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
 
 fn default_fail_on() -> Severity {
     Severity::Low
@@ -243,16 +320,8 @@ impl WorkspaceConfig {
         self.services.iter().find(|svc| svc.name == name)
     }
 
-    // Guarda una copia que solo conserva los componentes de las URL requeridos para el análisis.
+    // Guarda de forma atómica una copia saneada de la configuración del workspace.
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent).map_err(|source| LaineError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
         let mut config = self.clone();
         for value in config.env.values_mut().chain(
             config
@@ -264,10 +333,7 @@ impl WorkspaceConfig {
         }
         let serialized = toml::to_string_pretty(&config)
             .map_err(|err| LaineError::ConfigInvalid(err.to_string()))?;
-        fs::write(path, serialized).map_err(|source| LaineError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+        write_config_atomically(path, serialized.as_bytes())
     }
 }
 

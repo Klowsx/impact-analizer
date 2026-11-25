@@ -59,14 +59,18 @@ pub fn normalize_openapi_path(raw: &str) -> String {
 }
 
 /// Converts a normalized route path like `/customers/:id` into a wildcard key `/customers/*`
-/// so endpoints match even when producer and consumer use different parameter names.
+/// (and optional params like `/corp/:accion/:param?` into `/corp/*/*?`) so endpoints match
+/// even when producer and consumer use different parameter names or omit optional segments.
 pub fn canonical_route_key(normalized_path: &str) -> String {
     let segments: Vec<&str> = normalized_path
         .split('/')
         .filter(|segment| !segment.is_empty())
         .map(|segment| {
-            if segment.starts_with(':') || (segment.starts_with('{') && segment.ends_with('}')) {
-                "*"
+            if segment.starts_with(':') {
+                if segment.ends_with('?') { "*?" } else { "*" }
+            } else if segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2 {
+                let inner = &segment[1..segment.len() - 1];
+                if inner.ends_with('?') { "*?" } else { "*" }
             } else {
                 segment
             }

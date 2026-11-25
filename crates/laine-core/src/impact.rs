@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, HashSet};
 use crate::graph::DependencyGraph;
 use crate::model::{
     AffectedConsumer, AnalysisReport, AnalysisStats, Confidence, ContractChange,
-    ContractDiscrepancy, EndpointId, Evidence, ImpactFinding, IndirectConsumer, Severity,
-    UnresolvedCall,
+    ContractDiscrepancy, EndpointId, Evidence, HttpMethod, ImpactFinding, IndirectConsumer,
+    Severity, UnresolvedCall,
 };
-use crate::openapi::{find_field_line, find_parameter_line};
+use crate::openapi::{canonical_route_key, find_field_line, find_parameter_line};
 
 pub struct ImpactInput<'a> {
     pub target_repo: &'a str,
@@ -15,6 +15,9 @@ pub struct ImpactInput<'a> {
     pub source_file: &'a str,
     pub base_source_raw: &'a str,
     pub head_source_raw: &'a str,
+    /// Optional exact `(file, line)` source locations for code-extracted routes keyed by
+    /// `(service, method, canonical_route_key)`.
+    pub route_locations: BTreeMap<(String, HttpMethod, String), (String, usize)>,
     pub changes: Vec<ContractChange>,
     pub unresolved_calls: Vec<UnresolvedCall>,
     pub discrepancies: Vec<ContractDiscrepancy>,
@@ -58,9 +61,20 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
     };
 
     for (idx, change) in input.changes.into_iter().enumerate() {
+        let mut producer_file = input.source_file.to_string();
         let (producer_line, producer_snippet, consumers) = match &change {
             ContractChange::EndpointRemoved { endpoint } => {
-                let line = find_field_line(input.base_source_raw, &endpoint.normalized_path);
+                let key = (
+                    endpoint.service.clone(),
+                    endpoint.method,
+                    canonical_route_key(&endpoint.normalized_path),
+                );
+                let line = if let Some((file, exact_line)) = input.route_locations.get(&key) {
+                    producer_file = file.clone();
+                    *exact_line
+                } else {
+                    find_field_line(input.base_source_raw, &endpoint.normalized_path)
+                };
                 let consumers = consumers_for_endpoint(graph, endpoint);
                 (
                     line,
@@ -210,7 +224,7 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
             producer_evidence: Evidence {
                 repo: input.target_repo.to_string(),
                 revision: input.head_rev.to_string(),
-                file: input.source_file.to_string(),
+                file: producer_file,
                 line: producer_line,
                 snippet: producer_snippet,
             },
@@ -304,6 +318,7 @@ paths:
                 source_file: "openapi.yaml",
                 base_source_raw: "",
                 head_source_raw: head_spec,
+                route_locations: BTreeMap::new(),
                 changes: vec![
                     ContractChange::RequestFieldAddedRequired {
                         endpoint: post_ep.clone(),

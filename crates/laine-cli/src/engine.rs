@@ -130,6 +130,8 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     let mut files_analyzed = 0usize;
     let mut contract_changes: Vec<ContractChange> = Vec::new();
     let mut discrepancies: Vec<ContractDiscrepancy> = Vec::new();
+    let mut route_locations: BTreeMap<(String, HttpMethod, String), (String, usize)> =
+        BTreeMap::new();
     let mut source_file_display = String::new();
     let mut base_source_raw = String::new();
     let mut head_source_raw = String::new();
@@ -183,6 +185,13 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
                 route.endpoint.method,
                 &route.endpoint.normalized_path,
             );
+            route_locations
+                .entry((
+                    route.endpoint.service.clone(),
+                    route.endpoint.method,
+                    canonical_route_key(&route.endpoint.normalized_path),
+                ))
+                .or_insert_with(|| (route.file.clone(), route.line));
         }
 
         let route_changes = diff_routes(&base_routes, &head_routes);
@@ -294,6 +303,7 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
             source_file: &source_file_display,
             base_source_raw: &base_source_raw,
             head_source_raw: &head_source_raw,
+            route_locations,
             changes: contract_changes,
             unresolved_calls,
             discrepancies,

@@ -485,19 +485,26 @@ impl DependencyGraph {
 
         self.endpoints
             .iter()
-            .find_map(|((svc, m, ep_canonical), &idx)| {
-                if svc == service && *m == method && routes_match(ep_canonical, &consumer_canonical)
-                {
-                    Some(idx)
-                } else {
-                    None
-                }
+            .filter(|((svc, m, ep_canonical), _)| {
+                svc == service && *m == method && routes_match(ep_canonical, &consumer_canonical)
             })
+            .min_by(|((_, _, a), _), ((_, _, b), _)| {
+                let a_wildcards = a
+                    .split('/')
+                    .filter(|seg| *seg == "*" || *seg == "*?")
+                    .count();
+                let b_wildcards = b
+                    .split('/')
+                    .filter(|seg| *seg == "*" || *seg == "*?")
+                    .count();
+                (a_wildcards, a).cmp(&(b_wildcards, b))
+            })
+            .map(|(_, &idx)| idx)
     }
 }
 
-/// Checks whether two canonical route keys match segment-by-segment, treating `*` as a wildcard
-/// that matches both parameterized segments (`:id`) and concrete literals (`1024`).
+/// Checks whether two canonical route keys match segment-by-segment, treating `*` as a required
+/// wildcard (1 segment) and `*?` as an optional wildcard (0 or 1 segment).
 pub fn routes_match(producer_canonical: &str, consumer_canonical: &str) -> bool {
     let prod_segs: Vec<&str> = producer_canonical
         .split('/')
@@ -508,14 +515,45 @@ pub fn routes_match(producer_canonical: &str, consumer_canonical: &str) -> bool 
         .filter(|s| !s.is_empty())
         .collect();
 
-    if prod_segs.len() != cons_segs.len() {
-        return false;
+    segments_match(&prod_segs, &cons_segs)
+}
+
+fn segments_match(a: &[&str], b: &[&str]) -> bool {
+    let (m, n) = (a.len(), b.len());
+    let mut dp = vec![vec![false; n + 1]; m + 1];
+    dp[m][n] = true;
+
+    for i in (0..=m).rev() {
+        for j in (0..=n).rev() {
+            if i == m && j == n {
+                continue;
+            }
+            let mut matched = false;
+            if i < m && a[i] == "*?" {
+                matched |= dp[i + 1][j];
+                if j < n {
+                    matched |= dp[i + 1][j + 1];
+                }
+            }
+            if j < n && b[j] == "*?" {
+                matched |= dp[i][j + 1];
+                if i < m {
+                    matched |= dp[i + 1][j + 1];
+                }
+            }
+            if i < m
+                && j < n
+                && a[i] != "*?"
+                && b[j] != "*?"
+                && (a[i] == "*" || b[j] == "*" || a[i] == b[j])
+            {
+                matched |= dp[i + 1][j + 1];
+            }
+            dp[i][j] = matched;
+        }
     }
 
-    prod_segs
-        .iter()
-        .zip(cons_segs.iter())
-        .all(|(p, c)| *p == "*" || *c == "*" || p == c)
+    dp[0][0]
 }
 
 fn field_matches(changed_field: &str, read_field: &str) -> bool {
@@ -538,6 +576,25 @@ mod tests {
         assert!(routes_match("/customers/*", "/customers/1024"));
         assert!(!routes_match("/customers/*", "/orders/1024"));
         assert!(!routes_match("/customers/*", "/customers/1024/orders"));
+    }
+
+    #[test]
+    fn matches_optional_wildcard_segments_when_omitted_or_present() {
+        assert!(routes_match("/api/corp/*/*?", "/api/corp/loginCorp"));
+        assert!(routes_match("/api/corp/*/*?", "/api/corp/loginCorp/123"));
+        assert!(!routes_match("/api/corp/*/*?", "/api/corp"));
+        assert!(!routes_match(
+            "/api/corp/*/*?",
+            "/api/corp/loginCorp/123/extra"
+        ));
+
+        assert!(routes_match("/api/web/*/*?/*?", "/api/web/getRateCars"));
+        assert!(routes_match("/api/web/*/*?/*?", "/api/web/getRateCars/1"));
+        assert!(routes_match("/api/web/*/*?/*?", "/api/web/getRateCars/1/2"));
+        assert!(!routes_match(
+            "/api/web/*/*?/*?",
+            "/api/web/getRateCars/1/2/3"
+        ));
     }
 
     #[test]

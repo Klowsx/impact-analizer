@@ -14,7 +14,7 @@ pub struct ExtractedRoute {
 }
 
 /// Joins optional prefixes and normalizes Laravel `{param}` / `{param?}` or Express `:param`
-/// segments into Laine's canonical display path (e.g. `/corp/bookings/:id`).
+/// segments into Laine's canonical display path (e.g. `/corp/bookings/:id`, `/corp/:accion/:param?`).
 pub fn normalize_route_path(prefixes: &[&str], raw_path: &str) -> String {
     let mut segments = Vec::new();
 
@@ -25,7 +25,7 @@ pub fn normalize_route_path(prefixes: &[&str], raw_path: &str) -> String {
                 continue;
             }
             if seg.starts_with('{') && seg.ends_with('}') && seg.len() > 2 {
-                let inner = seg[1..seg.len() - 1].trim_end_matches('?');
+                let inner = &seg[1..seg.len() - 1];
                 segments.push(format!(":{inner}"));
             } else {
                 segments.push(seg.to_string());
@@ -133,6 +133,18 @@ mod tests {
             line: 10,
             snippet: format!("Route::{}('{path}')", method.as_str().to_lowercase()),
         }
+    }
+
+    #[test]
+    fn preserves_optional_parameter_markers_in_normalized_route_path() {
+        assert_eq!(
+            normalize_route_path(&["/api"], "corp/{accion}/{param?}"),
+            "/api/corp/:accion/:param?"
+        );
+        assert_eq!(
+            normalize_route_path(&["/api"], "web/{accion}/{param?}/{param2?}"),
+            "/api/web/:accion/:param?/:param2?"
+        );
     }
 
     #[test]

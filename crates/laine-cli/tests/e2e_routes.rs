@@ -148,3 +148,108 @@ target_service = "laravel-api"
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn matches_laravel_optional_route_params_and_reports_exact_route_line() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-laravel-opt-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    // Producer: Laravel wildcard route with optional `{param?}` defined on line 6
+    let api_dir = tmp.join("laravel-api");
+    init_repo(&api_dir);
+    fs::create_dir_all(api_dir.join("routes")).unwrap();
+    fs::write(
+        api_dir.join("routes/api.php"),
+        "<?php\n\
+use Illuminate\\Support\\Facades\\Route;\n\
+\n\
+Route::get('/health', 'HealthController@check');\n\
+// Corporate catch-all route:\n\
+Route::post('corp/{accion}/{param?}', [Corporativo::class, 'accion']);\n",
+    )
+    .unwrap();
+    git(&api_dir, &["add", "."]);
+    git(
+        &api_dir,
+        &["commit", "-m", "feat: add corp optional param route"],
+    );
+
+    // Consumer calls both 2-segment (`/corp/loginCorp`) and 3-segment (`/corp/booking/123`) URLs
+    let web_dir = tmp.join("portal-web");
+    init_repo(&web_dir);
+    fs::create_dir_all(web_dir.join("app/services")).unwrap();
+    fs::write(
+        web_dir.join("app/services/auth.ts"),
+        r#"export function login() {
+  return getClient().fetch('/corp/loginCorp', { method: 'POST' });
+}
+export function updateBooking(id: string) {
+  return getClient().fetch(`/corp/booking/${id}`, { method: 'POST' });
+}
+"#,
+    )
+    .unwrap();
+    git(&web_dir, &["add", "."]);
+    git(&web_dir, &["commit", "-m", "feat: call corp endpoints"]);
+
+    let cfg_path = tmp.join("laine.toml");
+    fs::write(
+        &cfg_path,
+        r#"version = 1
+
+[[services]]
+name = "laravel-api"
+path = "./laravel-api"
+[services.routes]
+framework = "laravel"
+files = ["routes/api.php"]
+prefix = "/api"
+
+[[services]]
+name = "portal-web"
+path = "./portal-web"
+
+[[clients]]
+callee = "getClient().fetch"
+target_service = "laravel-api"
+path_prefix = "/api"
+"#,
+    )
+    .unwrap();
+
+    // Remove the optional-param route locally in WORKTREE (no commit)
+    fs::write(
+        api_dir.join("routes/api.php"),
+        "<?php\n\
+use Illuminate\\Support\\Facades\\Route;\n\
+\n\
+Route::get('/health', 'HealthController@check');\n",
+    )
+    .unwrap();
+
+    let report = run_analysis(&AnalyzeRequest {
+        config_path: cfg_path,
+        target_repo: "laravel-api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "WORKTREE".into(),
+    })
+    .expect("analysis should succeed");
+
+    assert_eq!(report.findings.len(), 1);
+    let finding = &report.findings[0];
+    assert_eq!(finding.severity, Severity::Critical);
+    assert_eq!(finding.producer_evidence.file, "routes/api.php");
+    assert_eq!(
+        finding.producer_evidence.line, 6,
+        "expected exact route definition line 6"
+    );
+    assert_eq!(
+        finding.consumers.len(),
+        2,
+        "expected both 2-segment and 3-segment calls to match optional param route, got: {:?}",
+        finding.consumers
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}

@@ -34,6 +34,13 @@ pub struct GitRepo {
 }
 
 impl GitRepo {
+    // Resuelve la raíz de un checkout Git desde cualquier directorio de su árbol.
+    pub fn discover(path: &Path) -> Result<Self> {
+        let git = Self::new(path);
+        let root = git.run_git(&["rev-parse", "--show-toplevel"])?;
+        Ok(Self::new(root.strip_suffix('\n').unwrap_or(&root)))
+    }
+
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }

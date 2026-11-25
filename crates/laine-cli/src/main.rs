@@ -14,7 +14,7 @@ use laine_core::config::{
     PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig,
 };
 use laine_core::fixtures::create_demo_workspace;
-use laine_core::git::STAGED_REV;
+use laine_core::git::{GitRepo, STAGED_REV};
 use laine_core::workspace::{
     DiscoveredRepo, WorkspaceRegistry, build_workspace_config, infer_workspace_scan_dir,
     inspect_repo_path, merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
@@ -712,6 +712,7 @@ fn handle_workspace_edit(
     ExitCode::SUCCESS
 }
 
+// Valida la raíz Git antes de dar de alta un servicio y guarda su referencia desde el TOML.
 fn handle_repo(action: RepoAction) -> ExitCode {
     match action {
         RepoAction::Add {
@@ -723,6 +724,13 @@ fn handle_repo(action: RepoAction) -> ExitCode {
             base_urls,
             framework,
         } => {
+            let repo = match GitRepo::discover(&path) {
+                Ok(repo) => repo,
+                Err(err) => {
+                    eprintln!("Cannot add Git repository at {}: {err}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
             let target_cfg_path = match resolve_repo_command_config(config, workspace.as_deref()) {
                 Ok(p) => p,
                 Err(msg) => {
@@ -732,7 +740,8 @@ fn handle_repo(action: RepoAction) -> ExitCode {
             };
 
             let service_name = name.unwrap_or_else(|| {
-                path.file_name()
+                repo.root()
+                    .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "service".to_string())
             });
@@ -778,7 +787,7 @@ fn handle_repo(action: RepoAction) -> ExitCode {
 
             cfg.services.push(ServiceConfig {
                 name: service_name.clone(),
-                path,
+                path: repo_path_for_config(repo.root(), &target_cfg_path),
                 openapi,
                 routes,
                 base_urls,
@@ -844,6 +853,21 @@ fn handle_repo(action: RepoAction) -> ExitCode {
                 }
             }
         }
+    }
+}
+
+// Usa una ruta relativa si el checkout está dentro del directorio del TOML.
+fn repo_path_for_config(root: &Path, config: &Path) -> PathBuf {
+    let config_dir = normalize_absolute_path(
+        config
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    );
+    match root.strip_prefix(config_dir) {
+        Ok(path) if path.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(path) => path.to_path_buf(),
+        Err(_) => root.to_path_buf(),
     }
 }
 

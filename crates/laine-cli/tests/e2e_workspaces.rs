@@ -4,6 +4,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use laine_core::config::WorkspaceConfig;
+
 /// Verifica que el selector rechaza la entrada no interactiva aunque la tubería siga abierta.
 fn assert_selector_rejects_open_stdin(command: &mut Command) {
     let mut child = command
@@ -67,6 +69,7 @@ fn init_repo(dir: &Path) {
     git(dir, &["config", "user.email", "test@laine.local"]);
 }
 
+// Comprueba los checks desde un productor y las opciones cuando el cwd es un consumidor.
 #[test]
 fn init_scan_registers_isolated_workspaces_and_laine_check_runs_zero_flag_from_repo_cwd() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-workspaces-{}", std::process::id()));
@@ -214,6 +217,28 @@ fn init_scan_registers_isolated_workspaces_and_laine_check_runs_zero_flag_from_r
         !check_stdout.contains("portal-b") && !check_stdout.contains("laravel-b"),
         "eco-b repos must not leak into eco-a check, got:\n{check_stdout}"
     );
+
+    let consumer_check = Command::new(bin)
+        .current_dir(&portal_a)
+        .env("LAINE_HOME", &laine_home)
+        .arg("check")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&consumer_check.stderr);
+    assert_eq!(consumer_check.status.code(), Some(1));
+    assert!(stderr.contains("laine check --config"), "{stderr}");
+    assert!(stderr.contains("--repo \"laravel-a\""), "{stderr}");
+    assert!(!stderr.contains("laravel-b"), "{stderr}");
+
+    let producer_override = Command::new(bin)
+        .current_dir(&portal_a)
+        .env("LAINE_HOME", &laine_home)
+        .args(["check", "--config"])
+        .arg(&cfg_a)
+        .args(["--repo", "laravel-a"])
+        .output()
+        .unwrap();
+    assert_eq!(producer_override.status.code(), Some(2));
 
     // 5. `laine check --staged` should pass (exit 0) because the deletion is unstaged
     let staged_out = Command::new(bin)
@@ -433,16 +458,42 @@ fn workspace_edit_and_repo_add_remove_update_registered_workspace() {
         "expected portal-v2 hit after workspace edit, got:\n{check_stdout}"
     );
 
-    // 4. Test `laine repo add` and `laine repo remove` with `--workspace corp`
-    let add_out = Command::new(bin)
+    // Rechaza una ruta inexistente sin modificar la configuración del workspace.
+    let config_path = laine_home.join("configs/corp.toml");
+    let before = fs::read(&config_path).unwrap();
+    let missing = Command::new(bin)
+        .current_dir(&projects)
         .env("LAINE_HOME", &laine_home)
-        .args(["repo", "add", v1.to_str().unwrap(), "--workspace", "corp"])
+        .args(["repo", "add", "./nonexistent", "--workspace", "corp"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+
+    // Guarda la raíz real del checkout aunque la entrada sea una subcarpeta relativa.
+    fs::create_dir_all(v1.join("app/services")).unwrap();
+    let add_out = Command::new(bin)
+        .current_dir(&projects)
+        .env("LAINE_HOME", &laine_home)
+        .args([
+            "repo",
+            "add",
+            "./portal-v1/app/services",
+            "--workspace",
+            "corp",
+        ])
         .output()
         .expect("repo add --workspace should run");
     assert!(
         add_out.status.success(),
         "repo add --workspace failed: {}",
         String::from_utf8_lossy(&add_out.stderr)
+    );
+    let cfg = WorkspaceConfig::load_from_path(&config_path).unwrap();
+    let saved = &cfg.find_service("portal-v1").unwrap().path;
+    assert_eq!(
+        fs::canonicalize(saved).unwrap(),
+        fs::canonicalize(&v1).unwrap()
     );
 
     let rm_out = Command::new(bin)

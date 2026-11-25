@@ -96,7 +96,7 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
 ///
 /// When `no_cache` is `false`, per-repository consumer AST extractions are served from and
 /// persisted to the SQLite incremental cache keyed by `(repo, commit_sha, config_hash, schema_version)`.
-// Ejecuta el análisis y evalúa la política con la misma configuración del grafo.
+// Analiza un productor con su política u ofrece alternativas si el servicio solo consume APIs.
 pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result<AnalysisReport> {
     let config = WorkspaceConfig::load_from_path(&req.config_path)?;
     let config_dir = config_directory(&req.config_path);
@@ -110,11 +110,33 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     })?;
 
     if target_service.openapi.is_none() && target_service.routes.is_none() {
-        return Err(LaineError::ConfigInvalid(format!(
+        let mut message = format!(
             "service '{}' must configure `openapi` and/or `routes` in {}",
             req.target_repo,
             req.config_path.display()
-        )));
+        );
+        let candidates: std::collections::BTreeSet<_> = config
+            .services
+            .iter()
+            .filter(|service| service.openapi.is_some() || service.routes.is_some())
+            .map(|service| service.name.as_str())
+            .collect();
+        if !candidates.is_empty() {
+            message.push_str(". Choose a configured producer:\n");
+            message.push_str(
+                &candidates
+                    .iter()
+                    .map(|name| {
+                        format!(
+                            "  laine check --config \"{}\" --repo \"{name}\"",
+                            req.config_path.display()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+        return Err(LaineError::ConfigInvalid(message));
     }
 
     let producer_path = resolve_repo_path(config_dir, &target_service.path);

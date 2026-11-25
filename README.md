@@ -105,6 +105,8 @@ laine analyze \
 
 ### Initialize Your Own Workspace
 
+In CI or when stdin or stderr is redirected, pass `--select` or `--all` to `init --scan` and `workspace edit`.
+
 ```bash
 # Auto-discover Git repos in the current folder (or pass a directory) and interactively pick the ones for this ecosystem.
 # Saves config cleanly under ~/.laine/configs/<workspace>.toml and auto-detects .env URLs & custom HTTP wrappers.

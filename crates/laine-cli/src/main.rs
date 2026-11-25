@@ -21,7 +21,7 @@ use laine_core::workspace::{
     inspect_repo_path, merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
     scan_directory,
 };
-use selector::select_repositories;
+use selector::{ensure_selection_terminal, select_repositories};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -364,6 +364,7 @@ fn main() -> ExitCode {
     }
 }
 
+/// Inicializa la configuración y valida el terminal antes de escanear si pide selección.
 fn handle_init(
     path: Option<PathBuf>,
     force: bool,
@@ -395,6 +396,14 @@ fn handle_init(
     }
 
     if let Some(scan_dir) = scan {
+        if !all
+            && select.is_empty()
+            && let Err(message) = ensure_selection_terminal()
+        {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+
         let discovered = match scan_directory(&scan_dir) {
             Ok(repos) => repos,
             Err(err) => {
@@ -567,6 +576,7 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
     }
 }
 
+/// Actualiza los repositorios de un workspace con una selección explícita o interactiva.
 fn handle_workspace_edit(
     name: &str,
     scan: Option<PathBuf>,
@@ -574,6 +584,14 @@ fn handle_workspace_edit(
     all: bool,
     registry_path: &Path,
 ) -> ExitCode {
+    if !all
+        && select.is_empty()
+        && let Err(message) = ensure_selection_terminal()
+    {
+        eprintln!("{message}");
+        return ExitCode::FAILURE;
+    }
+
     let reg = match WorkspaceRegistry::load_from_path(registry_path) {
         Ok(r) => r,
         Err(err) => {

@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 
 use console::{Key, Term, style};
 use laine_core::workspace::DiscoveredRepo;
@@ -71,13 +71,19 @@ impl SelectorState {
     }
 }
 
-/// Prompts the user to select repositories from `discovered`.
-///
-/// - When attached to an interactive terminal (TTY), renders a live checkbox list
-///   supporting `↑/↓`, `j/k` (Vim), and `w/s` navigation (for compact 60% keyboards),
-///   `Space` to toggle, `a` to toggle all, `Enter` to confirm, and `Esc`/`q` to cancel.
-/// - When stdin/stdout is not a TTY (pipes, CI, AI agents), falls back to reading
-///   comma-separated numbers, repository names, or `all` from stdin.
+/// Comprueba la entrada y la salida que usa el selector antes de descubrir repositorios.
+pub fn ensure_selection_terminal() -> Result<(), &'static str> {
+    if !io::stdin().is_terminal() || !Term::stderr().is_term() {
+        return Err(
+            "Repository selection requires an interactive terminal. Pass --select <repo1,repo2> or --all.",
+        );
+    }
+    Ok(())
+}
+
+/// Muestra el selector de repositorios en stderr tras comprobar el terminal.
+/// Usa flechas, j/k o w/s para mover, espacio para marcar, a para marcar todo,
+/// Enter para confirmar y Esc o q para cancelar.
 pub fn select_repositories(
     discovered: &[DiscoveredRepo],
     preselected_names: &HashSet<String>,
@@ -87,18 +93,6 @@ pub fn select_repositories(
         return Ok(Vec::new());
     }
 
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        run_interactive_multiselect(discovered, preselected_names, title)
-    } else {
-        run_line_prompt_fallback(discovered, preselected_names, title)
-    }
-}
-
-fn run_interactive_multiselect(
-    discovered: &[DiscoveredRepo],
-    preselected_names: &HashSet<String>,
-    title: &str,
-) -> Result<Vec<DiscoveredRepo>, String> {
     let preselected: Vec<bool> = discovered
         .iter()
         .map(|r| preselected_names.contains(&r.name))
@@ -223,72 +217,6 @@ fn render_frame(
     }
 
     Ok(lines)
-}
-
-fn run_line_prompt_fallback(
-    discovered: &[DiscoveredRepo],
-    preselected_names: &HashSet<String>,
-    title: &str,
-) -> Result<Vec<DiscoveredRepo>, String> {
-    println!("{title} ({} found):", discovered.len());
-    for (idx, repo) in discovered.iter().enumerate() {
-        let mark = if preselected_names.contains(&repo.name) {
-            "x"
-        } else {
-            " "
-        };
-        println!(
-            "  [{}] ({}) {} ({})",
-            mark,
-            idx + 1,
-            repo.name,
-            repo.detected_kind
-        );
-    }
-    print!("Select repositories (comma-separated numbers/names, or 'all'): ");
-    let _ = io::stdout().flush();
-
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| format!("Failed to read selection: {e}"))?;
-    let trimmed = line.trim();
-    if trimmed.eq_ignore_ascii_case("all") {
-        return Ok(discovered.to_vec());
-    }
-
-    let mut selected = Vec::new();
-    for token in trimmed.split(',') {
-        let item = token.trim();
-        if item.is_empty() {
-            continue;
-        }
-        if let Ok(num) = item.parse::<usize>() {
-            if num == 0 || num > discovered.len() {
-                return Err(format!(
-                    "Selection index {num} is out of range (1..={})",
-                    discovered.len()
-                ));
-            }
-            let repo = &discovered[num - 1];
-            if !selected
-                .iter()
-                .any(|r: &DiscoveredRepo| r.name == repo.name)
-            {
-                selected.push(repo.clone());
-            }
-        } else if let Some(repo) = discovered.iter().find(|r| r.name == item) {
-            if !selected
-                .iter()
-                .any(|r: &DiscoveredRepo| r.name == repo.name)
-            {
-                selected.push(repo.clone());
-            }
-        } else {
-            return Err(format!("Unknown repository selection: '{item}'"));
-        }
-    }
-    Ok(selected)
 }
 
 #[cfg(test)]

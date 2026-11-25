@@ -79,6 +79,12 @@ laine analyze \
   --base main \
   --head feature/split-customer-name
 
+# Or validate local uncommitted changes before committing (--base defaults to HEAD, --head defaults to WORKTREE;
+# pass --head STAGED for pre-commit index validation)
+laine analyze \
+  --config laine.toml \
+  --repo customer-service
+
 # 4. Emit deterministic schema_version=1 JSON or PR-ready Markdown
 laine analyze \
   --config ./fixtures/demo-workspace/laine.toml \

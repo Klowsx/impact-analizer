@@ -59,11 +59,11 @@ enum Commands {
         /// Service repository where the change occurred
         #[arg(long)]
         repo: String,
-        /// Base Git revision (before change)
-        #[arg(long)]
+        /// Base Git revision before change (commit/branch/tag, or HEAD/STAGED/WORKTREE)
+        #[arg(long, default_value = "HEAD")]
         base: String,
-        /// Head Git revision (after change)
-        #[arg(long)]
+        /// Head Git revision after change (commit/branch/tag, STAGED, or WORKTREE for local uncommitted changes)
+        #[arg(long, default_value = "WORKTREE")]
         head: String,
         /// Output format
         #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]

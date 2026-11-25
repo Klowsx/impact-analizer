@@ -109,8 +109,9 @@ laine analyze \
 laine init --scan --workspace corporativo
 laine init --scan ./projects --select cerebro-web,portal-corporativo --workspace corporativo
 
-# Register an existing laine.toml under a named workspace
+# Register or interactively edit an existing workspace (pre-checks current repos; ↑/↓ or j/k or w/s + Space + Enter)
 laine workspace add corporativo ./laine.corporativo.toml
+laine workspace edit corporativo
 laine workspace list
 
 # Run zero-flag impact checks from inside any registered repository (defaults to HEAD -> WORKTREE)

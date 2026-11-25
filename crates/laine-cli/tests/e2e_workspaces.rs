@@ -279,3 +279,121 @@ fn init_scan_defaults_to_cwd_saves_in_laine_home_configs_and_autodetects_custom_
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn workspace_edit_and_repo_add_remove_update_registered_workspace() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-ws-edit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    fs::create_dir_all(&tmp).unwrap();
+
+    let laine_home = tmp.join("laine-home");
+    let projects = tmp.join("Projects");
+    fs::create_dir_all(&projects).unwrap();
+
+    let backend = projects.join("cerebro-web");
+    init_repo(&backend);
+    fs::write(backend.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    fs::create_dir_all(backend.join("routes")).unwrap();
+    fs::write(
+        backend.join("routes/api.php"),
+        "<?php\nRoute::post('corp/{accion}/{param?}', [Corp::class, 'accion']);\n",
+    )
+    .unwrap();
+    git(&backend, &["add", "."]);
+    git(&backend, &["commit", "-m", "init backend"]);
+
+    let v1 = projects.join("portal-v1");
+    init_repo(&v1);
+    fs::write(v1.join("package.json"), r#"{"name": "v1"}"#).unwrap();
+    git(&v1, &["add", "."]);
+    git(&v1, &["commit", "-m", "init v1"]);
+
+    let v2 = projects.join("portal-v2");
+    init_repo(&v2);
+    fs::write(v2.join("nuxt.config.ts"), "export default {}\n").unwrap();
+    fs::create_dir_all(v2.join("app/services")).unwrap();
+    fs::write(
+        v2.join("app/services/auth.ts"),
+        "export const login = () => getClient().fetch('/corp/loginCorp', { method: 'POST' });\n",
+    )
+    .unwrap();
+    git(&v2, &["add", "."]);
+    git(&v2, &["commit", "-m", "init v2"]);
+
+    let bin = env!("CARGO_BIN_EXE_laine");
+
+    // 1. Initialize workspace with backend + v1
+    let init = Command::new(bin)
+        .current_dir(&projects)
+        .env("LAINE_HOME", &laine_home)
+        .args([
+            "init",
+            "--scan",
+            "--select",
+            "cerebro-web,portal-v1",
+            "--workspace",
+            "corp",
+        ])
+        .output()
+        .expect("init should run");
+    assert!(init.status.success());
+
+    // 2. Edit workspace to swap portal-v1 -> portal-v2
+    let edit = Command::new(bin)
+        .env("LAINE_HOME", &laine_home)
+        .args([
+            "workspace",
+            "edit",
+            "corp",
+            "--select",
+            "cerebro-web,portal-v2",
+        ])
+        .output()
+        .expect("workspace edit should run");
+    assert!(
+        edit.status.success(),
+        "workspace edit failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&edit.stdout),
+        String::from_utf8_lossy(&edit.stderr)
+    );
+
+    // 3. Verify `laine check` now detects portal-v2 via auto-detected client
+    fs::write(backend.join("routes/api.php"), "<?php\n").unwrap();
+    let check = Command::new(bin)
+        .current_dir(&backend)
+        .env("LAINE_HOME", &laine_home)
+        .args(["check"])
+        .output()
+        .expect("check should run");
+    let check_stdout = String::from_utf8_lossy(&check.stdout);
+    assert_eq!(check.status.code(), Some(2), "got:\n{check_stdout}");
+    assert!(
+        check_stdout.contains("portal-v2/app/services/auth.ts:1"),
+        "expected portal-v2 hit after workspace edit, got:\n{check_stdout}"
+    );
+
+    // 4. Test `laine repo add` and `laine repo remove` with `--workspace corp`
+    let add_out = Command::new(bin)
+        .env("LAINE_HOME", &laine_home)
+        .args(["repo", "add", v1.to_str().unwrap(), "--workspace", "corp"])
+        .output()
+        .expect("repo add --workspace should run");
+    assert!(
+        add_out.status.success(),
+        "repo add --workspace failed: {}",
+        String::from_utf8_lossy(&add_out.stderr)
+    );
+
+    let rm_out = Command::new(bin)
+        .env("LAINE_HOME", &laine_home)
+        .args(["repo", "remove", "portal-v1", "--workspace", "corp"])
+        .output()
+        .expect("repo remove --workspace should run");
+    assert!(
+        rm_out.status.success(),
+        "repo remove --workspace failed: {}",
+        String::from_utf8_lossy(&rm_out.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}

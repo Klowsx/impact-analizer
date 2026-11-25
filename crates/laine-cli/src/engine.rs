@@ -19,8 +19,9 @@ use laine_py::{
     PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
 };
 use laine_ts::{
-    ExtractContext, TypeContractDef, extract_express_routes, extract_file_with_context,
-    extract_type_definitions, extract_zod_schemas, resolve_type_fields,
+    ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow,
+    extract_express_routes, extract_file_with_context, extract_type_definitions,
+    extract_zod_schemas, resolve_type_fields,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,8 @@ struct CachedFieldReadEdge {
     call_file: String,
     call_line: usize,
     confidence: Confidence,
+    #[serde(default)]
+    custom_trace: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -352,11 +355,19 @@ fn extract_consumer_repo(
     rev: &str,
     config: &WorkspaceConfig,
 ) -> Result<CachedConsumerRepo> {
-    let candidate_files: Vec<String> = git
-        .list_files(rev)?
-        .into_iter()
+    let all_tracked_files = git.list_files(rev)?;
+    let candidate_files: Vec<String> = all_tracked_files
+        .iter()
         .filter(|f| is_analyzable_ts_or_js(f) || is_analyzable_python(f))
+        .cloned()
         .collect();
+
+    let tsconfig_files: Vec<String> = all_tracked_files
+        .iter()
+        .filter(|f| is_tsconfig_file(f))
+        .cloned()
+        .collect();
+    let tsconfig_sources = git.read_files_batch(rev, &tsconfig_files)?;
 
     let file_contents: Vec<(String, String)> = git
         .read_files_batch(rev, &candidate_files)?
@@ -441,6 +452,7 @@ fn extract_consumer_repo(
                             call_file: file_path.clone(),
                             call_line: call.line,
                             confidence: Confidence::Confirmed,
+                            custom_trace: Vec::new(),
                         });
                     }
                 }
@@ -493,6 +505,7 @@ fn extract_consumer_repo(
                             call_file: file_path.clone(),
                             call_line: call.line,
                             confidence: Confidence::Likely,
+                            custom_trace: Vec::new(),
                         });
                     }
                 }
@@ -511,6 +524,7 @@ fn extract_consumer_repo(
                         call_file: file_path.clone(),
                         call_line: call.line,
                         confidence: Confidence::Confirmed,
+                        custom_trace: Vec::new(),
                     });
                 }
             }
@@ -536,6 +550,41 @@ fn extract_consumer_repo(
         consumes.extend(file_consumes);
         field_reads.extend(file_reads);
         unresolved_calls.extend(file_unresolved);
+    }
+
+    // Pass 3: Summary-based cross-file interprocedural dataflow across TS/JS/Vue modules
+    // (`services/` -> `hooks`/`composables`/`stores` -> `components/`, JSX props, `useQuery`, etc.).
+    let ts_files: Vec<(String, String)> = file_contents
+        .iter()
+        .filter(|(p, _)| is_analyzable_ts_or_js(p))
+        .cloned()
+        .collect();
+    if !ts_files.is_empty() {
+        let resolver = ModuleResolver::from_git_snapshot(&all_tracked_files, &tsconfig_sources);
+        let cross_reads = analyze_cross_file_dataflow(
+            &ts_files,
+            ExtractContext {
+                services: &config.services,
+                clients: &config.clients,
+                env: &config.env,
+            },
+            &|importer, specifier| resolver.resolve_import(importer, specifier),
+        );
+        for item in cross_reads {
+            field_reads.push(CachedFieldReadEdge {
+                file: item.read_file,
+                target_service: item.service,
+                method: item.method,
+                normalized_path: item.normalized_path,
+                field_path: item.field_path,
+                line: item.read_line,
+                snippet: item.read_snippet,
+                call_file: item.origin_file,
+                call_line: item.origin_line,
+                confidence: item.confidence,
+                custom_trace: item.trace,
+            });
+        }
     }
 
     consumes.sort_by(|a, b| {
@@ -620,7 +669,7 @@ fn apply_cached_consumer_repo(
     }
 
     for read in &snapshot.field_reads {
-        graph.link_reads_field_with_confidence(
+        graph.link_reads_field_with_trace(
             service_name,
             &read.file,
             consumer_rev,
@@ -633,6 +682,7 @@ fn apply_cached_consumer_repo(
             &read.call_file,
             read.call_line,
             read.confidence,
+            &read.custom_trace,
         );
     }
 
@@ -808,4 +858,14 @@ fn is_analyzable_python(path: &str) -> bool {
     }
 
     true
+}
+
+fn is_tsconfig_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("node_modules/") || lower.contains("/dist/") || lower.starts_with("dist/") {
+        return false;
+    }
+    let file_name = lower.rsplit('/').next().unwrap_or(&lower);
+    (file_name.starts_with("tsconfig") || file_name.starts_with("jsconfig"))
+        && file_name.ends_with(".json")
 }

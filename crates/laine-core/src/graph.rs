@@ -47,6 +47,7 @@ pub enum GraphEdge {
         call_file: String,
         call_line: usize,
         confidence: Confidence,
+        custom_trace: Vec<String>,
     },
 }
 
@@ -61,6 +62,7 @@ pub struct FieldConsumerHit {
     pub call_line: usize,
     pub matched_field: String,
     pub confidence: Confidence,
+    pub custom_trace: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +251,40 @@ impl DependencyGraph {
         call_line: usize,
         confidence: Confidence,
     ) {
+        self.link_reads_field_with_trace(
+            consumer_repo,
+            consumer_file,
+            revision,
+            target_service,
+            method,
+            consumer_path,
+            field_path,
+            line,
+            snippet,
+            call_file,
+            call_line,
+            confidence,
+            &[],
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_reads_field_with_trace(
+        &mut self,
+        consumer_repo: &str,
+        consumer_file: &str,
+        revision: &str,
+        target_service: &str,
+        method: HttpMethod,
+        consumer_path: &str,
+        field_path: &str,
+        line: usize,
+        snippet: &str,
+        call_file: &str,
+        call_line: usize,
+        confidence: Confidence,
+        custom_trace: &[String],
+    ) {
         let file_idx = self.add_file(consumer_repo, consumer_file);
 
         // Attach to the producer's canonical endpoint path if already registered.
@@ -273,6 +309,7 @@ impl DependencyGraph {
                 call_file: call_file.to_string(),
                 call_line,
                 confidence,
+                custom_trace: custom_trace.to_vec(),
             },
         );
     }
@@ -307,6 +344,7 @@ impl DependencyGraph {
                     call_file,
                     call_line,
                     confidence,
+                    custom_trace,
                 } = edge.weight()
                     && let GraphNode::File { repo, path } = &self.graph[edge.source()]
                 {
@@ -321,9 +359,14 @@ impl DependencyGraph {
                         call_line: *call_line,
                         matched_field: field_path.clone(),
                         confidence: *confidence,
+                        custom_trace: custom_trace.clone(),
                     };
                     match dedup.get(&key) {
-                        Some(existing) if existing.confidence >= candidate.confidence => {}
+                        Some(existing) if existing.confidence > candidate.confidence => {}
+                        Some(existing)
+                            if existing.confidence == candidate.confidence
+                                && (!existing.custom_trace.is_empty()
+                                    || candidate.custom_trace.is_empty()) => {}
                         _ => {
                             dedup.insert(key, candidate);
                         }

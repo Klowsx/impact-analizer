@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::config::{CustomClientConfig, WorkspaceConfig};
 use crate::error::{LaineError, Result};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
 
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;

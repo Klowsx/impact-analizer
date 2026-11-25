@@ -17,7 +17,7 @@ use laine_core::model::{
 use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
 use laine_core::policy::{evaluate_policy, filter_ignored_findings};
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
-use laine_core::workspace::normalize_absolute_path;
+use laine_core::workspace::{WorkspaceRegistry, normalize_absolute_path};
 use laine_py::{
     PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
 };
@@ -225,7 +225,7 @@ pub fn run_analysis_with_local_paths(
     run_analysis_with_consumer_revision(req, no_cache, include_repo_roots, ConsumerRevision::Head)
 }
 
-// Analiza los snapshots elegidos y conserva la ruta de cada versión del contrato.
+// Analiza los snapshots elegidos y reconstruye la extracción si el caché falla.
 pub fn run_analysis_with_consumer_revision(
     req: &AnalyzeRequest,
     no_cache: bool,
@@ -417,8 +417,9 @@ pub fn run_analysis_with_consumer_revision(
     let cache = if no_cache {
         None
     } else {
-        let cache_path = resolve_cache_path(config_dir, config.cache_path.as_deref());
-        Some(IndexCache::open(&cache_path)?)
+        resolve_cache_path(&req.config_path, config.cache_path.as_deref())
+            .and_then(|path| IndexCache::open(&path))
+            .ok()
     };
 
     let mut unresolved_calls = Vec::new();
@@ -441,14 +442,15 @@ pub fn run_analysis_with_consumer_revision(
             consumer_rev.clone()
         };
 
-        let cached_snapshot = if let Some(cache_db) = cache.as_ref() {
-            match cache_db.get_repo_snapshot(&service.name, &cache_key, &config_hash)? {
-                Some(raw_json) => serde_json::from_str::<CachedConsumerRepo>(&raw_json).ok(),
-                None => None,
-            }
-        } else {
-            None
-        };
+        let cached_snapshot = cache
+            .as_ref()
+            .and_then(|cache_db| {
+                cache_db
+                    .get_repo_snapshot(&service.name, &cache_key, &config_hash)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|raw| serde_json::from_str::<CachedConsumerRepo>(&raw).ok());
 
         let snapshot = match cached_snapshot {
             Some(hit) => hit,
@@ -458,15 +460,16 @@ pub fn run_analysis_with_consumer_revision(
                     None => load_consumer_inputs(&consumer_git, &consumer_rev)?,
                 };
                 let extracted = extract_consumer_repo(inputs, &config);
-                if let Some(cache_db) = cache.as_ref() {
-                    let payload = serde_json::to_string(&extracted)
-                        .map_err(|err| LaineError::Cache(err.to_string()))?;
-                    cache_db.put_repo_snapshot(
+                if let Some(cache_db) = cache.as_ref()
+                    && let Ok(payload) = serde_json::to_string(&extracted)
+                {
+                    // Los resultados se pueden usar aunque solo falle su persistencia.
+                    let _ = cache_db.put_repo_snapshot(
                         &service.name,
                         &cache_key,
                         &config_hash,
                         &payload,
-                    )?;
+                    );
                 }
                 extracted
             }
@@ -526,11 +529,7 @@ pub fn run_analysis_with_consumer_revision(
     let policy = evaluate_policy(&report, &config.policy);
     report.exit_code = Some(policy.exit_code);
     report.policy = Some(policy);
-    let id = stable_fingerprint(
-        normalize_absolute_path(&req.config_path)
-            .as_os_str()
-            .as_encoded_bytes(),
-    );
+    let id = workspace_identifier(&req.config_path);
     let repo_roots = if include_repo_roots {
         config
             .services
@@ -551,10 +550,11 @@ pub fn run_analysis_with_consumer_revision(
 
 /// Pre-computes and persists consumer AST extraction snapshots for every repository declared
 /// in `config_path`, populating the SQLite incremental cache for subsequent `laine analyze` runs.
+// Exige acceso al caché cuando se solicita explícitamente precalcularlo.
 pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
     let config = WorkspaceConfig::load_from_path(config_path)?;
     let config_dir = config_directory(config_path);
-    let cache_path = resolve_cache_path(config_dir, config.cache_path.as_deref());
+    let cache_path = resolve_cache_path(config_path, config.cache_path.as_deref())?;
     let cache = IndexCache::open(&cache_path)?;
     let config_hash = compute_config_hash(&config);
 
@@ -1102,12 +1102,24 @@ fn config_directory(config_path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn resolve_cache_path(config_dir: &Path, configured: Option<&Path>) -> PathBuf {
-    match configured {
+// Usa el estado del usuario para el caché por defecto y respeta el destino configurado.
+fn resolve_cache_path(config_path: &Path, configured: Option<&Path>) -> Result<PathBuf> {
+    Ok(match configured {
         Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(path) => config_dir.join(path),
-        None => config_dir.join(".laine-cache.db"),
-    }
+        Some(path) => config_directory(config_path).join(path),
+        None => WorkspaceRegistry::default_home_dir()?
+            .join("cache")
+            .join(format!("{}.sqlite3", workspace_identifier(config_path))),
+    })
+}
+
+// Da al TOML un identificador local que sirve para aislar reportes y cachés.
+fn workspace_identifier(config_path: &Path) -> String {
+    stable_fingerprint(
+        normalize_absolute_path(config_path)
+            .as_os_str()
+            .as_encoded_bytes(),
+    )
 }
 
 fn resolve_repo_path(config_dir: &Path, service_path: &Path) -> PathBuf {

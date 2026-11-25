@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+console.workspace = true
 laine-core = { path = "../laine-core" }
 laine-py = { path = "../laine-py" }
 laine-ts = { path = "../laine-ts" }

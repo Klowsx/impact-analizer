@@ -1,6 +1,8 @@
+mod selector;
+
+use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
@@ -15,9 +17,11 @@ use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::STAGED_REV;
 use laine_core::policy::evaluate_policy;
 use laine_core::workspace::{
-    DiscoveredRepo, WorkspaceRegistry, build_workspace_config, resolve_context_from_cwd,
+    DiscoveredRepo, WorkspaceRegistry, build_workspace_config, infer_workspace_scan_dir,
+    inspect_repo_path, merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
     scan_directory,
 };
+use selector::select_repositories;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -136,6 +140,20 @@ enum WorkspaceAction {
         /// Path to the workspace's laine.toml file
         config: PathBuf,
     },
+    /// Interactively add or remove repositories in an existing workspace
+    Edit {
+        /// Workspace name registered in ~/.laine/workspaces.toml
+        name: String,
+        /// Optional directory to scan for sibling repositories (auto-inferred if omitted)
+        #[arg(long)]
+        scan: Option<PathBuf>,
+        /// Comma-separated repository names to set as the workspace selection (non-interactive)
+        #[arg(long, value_delimiter = ',')]
+        select: Vec<String>,
+        /// Select all repositories found in the scan directory without prompting
+        #[arg(long)]
+        all: bool,
+    },
     /// Unregister a named workspace (does not delete its laine.toml file)
     Remove {
         /// Workspace name to remove
@@ -145,16 +163,19 @@ enum WorkspaceAction {
 
 #[derive(Debug, Subcommand)]
 enum RepoAction {
-    /// Register a local Git service repository in laine.toml
+    /// Register a local Git service repository in laine.toml or a named workspace
     Add {
         /// Path to the local Git repository
         path: PathBuf,
         /// Unique service name (defaults to the folder name)
         #[arg(long)]
         name: Option<String>,
-        /// Path to laine.toml
+        /// Path to laine.toml (ignored when `--workspace` is provided)
         #[arg(long, default_value = "laine.toml")]
         config: PathBuf,
+        /// Optional registered workspace name to update instead of `--config`
+        #[arg(long)]
+        workspace: Option<String>,
         /// Optional OpenAPI spec path relative to the service repository
         #[arg(long)]
         openapi: Option<PathBuf>,
@@ -164,6 +185,17 @@ enum RepoAction {
         /// Optional backend route framework when extracting routes from code
         #[arg(long, value_enum)]
         framework: Option<CliRouteFramework>,
+    },
+    /// Remove a service repository from laine.toml or a named workspace
+    Remove {
+        /// Service name to remove
+        name: String,
+        /// Path to laine.toml (ignored when `--workspace` is provided)
+        #[arg(long, default_value = "laine.toml")]
+        config: PathBuf,
+        /// Optional registered workspace name to update instead of `--config`
+        #[arg(long)]
+        workspace: Option<String>,
     },
 }
 
@@ -215,81 +247,7 @@ fn main() -> ExitCode {
             workspace,
         } => handle_init(path, force, scan, select, all, workspace),
         Commands::Workspace { action } => handle_workspace(action),
-        Commands::Repo {
-            action:
-                RepoAction::Add {
-                    path,
-                    name,
-                    config,
-                    openapi,
-                    base_urls,
-                    framework,
-                },
-        } => {
-            let service_name = name.unwrap_or_else(|| {
-                path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "service".to_string())
-            });
-
-            let mut cfg = if config.exists() {
-                match WorkspaceConfig::load_from_path(&config) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        eprintln!("Failed to load {}: {err}", config.display());
-                        return ExitCode::FAILURE;
-                    }
-                }
-            } else {
-                WorkspaceConfig {
-                    version: 1,
-                    services: Vec::new(),
-                    clients: Vec::new(),
-                    env: Default::default(),
-                    policy: PolicyConfig::default(),
-                    cache_path: None,
-                }
-            };
-
-            if cfg.find_service(&service_name).is_some() {
-                eprintln!(
-                    "Service '{}' already exists in {}",
-                    service_name,
-                    config.display()
-                );
-                return ExitCode::FAILURE;
-            }
-
-            let routes = framework.map(|fw| RouteSourceConfig {
-                framework: match fw {
-                    CliRouteFramework::Express => RouteFramework::Express,
-                    CliRouteFramework::Laravel => RouteFramework::Laravel,
-                    CliRouteFramework::FastApi => RouteFramework::FastApi,
-                    CliRouteFramework::Flask => RouteFramework::Flask,
-                },
-                files: Vec::new(),
-                prefix: None,
-            });
-
-            cfg.services.push(ServiceConfig {
-                name: service_name.clone(),
-                path,
-                openapi,
-                routes,
-                base_urls,
-            });
-
-            match cfg.save_to_path(&config) {
-                Ok(()) => {
-                    println!("Added service '{service_name}' to {}", config.display());
-                    ExitCode::SUCCESS
-                }
-                Err(err) => {
-                    eprintln!("Failed to save {}: {err}", config.display());
-                    ExitCode::FAILURE
-                }
-            }
-        }
+        Commands::Repo { action } => handle_repo(action),
         Commands::DemoSetup { path } => match create_demo_workspace(&path) {
             Ok(paths) => {
                 println!("Demo workspace created at: {}", paths.root.display());
@@ -451,7 +409,11 @@ fn handle_init(
                 }
             }
         } else {
-            match prompt_select_repos(&discovered) {
+            match select_repositories(
+                &discovered,
+                &HashSet::new(),
+                "Select repositories for this workspace",
+            ) {
                 Ok(repos) => repos,
                 Err(msg) => {
                     eprintln!("{msg}");
@@ -567,6 +529,12 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
                 }
             }
         }
+        WorkspaceAction::Edit {
+            name,
+            scan,
+            select,
+            all,
+        } => handle_workspace_edit(&name, scan, select, all, &registry_path),
         WorkspaceAction::Remove { name } => {
             let mut reg = match WorkspaceRegistry::load_from_path(&registry_path) {
                 Ok(r) => r,
@@ -586,6 +554,287 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
             println!("Removed workspace '{name}'.");
             ExitCode::SUCCESS
         }
+    }
+}
+
+fn handle_workspace_edit(
+    name: &str,
+    scan: Option<PathBuf>,
+    select: Vec<String>,
+    all: bool,
+    registry_path: &Path,
+) -> ExitCode {
+    let reg = match WorkspaceRegistry::load_from_path(registry_path) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("Failed to load workspace registry: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(cfg_path) = reg.workspaces.get(name) else {
+        eprintln!("Workspace '{name}' is not registered.");
+        return ExitCode::FAILURE;
+    };
+    let existing = match WorkspaceConfig::load_from_path(cfg_path) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("Failed to load {}: {err}", cfg_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let scan_dir = match scan.or_else(|| infer_workspace_scan_dir(&existing, cfg_path)) {
+        Some(dir) => dir,
+        None => {
+            eprintln!(
+                "Could not infer a scan directory for workspace '{name}'; pass `--scan <dir>`."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut discovered = match scan_directory(&scan_dir) {
+        Ok(repos) => repos,
+        Err(err) => {
+            eprintln!("Scan error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Keep any already-configured service that lives outside `scan_dir` in the candidate list.
+    let cfg_dir = cfg_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut preselected_names = HashSet::new();
+    for svc in &existing.services {
+        preselected_names.insert(svc.name.clone());
+        let svc_abs = normalize_absolute_path(&if svc.path.is_absolute() {
+            svc.path.clone()
+        } else {
+            cfg_dir.join(&svc.path)
+        });
+        if !discovered
+            .iter()
+            .any(|d| d.name == svc.name || d.path == svc_abs)
+        {
+            let mut extra = inspect_repo_path(&svc_abs);
+            extra.name = svc.name.clone();
+            discovered.push(extra);
+        }
+    }
+    discovered.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let selected = if all {
+        discovered
+    } else if !select.is_empty() {
+        match filter_selected_repos(&discovered, &select) {
+            Ok(repos) => repos,
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        match select_repositories(
+            &discovered,
+            &preselected_names,
+            &format!("Edit repositories in workspace '{name}'"),
+        ) {
+            Ok(repos) => repos,
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
+    if selected.is_empty() {
+        eprintln!("No repositories selected (workspace unchanged).");
+        return ExitCode::FAILURE;
+    }
+
+    let updated = merge_workspace_config(&existing, &selected, cfg_dir);
+    if let Err(err) = updated.save_to_path(cfg_path) {
+        eprintln!("Failed to save {}: {err}", cfg_path.display());
+        return ExitCode::FAILURE;
+    }
+
+    println!(
+        "Updated workspace '{name}' ({}) with {} repository(ies):",
+        cfg_path.display(),
+        updated.services.len()
+    );
+    for svc in &updated.services {
+        println!("  - {}", svc.name);
+    }
+    if !updated.clients.is_empty() {
+        println!("Configured HTTP client wrapper(s):");
+        for client in &updated.clients {
+            let prefix_note = client
+                .path_prefix
+                .as_deref()
+                .map(|p| format!(" (prefix: {p})"))
+                .unwrap_or_default();
+            println!(
+                "  - `{}` -> {}{prefix_note}",
+                client.callee, client.target_service
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn handle_repo(action: RepoAction) -> ExitCode {
+    match action {
+        RepoAction::Add {
+            path,
+            name,
+            config,
+            workspace,
+            openapi,
+            base_urls,
+            framework,
+        } => {
+            let target_cfg_path = match resolve_repo_command_config(config, workspace.as_deref()) {
+                Ok(p) => p,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let service_name = name.unwrap_or_else(|| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "service".to_string())
+            });
+
+            let mut cfg = if target_cfg_path.exists() {
+                match WorkspaceConfig::load_from_path(&target_cfg_path) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        eprintln!("Failed to load {}: {err}", target_cfg_path.display());
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                WorkspaceConfig {
+                    version: 1,
+                    services: Vec::new(),
+                    clients: Vec::new(),
+                    env: Default::default(),
+                    policy: PolicyConfig::default(),
+                    cache_path: None,
+                }
+            };
+
+            if cfg.find_service(&service_name).is_some() {
+                eprintln!(
+                    "Service '{}' already exists in {}",
+                    service_name,
+                    target_cfg_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+
+            let routes = framework.map(|fw| RouteSourceConfig {
+                framework: match fw {
+                    CliRouteFramework::Express => RouteFramework::Express,
+                    CliRouteFramework::Laravel => RouteFramework::Laravel,
+                    CliRouteFramework::FastApi => RouteFramework::FastApi,
+                    CliRouteFramework::Flask => RouteFramework::Flask,
+                },
+                files: Vec::new(),
+                prefix: None,
+            });
+
+            cfg.services.push(ServiceConfig {
+                name: service_name.clone(),
+                path,
+                openapi,
+                routes,
+                base_urls,
+            });
+
+            match cfg.save_to_path(&target_cfg_path) {
+                Ok(()) => {
+                    println!(
+                        "Added service '{service_name}' to {}",
+                        target_cfg_path.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Failed to save {}: {err}", target_cfg_path.display());
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        RepoAction::Remove {
+            name,
+            config,
+            workspace,
+        } => {
+            let target_cfg_path = match resolve_repo_command_config(config, workspace.as_deref()) {
+                Ok(p) => p,
+                Err(msg) => {
+                    eprintln!("{msg}");
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let mut cfg = match WorkspaceConfig::load_from_path(&target_cfg_path) {
+                Ok(c) => c,
+                Err(err) => {
+                    eprintln!("Failed to load {}: {err}", target_cfg_path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+
+            let before = cfg.services.len();
+            cfg.services.retain(|s| s.name != name);
+            if cfg.services.len() == before {
+                eprintln!(
+                    "Service '{name}' was not found in {}",
+                    target_cfg_path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+            cfg.clients.retain(|c| c.target_service != name);
+
+            match cfg.save_to_path(&target_cfg_path) {
+                Ok(()) => {
+                    println!(
+                        "Removed service '{name}' from {}",
+                        target_cfg_path.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => {
+                    eprintln!("Failed to save {}: {err}", target_cfg_path.display());
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn resolve_repo_command_config(
+    config: PathBuf,
+    workspace: Option<&str>,
+) -> Result<PathBuf, String> {
+    if let Some(ws_name) = workspace {
+        let registry_path = WorkspaceRegistry::default_path()
+            .map_err(|e| format!("Workspace registry error: {e}"))?;
+        let reg = WorkspaceRegistry::load_from_path(&registry_path)
+            .map_err(|e| format!("Failed to load workspace registry: {e}"))?;
+        reg.workspaces
+            .get(ws_name)
+            .cloned()
+            .ok_or_else(|| format!("Workspace '{ws_name}' is not registered."))
+    } else {
+        Ok(config)
     }
 }
 
@@ -622,57 +871,6 @@ fn filter_selected_repos(
                 "Repository '{name}' was not found in scan results (available: {})",
                 available.join(", ")
             ));
-        }
-    }
-    Ok(selected)
-}
-
-fn prompt_select_repos(discovered: &[DiscoveredRepo]) -> Result<Vec<DiscoveredRepo>, String> {
-    println!("Discovered {} Git repository(ies):", discovered.len());
-    for (idx, repo) in discovered.iter().enumerate() {
-        println!("  [{}] {} ({})", idx + 1, repo.name, repo.detected_kind);
-    }
-    print!("Select repositories to include (comma-separated numbers/names, or 'all'): ");
-    let _ = io::stdout().flush();
-
-    let mut line = String::new();
-    io::stdin()
-        .read_line(&mut line)
-        .map_err(|e| format!("Failed to read selection: {e}"))?;
-    let trimmed = line.trim();
-    if trimmed.eq_ignore_ascii_case("all") {
-        return Ok(discovered.to_vec());
-    }
-
-    let mut selected = Vec::new();
-    for token in trimmed.split(',') {
-        let item = token.trim();
-        if item.is_empty() {
-            continue;
-        }
-        if let Ok(num) = item.parse::<usize>() {
-            if num == 0 || num > discovered.len() {
-                return Err(format!(
-                    "Selection index {num} is out of range (1..={})",
-                    discovered.len()
-                ));
-            }
-            let repo = &discovered[num - 1];
-            if !selected
-                .iter()
-                .any(|r: &DiscoveredRepo| r.name == repo.name)
-            {
-                selected.push(repo.clone());
-            }
-        } else if let Some(repo) = discovered.iter().find(|r| r.name == item) {
-            if !selected
-                .iter()
-                .any(|r: &DiscoveredRepo| r.name == repo.name)
-            {
-                selected.push(repo.clone());
-            }
-        } else {
-            return Err(format!("Unknown repository selection: '{item}'"));
         }
     }
     Ok(selected)

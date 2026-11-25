@@ -241,6 +241,138 @@ pub fn build_workspace_config(
     }
 }
 
+/// Infers the common parent directory containing a workspace's repositories so
+/// `laine workspace edit <name>` can rescan sibling repos automatically.
+pub fn infer_workspace_scan_dir(config: &WorkspaceConfig, config_path: &Path) -> Option<PathBuf> {
+    let config_dir = config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let mut parents: Vec<PathBuf> = Vec::new();
+    for service in &config.services {
+        let raw = if service.path.is_absolute() {
+            service.path.clone()
+        } else {
+            config_dir.join(&service.path)
+        };
+        let abs = normalize_absolute_path(&raw);
+        if let Some(parent) = abs.parent() {
+            parents.push(parent.to_path_buf());
+        }
+    }
+
+    let first = parents.first()?.clone();
+    let mut common: Vec<_> = first.components().collect();
+    for parent in &parents[1..] {
+        let comps: Vec<_> = parent.components().collect();
+        let mut shared = 0usize;
+        while shared < common.len() && shared < comps.len() {
+            let same = if cfg!(windows) {
+                common[shared]
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&comps[shared].as_os_str().to_string_lossy())
+            } else {
+                common[shared] == comps[shared]
+            };
+            if same {
+                shared += 1;
+            } else {
+                break;
+            }
+        }
+        common.truncate(shared);
+    }
+
+    if common.is_empty() {
+        None
+    } else {
+        Some(common.into_iter().collect())
+    }
+}
+
+/// Inspects a single repository directory into a `DiscoveredRepo` descriptor.
+pub fn inspect_repo_path(path: &Path) -> DiscoveredRepo {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "service".to_string());
+    inspect_git_repo(&name, path)
+}
+
+/// Updates an existing `WorkspaceConfig` with a new repository selection while preserving
+/// existing policy, cache path, manual env/client entries, and per-service overrides.
+pub fn merge_workspace_config(
+    existing: &WorkspaceConfig,
+    selected: &[DiscoveredRepo],
+    config_dir: &Path,
+) -> WorkspaceConfig {
+    let mut merged = build_workspace_config(selected, config_dir, false);
+    merged.policy = existing.policy.clone();
+    merged.cache_path = existing.cache_path.clone();
+
+    // Preserve per-service overrides (`openapi`, `routes`, `base_urls`) for kept repositories.
+    for service in &mut merged.services {
+        let svc_abs = normalize_absolute_path(&service.path);
+        let prev = existing.services.iter().find(|old| {
+            let old_raw = if old.path.is_absolute() {
+                old.path.clone()
+            } else {
+                config_dir.join(&old.path)
+            };
+            old.name == service.name || path_equals_ci(&normalize_absolute_path(&old_raw), &svc_abs)
+        });
+
+        if let Some(old) = prev {
+            if old.openapi.is_some() {
+                service.openapi = old.openapi.clone();
+            }
+            if old.routes.is_some() {
+                service.routes = old.routes.clone();
+            }
+            if !old.base_urls.is_empty() {
+                service.base_urls = old.base_urls.clone();
+            }
+        }
+    }
+
+    // Preserve manual `[env]` overrides on top of newly auto-detected URLs.
+    for (k, v) in &existing.env {
+        merged.env.insert(k.clone(), v.clone());
+    }
+
+    // Preserve existing `[[clients]]` whose `target_service` is still selected,
+    // without duplicating clients already auto-detected by `build_workspace_config`.
+    let kept_service_names: BTreeSet<&str> =
+        merged.services.iter().map(|s| s.name.as_str()).collect();
+    let mut existing_client_keys: BTreeSet<(String, String)> = merged
+        .clients
+        .iter()
+        .map(|c| (c.callee.clone(), c.target_service.clone()))
+        .collect();
+
+    for old_client in &existing.clients {
+        if !kept_service_names.contains(old_client.target_service.as_str()) {
+            continue;
+        }
+        let key = (old_client.callee.clone(), old_client.target_service.clone());
+        if existing_client_keys.insert(key) {
+            merged.clients.push(old_client.clone());
+        }
+    }
+
+    merged
+        .clients
+        .sort_by(|a, b| (&a.callee, &a.target_service).cmp(&(&b.callee, &b.target_service)));
+
+    merged
+}
+
+fn path_equals_ci(a: &Path, b: &Path) -> bool {
+    path_starts_with_ci(a, b) && path_starts_with_ci(b, a)
+}
+
 fn detect_env_urls_in_repo(repo_root: &Path) -> BTreeMap<String, String> {
     let mut env_map = BTreeMap::new();
     for filename in [".env.example", ".env.development"] {
@@ -1208,6 +1340,112 @@ export function reset() {
         assert_eq!(cfg.clients[0].callee, "getClient().fetch");
         assert_eq!(cfg.clients[0].target_service, "cerebro-web");
         assert_eq!(cfg.clients[0].path_prefix.as_deref(), Some("/api"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn infers_common_parent_dir_and_merges_workspace_edits_preserving_customizations() {
+        let tmp = std::env::temp_dir().join(format!("laine-ws-merge-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let projects = tmp.join("Projects");
+        fs::create_dir_all(&projects).unwrap();
+
+        let backend = projects.join("cerebro-web");
+        init_git_repo(&backend);
+        fs::write(backend.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+        fs::create_dir_all(backend.join("routes")).unwrap();
+        fs::write(
+            backend.join("routes/api.php"),
+            "<?php\nRoute::post('corp/{accion}/{param?}', [Corp::class, 'accion']);\n",
+        )
+        .unwrap();
+
+        let old_fe = projects.join("portal-v1");
+        init_git_repo(&old_fe);
+
+        let new_fe = projects.join("portal-v2");
+        init_git_repo(&new_fe);
+        fs::write(new_fe.join("nuxt.config.ts"), "export default {}\n").unwrap();
+        fs::create_dir_all(new_fe.join("app/services")).unwrap();
+        fs::write(
+            new_fe.join("app/services/auth.ts"),
+            "export const login = () => getClient().fetch('/corp/loginCorp', { method: 'POST' });\n",
+        )
+        .unwrap();
+
+        let cfg_path = tmp.join("configs").join("corp.toml");
+        let existing = WorkspaceConfig {
+            version: 1,
+            services: vec![
+                ServiceConfig {
+                    name: "cerebro-web".into(),
+                    path: backend.clone(),
+                    openapi: Some("openapi.yaml".into()),
+                    routes: Some(RouteSourceConfig {
+                        framework: RouteFramework::Laravel,
+                        files: vec!["routes/api.php".into()],
+                        prefix: Some("/api".into()),
+                    }),
+                    base_urls: vec!["https://custom.internal".into()],
+                },
+                ServiceConfig {
+                    name: "portal-v1".into(),
+                    path: old_fe.clone(),
+                    openapi: None,
+                    routes: None,
+                    base_urls: Vec::new(),
+                },
+            ],
+            clients: vec![CustomClientConfig {
+                callee: "legacyClient".into(),
+                target_service: "portal-v1".into(),
+                path_prefix: None,
+            }],
+            env: BTreeMap::from([("MANUAL_URL".into(), "https://manual.local".into())]),
+            policy: PolicyConfig {
+                fail_on: Severity::Critical,
+                ignore_endpoints: vec!["/health".into()],
+                fail_on_unresolved: true,
+            },
+            cache_path: Some(".cache/custom.sqlite".into()),
+        };
+
+        let inferred =
+            infer_workspace_scan_dir(&existing, &cfg_path).expect("should infer parent dir");
+        assert_eq!(
+            normalize_absolute_path(&inferred),
+            normalize_absolute_path(&projects)
+        );
+
+        let discovered = scan_directory(&projects).unwrap();
+        let selected: Vec<DiscoveredRepo> = discovered
+            .into_iter()
+            .filter(|r| r.name == "cerebro-web" || r.name == "portal-v2")
+            .collect();
+
+        let merged = merge_workspace_config(&existing, &selected, tmp.join("configs").as_path());
+        assert_eq!(merged.policy.fail_on, Severity::Critical);
+        assert_eq!(merged.policy.ignore_endpoints, vec!["/health".to_string()]);
+        assert_eq!(merged.cache_path, Some(".cache/custom.sqlite".into()));
+        assert_eq!(
+            merged.env.get("MANUAL_URL").map(String::as_str),
+            Some("https://manual.local")
+        );
+
+        let kept_backend = merged.find_service("cerebro-web").unwrap();
+        assert_eq!(kept_backend.openapi, Some("openapi.yaml".into()));
+        assert_eq!(kept_backend.base_urls, vec!["https://custom.internal"]);
+        assert!(merged.find_service("portal-v1").is_none());
+        assert!(merged.find_service("portal-v2").is_some());
+
+        // Stale client pointing to removed portal-v1 should be pruned, while new portal-v2 client is auto-detected
+        assert!(!merged.clients.iter().any(|c| c.callee == "legacyClient"));
+        assert!(merged.clients.iter().any(|c| {
+            c.callee == "getClient().fetch"
+                && c.target_service == "cerebro-web"
+                && c.path_prefix.as_deref() == Some("/api")
+        }));
 
         let _ = fs::remove_dir_all(&tmp);
     }

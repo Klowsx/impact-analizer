@@ -97,17 +97,10 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                         } else {
                             "read"
                         };
-                        AffectedConsumer {
-                            repo: hit.repo.clone(),
-                            evidence: Evidence {
-                                repo: hit.repo.clone(),
-                                revision: hit.revision,
-                                file: hit.file.clone(),
-                                line: hit.line,
-                                snippet: hit.snippet,
-                            },
-                            confidence: hit.confidence,
-                            dependency_path: vec![
+                        let dependency_path = if !hit.custom_trace.is_empty() {
+                            hit.custom_trace
+                        } else {
+                            vec![
                                 format!(
                                     "{} {}",
                                     endpoint.method.as_str(),
@@ -121,7 +114,19 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                                     "{step_label} `{}` @ {}/{}:{}",
                                     hit.matched_field, hit.repo, hit.file, hit.line
                                 ),
-                            ],
+                            ]
+                        };
+                        AffectedConsumer {
+                            repo: hit.repo.clone(),
+                            evidence: Evidence {
+                                repo: hit.repo.clone(),
+                                revision: hit.revision,
+                                file: hit.file.clone(),
+                                line: hit.line,
+                                snippet: hit.snippet,
+                            },
+                            confidence: hit.confidence,
+                            dependency_path,
                         }
                     })
                     .collect::<Vec<_>>();

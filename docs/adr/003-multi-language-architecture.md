@@ -25,7 +25,7 @@ flowchart LR
     end
 
     subgraph Consumers["Consumer HTTP & Data-Flow Extractors"]
-        TSC["laine-ts::extractor + vue + types\nTS / JS / Vue SFC\nfetch, axios, [[clients]]"]
+        TSC["laine-ts::extractor + vue + types + zod + cross_file\nTS / JS / Vue SFC\nfetch, axios, [[clients]], cross-file dataflow"]
         PYC["laine-py::consumer\nPython .py\nrequests, httpx, [[clients]]"]
     end
 
@@ -53,9 +53,10 @@ flowchart LR
 
 Built on **`oxc`** (`oxc_parser`, `oxc_semantic`, `oxc_ast_visit`) for native-speed AST parsing with zero dependency on Node.js or `node_modules`:
 
-- **Vue Single File Components (`vue.rs`):** `extract_vue_scripts` extracts every `<script>` and `<script setup>` block (detecting `lang="ts"` / `lang="tsx"` vs JavaScript and skipping HTML comments), padding leading `\n` newlines so every extracted HTTP call and field read retains its exact 1-based `.vue` line number.
-- **Consumer Extraction (`extractor.rs` & `url.rs`):** Tracks `fetch`, `axios`, `axios.create({ baseURL })`, custom wrappers (`[[clients]]` such as `$fetch`, `getClient().fetch`, `apiClient`), and `[env]` substitutions (`process.env.*`, `import.meta.env.*`). Performs AST data-flow tracking for direct property reads, destructuring, local aliases, optional chaining, and 1-level local helper propagation (`Confidence::Confirmed`). Unresolvable dynamic URLs are recorded as `UNKNOWN`.
-- **Generic Type Contracts (`types.rs`):** A repo-wide first pass indexes TypeScript `interface` and `type` definitions so generic HTTP calls (e.g., `getClient().fetch<CustomerResponse>('/customers/:id')`) link fields into the graph with `Confidence::Likely`.
+- **Vue Single File Components (`vue.rs`):** `extract_vue_scripts` extracts every `<script>` and `<script setup>` block (detecting `lang="ts"` / `lang="tsx"` vs JavaScript and skipping HTML comments), padding leading `\n` newlines so every extracted HTTP call and field read retains its exact 1-based `.vue` line number. `extract_vue_template_expressions` also scans `<template>` blocks (`{{ ... }}`, `:attr` / `v-bind`, `v-if` / `v-else-if`, `v-show`, `v-for`) to capture field reads rendered directly in templates.
+- **Consumer Extraction (`extractor.rs` & `url.rs`):** Tracks `fetch`, `axios`, `axios.create({ baseURL })`, custom wrappers (`[[clients]]` such as `$fetch`, `getClient().fetch`, `apiClient`), Vue `ref()` / `shallowRef()` / `computed()` / `useFetch()`, and `[env]` substitutions (`process.env.*`, `import.meta.env.*`). Performs AST data-flow tracking for direct property reads, destructuring, local aliases, optional chaining, 1-level local helper propagation (`Confidence::Confirmed`), and enclosing function/method/arrow `: Promise<T>` return-type annotations (`Confidence::Likely`). Unresolvable dynamic URLs are recorded as `UNKNOWN`.
+- **Generic Type Contracts & Zod Runtime Schemas (`types.rs`, `zod.rs`):** Repo-wide passes index TypeScript `interface` / `type` definitions and Zod runtime schemas (`z.object`, `.extend`, `.merge`, `.pick`, `.omit`, `z.infer`, `.parse` / `.safeParse`), linking schema fields into the graph even when fields are validated at runtime or consumed via typed contracts (`Confidence::Likely`).
+- **In-Memory Module Resolution & Cross-File Interprocedural Dataflow (`module_resolver.rs`, `cross_file.rs`):** Reads `tsconfig*.json` / `jsconfig*.json` (pure-Rust JSONC parser supporting `baseUrl`, `paths`, `extends`, `${configDir}`, Nuxt `.nuxt/tsconfig.json`, and `@/`/`~/` aliases) directly from Git snapshots without touching `node_modules`. A 3-pass summary-based engine builds per-file `ModuleSummary` records, runs a bounded 6-hop cycle-safe fixed-point propagation across ESM imports, re-exports, barrels, CommonJS `require`/`module.exports`, service objects, classes, React Query / SWR / Nuxt hooks, and emits cross-file reads across consumer files, helper calls, JSX props (`<UserCard user={user} />`), and Vue `<template>` expressions with full multi-file evidence traces.
 - **Express Producer Routes (`express.rs`):** Extracts `app.<method>`, `router.<method>`, chained `router.route('/path').get(...).post(...)`, and `app.use('/prefix', subRouter)` mount prefixes.
 
 ### 2. Python FastAPI, Flask, `requests`, and `httpx` (`crates/laine-py`)

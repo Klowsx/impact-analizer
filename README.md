@@ -65,6 +65,8 @@ Prebuilt single-file binaries for Linux (`x86_64`), macOS (`aarch64`), and Windo
 
 ### Try the Reproducible 4-Repository Demo
 
+`demo-setup` requires a new destination directory. To generate another demo, choose a different path.
+
 ```bash
 # 1. Materialize 4 independent Git repos (customer, billing, notification, shipping)
 laine demo-setup ./fixtures/demo-workspace

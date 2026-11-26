@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,3 +37,52 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace
+
+  msrv:
+    name: Rust 1.98.0 quickstart
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Laine with the minimum Rust version
+        shell: bash
+        run: |
+          rustup toolchain install 1.98.0 --profile minimal
+          cargo +1.98.0 install --locked --path crates/laine-cli --root "$RUNNER_TEMP/laine-msrv"
+
+      - name: Run the demo from an empty directory
+        shell: bash
+        run: |
+          export PATH="$RUNNER_TEMP/laine-msrv/bin:$PATH"
+          cd "$(mktemp -d)"
+
+          laine demo-setup ./fixtures/demo-workspace
+          config=./fixtures/demo-workspace/laine.toml
+          laine index --config "$config"
+
+          laine analyze --config "$config" --repo customer-service \
+            --base main --head main --format json > compatible.json
+          jq -e '.target_repo == "customer-service" and (.findings | length == 0)' compatible.json
+
+          for format in terminal json markdown; do
+            status=0
+            laine analyze --config "$config" --repo customer-service \
+              --base main --head feature/split-customer-name --format "$format" > "impact.$format" || status=$?
+            if [[ "$status" -ne 2 ]]; then
+              echo "Expected exit code 2 for the breaking demo ($format), got $status." >&2
+              exit 1
+            fi
+          done
+          jq -e '.target_repo == "customer-service" and (.findings | length > 0)' impact.json
+          grep -Fq 'RESULT:' impact.terminal
+          grep -Fq '## Laine Impact Analysis' impact.markdown
+
+          status=0
+          laine analyze --config ./missing.toml --repo customer-service > error.log 2>&1 || status=$?
+          if [[ "$status" -ne 1 ]]; then
+            echo "Expected exit code 1 for a missing configuration, got $status." >&2
+            cat error.log >&2
+            exit 1
+          fi

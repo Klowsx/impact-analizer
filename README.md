@@ -54,14 +54,14 @@ flowchart LR
 ### Build or Install
 
 ```bash
-# Build from source (Rust 1.85+ / Edition 2024)
-cargo install --path crates/laine-cli
+# Build from source (Rust 1.98.0+ / Edition 2024)
+cargo install --locked --path crates/laine-cli
 
 # Or run directly in this workspace
 cargo run -p laine-cli -- --help
 ```
 
-Prebuilt single-file binaries for Linux (`x86_64`), macOS (`aarch64`), and Windows (`x86_64`) are published on [GitHub Releases](https://github.com/Klowsx/impact-analizer/releases).
+When a release is available, you can download a prebuilt single-file binary for Linux (`x86_64`), macOS (`aarch64`), or Windows (`x86_64`) from [GitHub Releases](https://github.com/Klowsx/impact-analizer/releases).
 
 ### Try the Reproducible 4-Repository Demo
 
@@ -182,7 +182,9 @@ path_prefix = "/api"
 
 ## GitHub Action (PR Comments & CI Gating)
 
-Laine ships an official composite GitHub Action (`action.yml`) that runs impact analysis on Pull Requests, posts or updates a single sticky comment (`<!-- laine-impact-report -->`), and fails the check with exit code `2` when breaking changes violate `[policy]`:
+Laine ships an official composite GitHub Action (`action.yml`) that runs impact analysis on Pull Requests, posts or updates a single sticky comment (`<!-- laine-impact-report -->`), and fails the check with exit code `2` when breaking changes violate `[policy]`.
+
+This example writes `laine.toml` beside both checkouts, so the service paths are relative to the workflow workspace. Set the consumer repository, the producer's OpenAPI path, and the base URL used by consumers for your project.
 
 ```yaml
 name: Cross-Repo Impact Check
@@ -211,8 +213,28 @@ jobs:
           repository: your-org/billing-service
           path: billing-service
 
+      - name: Write Laine workspace configuration
+        shell: bash
+        run: |
+          cat > laine.toml <<'TOML'
+          version = 1
+
+          [[services]]
+          name = "customer-service"
+          path = "./customer-service"
+          openapi = "openapi.yaml"
+          base_urls = ["http://customer-service"]
+
+          [[services]]
+          name = "billing-service"
+          path = "./billing-service"
+          TOML
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Run Laine impact analysis
-        uses: Klowsx/impact-analizer@v0.1.0
+        uses: Klowsx/impact-analizer@main
         with:
           config: laine.toml
           repo: customer-service
@@ -220,7 +242,7 @@ jobs:
           head: ${{ github.event.pull_request.head.sha }}
           format: markdown
           comment-pr: "true"
-          laine-version: v0.1.0
+          laine-version: source
 ```
 
 ---

@@ -89,15 +89,14 @@ fn request_compatibility<'a>(
         } => ("body", None, false, new_type),
         _ => unreachable!("only request changes have argument evidence"),
     };
-    let result = match section {
-        "body" => request.body.compare(field, required, expected, line),
-        "query" => request.query.compare(field, required, expected, line),
-        "header" => request.headers.compare(
-            field.map(str::to_ascii_lowercase).as_deref(),
-            required,
-            expected,
-            line,
-        ),
+    let result = match (section, field) {
+        ("body", field) => request.body.compare(field, required, expected, line),
+        ("query", Some(name)) => request.query.compare_query(name, required, expected, line),
+        ("header", Some(name)) => {
+            request
+                .headers
+                .compare(Some(&name.to_ascii_lowercase()), required, expected, line)
+        }
         _ => ArgumentCompatibility::Unknown(None),
     };
     (section, field.unwrap_or("<root>"), result)

@@ -183,7 +183,7 @@ path = "./checkout-web"
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// Check compatible, incompatible, and unverified arguments in TS, Python, and Vue.
+// Check request arguments in TS, Python, and Vue, including query array serialization.
 #[test]
 fn checks_request_arguments_before_attributing_impact() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-arguments-{}", std::process::id()));
@@ -208,6 +208,10 @@ paths:
               type: object
               properties:
                 tenant: {type: string}
+  /search:
+    get:
+      parameters:
+        - {in: query, name: tags, schema: {type: array, items: {type: string}}}
 "#;
     fs::write(api.join("openapi.yaml"), base).unwrap();
     git(&api, &["add", "."]);
@@ -216,6 +220,7 @@ paths:
         api.join("openapi.yaml"),
         base.replace("name: limit,", "name: limit, required: true,")
             .replace("name: X-Mode,", "name: X-Mode, required: true,")
+            .replace("name: tags,", "name: tags, required: true,")
             .replace(
                 "              properties:",
                 "              required: [tenant]\n              properties:",
@@ -225,7 +230,8 @@ paths:
 
     fs::write(
         consumer.join("client.ts"),
-        r#"fetch('http://api/orders?limit=2', {
+        r#"import axios from 'axios';
+fetch('http://api/orders?limit=2', {
   method: 'POST', headers: { 'x-mode': 'fast' },
   body: JSON.stringify({ tenant: 'example' }),
 });
@@ -233,6 +239,10 @@ fetch('http://api/orders', {
   method: 'POST', headers: { 'x-mode': 'slow' },
   body: JSON.stringify({ tenant: 42 }),
 });
+fetch('http://api/search?tags=a');
+fetch('http://api/search?tags=a&tags=b');
+axios.get('http://api/search', { params: { tags: ['a', 'b'] } });
+fetch('http://api/search');
 "#,
     )
     .unwrap();
@@ -243,6 +253,10 @@ http.post("http://api/orders",
           json={"tenant": "example"}, params={"limit": 2}, headers={"X-MODE": "fast"})
 http.post("http://api/orders",
           json={"tenant": current_tenant}, params={"limit": 7}, headers={"X-mode": "slow"})
+http.get("http://api/search?tags=a")
+http.get("http://api/search?tags=a&tags=b")
+http.get("http://api/search", params={"tags": ["a", "b"]})
+http.get("http://api/search")
 "#,
     )
     .unwrap();
@@ -302,7 +316,7 @@ path = "./consumer"
         head_rev: "WORKTREE".into(),
     })
     .unwrap();
-    assert_eq!(report.findings.len(), 3);
+    assert_eq!(report.findings.len(), 4);
     let tenant = report.findings.iter().find(|finding| matches!(
         &finding.change, ContractChange::RequestFieldAddedRequired { field_path, .. } if field_path == "tenant"
     )).unwrap();
@@ -318,7 +332,7 @@ path = "./consumer"
             .collect::<Vec<_>>(),
         [
             ("Orders.vue", 10, Confidence::Confirmed),
-            ("client.ts", 7, Confidence::Confirmed),
+            ("client.ts", 8, Confidence::Confirmed),
             ("transport.ts", 3, Confidence::Possible),
             ("worker.py", 5, Confidence::Possible)
         ]
@@ -347,5 +361,35 @@ path = "./consumer"
         &finding.change, ContractChange::RequiredParameterAdded { name, .. } if name == "X-Mode"
     )).unwrap();
     assert!(mode.consumers.is_empty());
+    let tags = report
+        .findings
+        .iter()
+        .find(|finding| {
+            matches!(
+                &finding.change, ContractChange::RequiredParameterAdded { name, param_type, .. }
+                    if name == "tags" && param_type == "array"
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        tags.consumers
+            .iter()
+            .map(|consumer| (
+                consumer.evidence.file.as_str(),
+                consumer.evidence.line,
+                consumer.confidence,
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("client.ts", 10, Confidence::Possible),
+            ("client.ts", 11, Confidence::Possible),
+            ("client.ts", 12, Confidence::Possible),
+            ("client.ts", 13, Confidence::Confirmed),
+            ("worker.py", 6, Confidence::Possible),
+            ("worker.py", 7, Confidence::Possible),
+            ("worker.py", 8, Confidence::Possible),
+            ("worker.py", 9, Confidence::Confirmed),
+        ]
+    );
     fs::remove_dir_all(&tmp).unwrap();
 }

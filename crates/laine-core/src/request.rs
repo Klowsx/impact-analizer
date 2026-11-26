@@ -15,17 +15,23 @@ pub enum ArgumentType {
 }
 
 impl ArgumentType {
-    // Match an observed type against one OpenAPI alternative.
-    fn matches(self, expected: &str) -> bool {
-        match self {
-            Self::Null => expected == "null",
-            Self::Boolean => expected == "boolean",
-            Self::Integer => matches!(expected, "integer" | "number"),
-            Self::Number => expected == "number",
-            Self::String => expected == "string",
-            Self::Object => expected == "object",
-            Self::Array => expected == "array",
-        }
+    // Recognize schema labels whose types can be checked from argument evidence.
+    fn from_schema_label(label: &str) -> Option<Self> {
+        Some(match label {
+            "null" => Self::Null,
+            "boolean" => Self::Boolean,
+            "integer" => Self::Integer,
+            "number" => Self::Number,
+            "string" => Self::String,
+            "object" => Self::Object,
+            "array" => Self::Array,
+            _ => return None,
+        })
+    }
+
+    // Accept an integer where the contract allows any number.
+    fn matches(self, expected: Self) -> bool {
+        self == expected || (self == Self::Integer && expected == Self::Number)
     }
 }
 
@@ -107,13 +113,17 @@ impl RequestSection {
             if argument.types.is_empty() {
                 return ArgumentCompatibility::Unknown(Some(argument.line));
             }
-            if expected == "unknown"
-                || argument
+            let mut alternatives = expected.split(" | ").map(ArgumentType::from_schema_label);
+            if alternatives.clone().flatten().any(|expected| {
+                argument
                     .types
                     .iter()
-                    .any(|kind| expected.split(" | ").any(|ty| kind.matches(ty)))
-            {
+                    .any(|observed| observed.matches(expected))
+            }) {
                 return ArgumentCompatibility::Compatible;
+            }
+            if alternatives.any(|expected| expected.is_none()) {
+                return ArgumentCompatibility::Unknown(Some(argument.line));
             }
             return ArgumentCompatibility::Incompatible(argument.line);
         }
@@ -127,6 +137,24 @@ impl RequestSection {
         } else {
             ArgumentCompatibility::Compatible
         }
+    }
+
+    // A present wire value may encode an array even when the evidence only shows a scalar.
+    pub(crate) fn compare_query(
+        &self,
+        name: &str,
+        required: bool,
+        expected: &str,
+        call_line: usize,
+    ) -> ArgumentCompatibility {
+        let result = self.compare(Some(name), required, expected, call_line);
+        if let ArgumentCompatibility::Incompatible(line) = result
+            && self.fields.contains_key(name)
+            && expected.split(" | ").any(|label| label == "array")
+        {
+            return ArgumentCompatibility::Unknown(Some(line));
+        }
+        result
     }
 
     // Keep descendants of dynamic objects and array items unverified.
@@ -254,6 +282,44 @@ mod tests {
         assert_eq!(
             RequestSection::default().compare(Some("absent"), true, "string", 3),
             Unknown(None)
+        );
+    }
+
+    // Keep unsupported schema alternatives unverified while retaining known matches.
+    #[test]
+    fn does_not_reject_objects_when_the_expected_type_is_unresolved() {
+        let mut body = RequestSection::absent();
+        body.root = Some(Argument::new(4, Some(ArgumentType::Object)));
+        for label in [
+            "unknown",
+            "#/components/schemas/Payload",
+            "enum",
+            "string | enum",
+        ] {
+            assert_eq!(body.compare(None, true, label, 3), Unknown(Some(4)));
+        }
+        assert_eq!(body.compare(None, true, "enum | object", 3), Compatible);
+        assert_eq!(body.compare(None, true, "string", 3), Incompatible(4));
+    }
+
+    // Distinguish ambiguous query array serialization from a missing or invalid scalar.
+    #[test]
+    fn keeps_serialized_query_arrays_unverified() {
+        let mut query = RequestSection::absent();
+        query.add_url_query("/search?tags=a", 4);
+        for label in ["array", "array | null", "array<string>"] {
+            assert_eq!(
+                query.compare_query("tags", true, label, 4),
+                Unknown(Some(4))
+            );
+        }
+        assert_eq!(
+            query.compare_query("missing", true, "array", 4),
+            Incompatible(4)
+        );
+        assert_eq!(
+            query.compare_query("tags", true, "integer", 4),
+            Incompatible(4)
         );
     }
 

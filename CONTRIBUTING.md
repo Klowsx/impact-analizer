@@ -2,6 +2,10 @@
 
 Thank you for your interest in contributing to **Laine**. This project follows a lightweight, disciplined Git workflow designed to keep `main` always green and the commit history clean.
 
+## Language
+
+- Write all **branch names**, **commit messages**, **pull request titles and descriptions**, **code comments**, and **documentation** in **English**.
+
 ## Branching Strategy (Trunk-Based)
 
 - `main` is always buildable, tested, and ready to release.
@@ -37,9 +41,10 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) in imperative m
 - `chore` — maintenance, tooling, dependency updates
 
 ### Scopes
-- `core` — `laine-core` (domain model, config, graph, impact engine)
+- `core` — `laine-core` (domain model, config, git snapshots, graph, impact engine)
 - `openapi` — OpenAPI parsing and contract diffing
 - `ts` — `laine-ts` (`oxc` parser, HTTP extraction, data-flow)
+- `py` — `laine-py` (Python FastAPI/Flask and `requests`/`httpx` analyzers)
 - `cli` — `laine-cli` (commands, flags, output formatting)
 - `fixtures` — reproducible demo/test repositories
 - `ci` / `docs` / `deps`
@@ -47,7 +52,8 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) in imperative m
 ## Pull Requests
 
 - **One PR = one focused responsibility.**
-- **PR title** must follow Conventional Commits (because **Squash and Merge** uses the PR title as the commit message on `main`).
+- **PR title** must be in English and follow Conventional Commits (because **Squash and Merge** uses the PR title as the commit message on `main`).
+- **PR description** must be in English and follow `.github/pull_request_template.md` (`Summary`, `Type of Change`, `Verification`, and `Checklist`).
 - Include tests for every new feature or bug fix (including negative and `UNKNOWN`/unresolvable cases where relevant).
 - Keep `Cargo.lock` committed: Laine is a CLI application workspace and relies on reproducible builds.
 

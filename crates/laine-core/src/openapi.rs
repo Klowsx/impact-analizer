@@ -215,8 +215,9 @@ pub fn canonical_route_key(normalized_path: &str) -> String {
     }
 }
 
-/// Extrae operaciones, campos, parámetros y sus ubicaciones de un contrato YAML o JSON.
+/// Extrae operaciones y ubicaciones de YAML o JSON, con BOM UTF-8 opcional.
 pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
+    let raw_spec = raw_spec.strip_prefix('\u{feff}').unwrap_or(raw_spec);
     let root: Value = serde_yaml_ng::from_str(raw_spec)
         .map_err(|err| LaineError::OpenApiParse(err.to_string()))?;
 
@@ -648,6 +649,15 @@ mod tests {
     use super::*;
     use crate::fixtures::create_demo_workspace;
     use crate::git::GitRepo;
+
+    // Verifica que el BOM no altere el contrato ni sus líneas.
+    #[test]
+    fn accepts_utf8_bom_for_openapi() {
+        let yaml = "openapi: 3.1.0\npaths:\n  /health:\n    get: {}\n";
+        let parsed = extract_contract("api", yaml).unwrap();
+        let marked = extract_contract("api", &format!("\u{feff}{yaml}")).unwrap();
+        assert_eq!(parsed, marked);
+    }
 
     #[test]
     fn normalizes_paths_and_canonical_keys() {

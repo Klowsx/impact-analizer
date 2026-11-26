@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{LaineError, Result};
@@ -37,7 +37,7 @@ impl GitRepo {
     // Resuelve la raíz de un checkout Git desde cualquier directorio de su árbol.
     pub fn discover(path: &Path) -> Result<Self> {
         let git = Self::new(path);
-        let root = git.run_git(&["rev-parse", "--show-toplevel"])?;
+        let root = git.run_git_utf8(&["rev-parse", "--show-toplevel"])?;
         Ok(Self::new(root.strip_suffix('\n').unwrap_or(&root)))
     }
 
@@ -53,36 +53,66 @@ impl GitRepo {
     /// or validates and normalizes the `WORKTREE` / `STAGED` pseudo-revisions.
     pub fn resolve_revision(&self, rev: &str) -> Result<String> {
         if is_worktree_rev(rev) {
-            self.run_git(&["rev-parse", "--git-dir"])?;
+            self.run_git_utf8(&["rev-parse", "--git-dir"])?;
             return Ok(WORKTREE_REV.to_string());
         }
         if is_staged_rev(rev) {
-            self.run_git(&["rev-parse", "--git-dir"])?;
+            self.run_git_utf8(&["rev-parse", "--git-dir"])?;
             return Ok(STAGED_REV.to_string());
         }
         let target = format!("{rev}^{{commit}}");
-        let sha = self.run_git(&["rev-parse", "--verify", &target])?;
+        let sha = self.run_git_utf8(&["rev-parse", "--verify", &target])?;
         Ok(sha.trim().to_string())
     }
 
-    /// Reads the UTF-8 contents of a single file at a given commit, staged index,
-    /// or local working tree without checking anything out.
+    /// Lee un archivo UTF-8 regular del commit, índice o árbol local, sin seguir enlaces.
     pub fn read_file(&self, rev: &str, relative_path: &Path) -> Result<String> {
-        if is_worktree_rev(rev) {
-            let full_path = self.root.join(relative_path);
-            let bytes = fs::read(&full_path).map_err(|source| LaineError::Io {
-                path: full_path,
-                source,
-            })?;
-            return Ok(String::from_utf8_lossy(&bytes).into_owned());
-        }
         let posix_path = to_git_posix_path(relative_path);
+        if is_worktree_rev(rev) {
+            let links = self.git_link_paths(STAGED_REV, Some(&posix_path))?;
+            return read_worktree_file(&self.canonical_worktree_root()?, &posix_path, &links);
+        }
+        if self
+            .git_link_paths(rev, Some(&posix_path))?
+            .contains(&posix_path)
+        {
+            return Err(link_not_supported(relative_path));
+        }
         let spec = if is_staged_rev(rev) {
             format!(":{posix_path}")
         } else {
             format!("{rev}:{posix_path}")
         };
-        self.run_git(&["show", &spec])
+        let bytes = self.run_git_bytes(&["cat-file", "blob", &spec])?;
+        decode_source(bytes, relative_path)
+    }
+
+    // Usa la raíz física como límite para las lecturas en disco.
+    fn canonical_worktree_root(&self) -> Result<PathBuf> {
+        self.root.canonicalize().map_err(|source| LaineError::Io {
+            path: self.root.clone(),
+            source,
+        })
+    }
+
+    // Obtiene las rutas registradas en Git con modo de enlace simbólico.
+    fn git_link_paths(&self, rev: &str, path: Option<&str>) -> Result<BTreeSet<String>> {
+        let mut args = if is_staged_rev(rev) {
+            vec!["--literal-pathspecs", "ls-files", "-z", "--stage"]
+        } else {
+            vec!["--literal-pathspecs", "ls-tree", "-rz", rev]
+        };
+        if let Some(path) = path {
+            args.extend(["--", path]);
+        }
+        let output = self.run_git_utf8(&args)?;
+        Ok(output
+            .split_terminator('\0')
+            .filter_map(|entry| {
+                let (object, file) = entry.split_once('\t')?;
+                object.starts_with("120000 ").then(|| file.to_owned())
+            })
+            .collect())
     }
 
     /// Lee archivos de un commit, del índice o del árbol local, conservando sus rutas.
@@ -100,20 +130,21 @@ impl GitRepo {
 
         if is_worktree_rev(rev) {
             let mut results = BTreeMap::new();
+            let links = self.git_link_paths(STAGED_REV, None)?;
+            let root = self.canonical_worktree_root()?;
             for path in relative_paths {
-                let full_path = self.root.join(path);
-                if full_path.is_file()
-                    && let Ok(bytes) = fs::read(&full_path)
-                {
-                    results.insert(path.clone(), String::from_utf8_lossy(&bytes).into_owned());
+                if let Ok(raw) = read_worktree_file(&root, path, &links) {
+                    results.insert(path.clone(), raw);
                 }
             }
             return Ok(results);
         }
 
         // El protocolo batch usa líneas. Las rutas con saltos se pasan como argumentos separados.
+        let links = self.git_link_paths(rev, None)?;
         let (line_paths, unusual_paths): (Vec<_>, Vec<_>) = relative_paths
             .iter()
+            .filter(|path| links.is_empty() || !links.contains(&to_git_posix_path(Path::new(path))))
             .partition(|path| !path.contains(['\r', '\n']));
         let mut results = BTreeMap::new();
         for path in unusual_paths {
@@ -210,8 +241,10 @@ impl GitRepo {
                 let mut trailing = [0u8; 1];
                 let _ = reader.read_exact(&mut trailing);
 
-                if obj_type == Some("blob") {
-                    results.insert(path.clone(), String::from_utf8_lossy(&buf).into_owned());
+                if obj_type == Some("blob")
+                    && let Ok(source) = decode_source(buf, Path::new(path))
+                {
+                    results.insert(path.clone(), source);
                 }
             }
 
@@ -238,7 +271,7 @@ impl GitRepo {
     /// Enumera archivos de un commit, índice o árbol local con rutas delimitadas por NUL.
     pub fn list_files(&self, rev: &str) -> Result<Vec<String>> {
         let output = if is_worktree_rev(rev) {
-            self.run_git(&[
+            self.run_git_utf8(&[
                 "ls-files",
                 "-z",
                 "--cached",
@@ -246,15 +279,24 @@ impl GitRepo {
                 "--exclude-standard",
             ])?
         } else if is_staged_rev(rev) {
-            self.run_git(&["ls-files", "-z", "--cached"])?
+            self.run_git_utf8(&["ls-files", "-z", "--cached"])?
         } else {
-            self.run_git(&["ls-tree", "-rz", "--name-only", rev])?
+            self.run_git_utf8(&["ls-tree", "-rz", "--name-only", rev])?
         };
         let worktree = is_worktree_rev(rev);
         let mut files: Vec<String> = output
             .split_terminator('\0')
             .filter(|line| !line.is_empty())
-            .filter(|line| !worktree || self.root.join(line).is_file())
+            .filter(|line| {
+                !worktree
+                    || match fs::symlink_metadata(self.root.join(line)) {
+                        Ok(metadata) => metadata.is_file() || is_link(&metadata),
+                        Err(error) => !matches!(
+                            error.kind(),
+                            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                        ),
+                    }
+            })
             .map(ToOwned::to_owned)
             .collect();
         files.sort();
@@ -285,7 +327,7 @@ impl GitRepo {
             false
         };
         args.push("--");
-        let raw = self.run_git(&args)?;
+        let raw = self.run_git_utf8(&args)?;
         let mut entries = raw.split_terminator('\0');
         let mut renamed = Vec::new();
         while let (Some(status), Some(path)) = (entries.next(), entries.next()) {
@@ -306,7 +348,13 @@ impl GitRepo {
         Ok(renamed)
     }
 
-    fn run_git(&self, args: &[&str]) -> Result<String> {
+    // Lee salidas de control de Git que deben contener texto UTF-8 válido.
+    fn run_git_utf8(&self, args: &[&str]) -> Result<String> {
+        decode_source(self.run_git_bytes(args)?, &self.root)
+    }
+
+    // Ejecuta Git sin alterar los bytes de la salida original.
+    fn run_git_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
         let output = Command::new("git")
             .current_dir(&self.root)
             .args(args)
@@ -323,8 +371,82 @@ impl GitRepo {
             });
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(output.stdout)
     }
+}
+
+// Rechaza enlaces y rutas externas antes de abrir el archivo local como UTF-8.
+fn read_worktree_file(
+    root: &Path,
+    relative_path: &str,
+    indexed_links: &BTreeSet<String>,
+) -> Result<String> {
+    let normalized = to_git_posix_path(Path::new(relative_path));
+    let relative = Path::new(&normalized);
+    if indexed_links.contains(&normalized) {
+        return Err(link_not_supported(relative));
+    }
+    let io_error = |source| LaineError::Io {
+        path: relative.to_path_buf(),
+        source,
+    };
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(io_error(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected a path inside the git checkout",
+            )));
+        };
+        path.push(component);
+        if is_link(&fs::symlink_metadata(&path).map_err(io_error)?) {
+            return Err(link_not_supported(relative));
+        }
+    }
+    let path = path.canonicalize().map_err(io_error)?;
+    if !path.starts_with(root) {
+        return Err(link_not_supported(relative));
+    }
+    if !fs::metadata(&path).map_err(io_error)?.is_file() {
+        return Err(io_error(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        )));
+    }
+    decode_source(fs::read(path).map_err(io_error)?, relative)
+}
+
+// Detecta enlaces y puntos de reanálisis de Windows como junctions.
+fn is_link(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.file_type().is_symlink()
+    }
+}
+
+// Nombra la ruta descartada para que el reporte señale evidencia incompleta.
+fn link_not_supported(path: &Path) -> LaineError {
+    LaineError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "symbolic links are not read from snapshots",
+        ),
+    }
+}
+
+// Devuelve un error localizado en vez de sustituir bytes inválidos.
+fn decode_source(bytes: Vec<u8>, path: &Path) -> Result<String> {
+    String::from_utf8(bytes).map_err(|error| LaineError::Io {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidData, error.utf8_error()),
+    })
 }
 
 // Convierte separadores de Windows y conserva una barra invertida literal en Unix.
@@ -343,6 +465,63 @@ mod tests {
 
     use super::*;
     use crate::fixtures::create_demo_workspace;
+
+    // Verifica que commits, índice y disco rechacen bytes y entradas de enlace no analizables.
+    #[test]
+    fn rejects_non_utf8_and_indexed_links_in_every_snapshot() {
+        let tmp = std::env::temp_dir().join(format!("laine-git-unreadable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let paths = create_demo_workspace(&tmp).unwrap();
+        let repo = GitRepo::new(&paths.customer_service);
+        fs::write(repo.root().join("binary.ts"), [0x66, 0x80]).unwrap();
+        fs::write(repo.root().join("link.ts"), "../../outside.ts").unwrap();
+        let oid = repo
+            .run_git_utf8(&["hash-object", "-w", "link.ts"])
+            .unwrap();
+        let link = format!("120000,{},link.ts", oid.trim_end());
+        repo.run_git_utf8(&["add", "binary.ts"]).unwrap();
+        repo.run_git_utf8(&["update-index", "--add", "--cacheinfo", &link])
+            .unwrap();
+        repo.run_git_utf8(&["commit", "-m", "test: add invalid source entries"])
+            .unwrap();
+        let rev = repo.resolve_revision("HEAD").unwrap();
+        let paths = vec![
+            "openapi.yaml".to_owned(),
+            "binary.ts".to_owned(),
+            "./link.ts".to_owned(),
+        ];
+
+        for snapshot in [rev.as_str(), STAGED_REV, WORKTREE_REV] {
+            assert!(
+                matches!(repo.read_file(snapshot, Path::new("binary.ts")), Err(LaineError::Io { source, .. }) if source.kind() == io::ErrorKind::InvalidData)
+            );
+            assert!(
+                matches!(repo.read_file(snapshot, Path::new("link.ts")), Err(LaineError::Io { source, .. }) if source.kind() == io::ErrorKind::PermissionDenied)
+            );
+            let batch = repo.read_files_batch(snapshot, &paths).unwrap();
+            assert_eq!(
+                batch.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["openapi.yaml"]
+            );
+        }
+        fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    // Comprueba que un enlace a un directorio externo no sirva para abrir un archivo.
+    #[cfg(unix)]
+    #[test]
+    fn confines_worktree_reads_below_the_checkout() {
+        let tmp = std::env::temp_dir().join(format!("laine-git-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let paths = create_demo_workspace(&tmp).unwrap();
+        fs::write(tmp.join("external.ts"), "external content").unwrap();
+        std::os::unix::fs::symlink(&tmp, paths.customer_service.join("outside")).unwrap();
+        let repo = GitRepo::new(&paths.customer_service);
+        for path in ["outside/external.ts", "../external.ts"] {
+            assert!(repo.read_file(WORKTREE_REV, Path::new(path)).is_err());
+        }
+        fs::remove_dir_all(&tmp).unwrap();
+    }
 
     #[test]
     fn reads_base_and_head_snapshots_without_touching_working_tree() {

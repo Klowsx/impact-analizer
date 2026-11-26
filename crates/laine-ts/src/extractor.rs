@@ -2594,11 +2594,13 @@ export async function loadAxiosDestructured(id: string) {
         let services = customer_services();
         let clients = vec![
             CustomClientConfig {
+                consumer_service: None,
                 callee: "getClient().fetch".into(),
                 target_service: "customer-service".into(),
                 path_prefix: Some("/api".into()),
             },
             CustomClientConfig {
+                consumer_service: None,
                 callee: "apiClient".into(),
                 target_service: "customer-service".into(),
                 path_prefix: None,
@@ -2757,6 +2759,7 @@ export const service = {
     fn captures_function_method_and_arrow_return_types_while_skipping_primitives() {
         let services = customer_services();
         let clients = vec![CustomClientConfig {
+            consumer_service: None,
             callee: "getClient().fetch".into(),
             target_service: "customer-service".into(),
             path_prefix: Some("/api".into()),
@@ -2910,6 +2913,7 @@ export async function explicitGenericWins(id: string): Promise<UserViewModel> {
     fn tracks_nested_ref_assignment_shallow_ref_use_fetch_and_plain_let_assignment() {
         let services = customer_services();
         let clients = vec![CustomClientConfig {
+            consumer_service: None,
             callee: "getClient().fetch".into(),
             target_service: "customer-service".into(),
             path_prefix: None,

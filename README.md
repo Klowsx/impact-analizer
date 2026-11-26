@@ -190,9 +190,21 @@ path = "./python-worker"
 
 [[clients]]
 callee = "getClient().fetch"
+consumer_service = "web-portal"
 target_service = "customer-service"
 path_prefix = "/api"
 ```
+
+`consumer_service` names the calling repository in `[[services]]`. The same callee can target
+different services in different repositories. Entries without `consumer_service` remain
+workspace-wide defaults. A consumer's own entry takes precedence for that callee. Rescans
+preserve existing mappings. Remove a global entry to let Laine infer new mappings for its callee.
+
+`laine init --scan` and `laine workspace edit` infer mappings per consumer using OpenAPI and
+supported framework routes. When producers tie, Laine prints the candidate names. Add a
+`[[clients]]` entry for the consumer to resolve the tie. Workspace edits keep configured
+service names and overrides for repositories at the same path. When renaming a service in
+the TOML, update any `consumer_service` and `target_service` references to it.
 
 ---
 

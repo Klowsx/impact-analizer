@@ -7,12 +7,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
-    WorkspaceConfig, matching_http_url, write_config_atomically,
+    WorkspaceConfig, matching_http_url, normalize_relative_path, write_config_atomically,
 };
 use crate::error::{LaineError, Result};
 use crate::git::GitRepo;
 use crate::graph::routes_match;
-use crate::laravel::extract_laravel_routes;
 use crate::model::Severity;
 use crate::openapi::{canonical_route_key, extract_contract};
 
@@ -164,6 +163,7 @@ pub fn validate_workspace_name(name: &str) -> Result<()> {
 
 /// Scans immediate subdirectories of `root` for local Git repositories and detects
 /// their backend route framework, OpenAPI specs, and consumer stack without executing code.
+/// Directory aliases that resolve to the same repository are offered once.
 pub fn scan_directory(root: &Path) -> Result<Vec<DiscoveredRepo>> {
     if !root.exists() {
         return Err(LaineError::ConfigInvalid(format!(
@@ -202,10 +202,21 @@ pub fn scan_directory(root: &Path) -> Result<Vec<DiscoveredRepo>> {
     }
 
     repos.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut seen_paths = Vec::new();
+    repos.retain(|repo| {
+        if seen_paths
+            .iter()
+            .any(|path: &PathBuf| same_repository_path(path, &repo.path))
+        {
+            return false;
+        }
+        seen_paths.push(repo.path.clone());
+        true
+    });
     Ok(repos)
 }
 
-/// Builds a `WorkspaceConfig` from a user-selected subset of discovered repositories.
+/// Builds the service and environment configuration from the selected repositories.
 pub fn build_workspace_config(
     repos: &[DiscoveredRepo],
     config_dir: &Path,
@@ -255,12 +266,10 @@ pub fn build_workspace_config(
         }
     }
 
-    let clients = detect_custom_clients(repos);
-
     WorkspaceConfig {
         version: 1,
         services,
-        clients,
+        clients: Vec::new(),
         env: env_vars,
         policy: PolicyConfig {
             fail_on: Severity::High,
@@ -342,60 +351,56 @@ pub fn merge_workspace_config(
     merged.policy = existing.policy.clone();
     merged.cache_path = existing.cache_path.clone();
 
-    // Preserve per-service overrides (`openapi`, `routes`, `base_urls`) for kept repositories.
+    // Keep names and overrides attached to the same repository across scans.
+    let mut retained_names = BTreeSet::new();
+    let configured_repos: Vec<_> = existing
+        .services
+        .iter()
+        .map(|service| (workspace_service_path(config_dir, service), service))
+        .collect();
     for service in &mut merged.services {
-        let svc_abs = normalize_absolute_path(&service.path);
-        let prev = existing.services.iter().find(|old| {
-            let old_raw = if old.path.is_absolute() {
-                old.path.clone()
-            } else {
-                config_dir.join(&old.path)
-            };
-            old.name == service.name || path_equals_ci(&normalize_absolute_path(&old_raw), &svc_abs)
-        });
-
-        if let Some(old) = prev {
+        if let Some((_, old)) = configured_repos
+            .iter()
+            .find(|(path, _)| same_repository_path(path, &service.path))
+        {
+            retained_names.insert(old.name.as_str());
+            service.name.clone_from(&old.name);
+            service.path.clone_from(&old.path);
             if old.openapi.is_some() {
-                service.openapi = old.openapi.clone();
+                service.openapi.clone_from(&old.openapi);
             }
             if old.routes.is_some() {
-                service.routes = old.routes.clone();
+                service.routes.clone_from(&old.routes);
             }
-            if !old.base_urls.is_empty() {
-                service.base_urls = old.base_urls.clone();
+            if old.openapi.is_some() || old.routes.is_some() || !old.base_urls.is_empty() {
+                service.base_urls.clone_from(&old.base_urls);
             }
         }
     }
 
-    // Preserve manual `[env]` overrides on top of newly auto-detected URLs.
-    for (k, v) in &existing.env {
-        merged.env.insert(k.clone(), v.clone());
-    }
-
-    // Preserve existing `[[clients]]` whose `target_service` is still selected,
-    // without duplicating a `callee` already auto-detected by `build_workspace_config`.
-    let kept_service_names: BTreeSet<&str> =
-        merged.services.iter().map(|s| s.name.as_str()).collect();
-    let mut existing_callees: BTreeSet<String> =
-        merged.clients.iter().map(|c| c.callee.clone()).collect();
-
-    for old_client in &existing.clients {
-        if !kept_service_names.contains(old_client.target_service.as_str()) {
-            continue;
-        }
-        if existing_callees.insert(old_client.callee.clone()) {
-            merged.clients.push(old_client.clone());
-        }
-    }
-
-    merged
+    merged.env.extend(existing.env.clone());
+    merged.clients = existing
         .clients
-        .sort_by(|a, b| (&a.callee, &a.target_service).cmp(&(&b.callee, &b.target_service)));
-
+        .iter()
+        .filter(|client| {
+            retained_names.contains(client.target_service.as_str())
+                && client
+                    .consumer_service
+                    .as_deref()
+                    .is_none_or(|consumer| retained_names.contains(consumer))
+        })
+        .cloned()
+        .collect();
     merged
 }
 
-fn path_equals_ci(a: &Path, b: &Path) -> bool {
+/// Resolve a configured repository path relative to its workspace TOML.
+pub fn workspace_service_path(config_dir: &Path, service: &ServiceConfig) -> PathBuf {
+    normalize_absolute_path(&config_dir.join(&service.path))
+}
+
+/// Compare canonical repository paths using the platform's path case rules.
+pub fn same_repository_path(a: &Path, b: &Path) -> bool {
     path_starts_with_ci(a, b) && path_starts_with_ci(b, a)
 }
 
@@ -436,48 +441,84 @@ fn detect_env_urls_in_repo(repo_root: &Path) -> BTreeMap<String, String> {
     env_map
 }
 
-struct ProducerCatalog {
-    name: String,
-    prefix: Option<String>,
-    canonical_routes: Vec<String>,
+struct ProducerCatalog<'a> {
+    name: &'a str,
+    prefix: Option<&'a str>,
+    canonical_routes: BTreeSet<String>,
 }
 
-fn detect_custom_clients(repos: &[DiscoveredRepo]) -> Vec<CustomClientConfig> {
-    let producers: Vec<ProducerCatalog> = repos
-        .iter()
-        .filter(|r| r.openapi.is_some() || r.framework.is_some())
-        .map(build_producer_catalog)
-        .collect();
+/// A wrapper matched more than one producer with the same number of routes.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ClientAmbiguity {
+    pub consumer: String,
+    pub callee: String,
+    pub candidates: Vec<String>,
+}
 
+/// Infer missing mappings per consumer using the workspace's final service names and overrides.
+pub fn discover_workspace_clients(
+    config: &mut WorkspaceConfig,
+    config_dir: &Path,
+    framework_routes: impl Fn(&Path, &str, &RouteSourceConfig) -> Vec<String>,
+) -> Vec<ClientAmbiguity> {
+    let producers: Vec<_> = config
+        .services
+        .iter()
+        .filter(|service| service.openapi.is_some() || service.routes.is_some())
+        .map(|service| build_producer_catalog(service, config_dir, &framework_routes))
+        .collect();
     if producers.is_empty() {
         return Vec::new();
     }
 
-    let mut observed_by_callee: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for repo in repos {
-        if repo.openapi.is_some() || repo.framework.is_some() {
-            continue;
-        }
-        collect_consumer_wrapper_paths(&repo.path, 0, &mut observed_by_callee);
-    }
-
+    let mut ambiguities = Vec::new();
     let mut clients = Vec::new();
-    for (callee, paths) in observed_by_callee {
-        if paths.is_empty() {
+    for service in &config.services {
+        if service.openapi.is_some() || service.routes.is_some() {
             continue;
         }
-        if let Some(best) = select_best_producer(&producers, &paths) {
-            clients.push(CustomClientConfig {
-                callee,
-                target_service: best.name.clone(),
-                path_prefix: best.prefix.clone(),
-            });
+        let mut observed = BTreeMap::new();
+        collect_consumer_wrapper_paths(
+            &workspace_service_path(config_dir, service),
+            0,
+            &mut observed,
+        );
+        let configured = config.clients_for_consumer(&service.name);
+        for (callee, paths) in observed {
+            // Existing entries, including legacy global ones, retain their behavior after a scan.
+            if configured.iter().any(|client| client.callee == callee) {
+                continue;
+            }
+            let best = select_best_producers(&producers, &paths, is_known_wrapper(&callee));
+            match best.as_slice() {
+                [] => {}
+                [(producer, prefix)] => clients.push(CustomClientConfig {
+                    consumer_service: Some(service.name.clone()),
+                    callee,
+                    target_service: producer.name.to_owned(),
+                    path_prefix: prefix.map(str::to_owned),
+                }),
+                _ => {
+                    let mut candidates: Vec<_> = best
+                        .iter()
+                        .map(|(producer, _)| producer.name.to_owned())
+                        .collect();
+                    candidates.sort();
+                    ambiguities.push(ClientAmbiguity {
+                        consumer: service.name.clone(),
+                        callee,
+                        candidates,
+                    });
+                }
+            }
         }
     }
 
-    clients
+    config.clients.extend(clients);
+    ambiguities
 }
 
+// Prefer committed contract evidence and fall back to a local OpenAPI file.
 fn read_repo_file_preferring_head(repo_root: &Path, rel: &Path) -> Option<String> {
     let git = GitRepo::new(repo_root);
     if let Ok(committed) = git.read_file("HEAD", rel) {
@@ -488,85 +529,101 @@ fn read_repo_file_preferring_head(repo_root: &Path, rel: &Path) -> Option<String
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn build_producer_catalog(repo: &DiscoveredRepo) -> ProducerCatalog {
-    let mut routes = BTreeSet::new();
+// Combine the configured OpenAPI spec with the same framework routes used for analysis.
+fn build_producer_catalog<'a>(
+    service: &'a ServiceConfig,
+    config_dir: &Path,
+    framework_routes: &impl Fn(&Path, &str, &RouteSourceConfig) -> Vec<String>,
+) -> ProducerCatalog<'a> {
+    let root = workspace_service_path(config_dir, service);
+    let mut canonical_routes = BTreeSet::new();
 
-    if let Some(openapi_rel) = repo.openapi.as_deref()
-        && let Some(raw) = read_repo_file_preferring_head(&repo.path, openapi_rel)
-        && let Ok(contract) = extract_contract(&repo.name, &raw)
+    if let Some(openapi_rel) = service.openapi.as_deref()
+        && let Some(raw) = read_repo_file_preferring_head(&root, openapi_rel)
+        && let Ok(contract) = extract_contract(&service.name, &raw)
     {
-        for ep in contract.endpoints.keys() {
-            routes.insert(canonical_route_key(&ep.normalized_path));
-        }
+        canonical_routes.extend(
+            contract
+                .endpoints
+                .keys()
+                .map(|ep| canonical_route_key(&ep.normalized_path)),
+        );
     }
 
-    if repo.framework == Some(RouteFramework::Laravel) {
-        for rel in &repo.route_files {
-            if let Some(raw) = read_repo_file_preferring_head(&repo.path, rel) {
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                for extracted in
-                    extract_laravel_routes(&repo.name, &rel_str, &raw, repo.route_prefix.as_deref())
-                {
-                    routes.insert(canonical_route_key(&extracted.endpoint.normalized_path));
-                }
-            }
-        }
+    if let Some(routes) = &service.routes {
+        canonical_routes.extend(
+            framework_routes(&root, &service.name, routes)
+                .iter()
+                .map(|path| canonical_route_key(path)),
+        );
     }
 
     ProducerCatalog {
-        name: repo.name.clone(),
-        prefix: repo.route_prefix.clone(),
-        canonical_routes: routes.into_iter().collect(),
+        name: &service.name,
+        prefix: service
+            .routes
+            .as_ref()
+            .and_then(|routes| routes.prefix.as_deref()),
+        canonical_routes,
     }
 }
 
-fn select_best_producer<'a>(
-    producers: &'a [ProducerCatalog],
+// Keep all producers tied at the highest positive score.
+fn select_best_producers<'a>(
+    producers: &'a [ProducerCatalog<'a>],
     consumer_paths: &BTreeSet<String>,
-) -> Option<&'a ProducerCatalog> {
-    let mut best: Option<(usize, &'a ProducerCatalog)> = None;
-
+    known_wrapper: bool,
+) -> Vec<(&'a ProducerCatalog<'a>, Option<&'a str>)> {
+    let mut best = Vec::new();
+    let mut best_hits = 0;
     for producer in producers {
-        let mut hits = 0usize;
-        for raw_path in consumer_paths {
-            let prefixed = match producer.prefix.as_deref() {
-                Some(prefix) if !raw_path.starts_with(prefix) => {
-                    format!(
-                        "{}/{}",
-                        prefix.trim_end_matches('/'),
-                        raw_path.trim_start_matches('/')
-                    )
-                }
-                _ => raw_path.clone(),
-            };
-            let canonical_consumer = canonical_route_key(&prefixed);
-            if producer
-                .canonical_routes
+        let count_hits = |prefix| {
+            consumer_paths
                 .iter()
-                .any(|prod_key| routes_match(prod_key, &canonical_consumer))
-            {
-                hits += 1;
-            }
+                .filter(|path| {
+                    let key = canonical_route_key(&normalize_relative_path(path, prefix));
+                    producer
+                        .canonical_routes
+                        .iter()
+                        .any(|route| routes_match(route, &key))
+                })
+                .count()
+        };
+        let direct_hits = count_hits(None);
+        let prefixed_hits = producer.prefix.map_or(0, |prefix| count_hits(Some(prefix)));
+        let (hits, prefix) = if prefixed_hits > direct_hits {
+            (prefixed_hits, producer.prefix)
+        } else {
+            (direct_hits, None)
+        };
+        if hits > best_hits {
+            best_hits = hits;
+            best.clear();
         }
-
-        if hits > 0 && best.as_ref().is_none_or(|(best_hits, _)| hits > *best_hits) {
-            best = Some((hits, producer));
+        if hits > 0 && hits == best_hits {
+            best.push((producer, prefix));
         }
     }
 
-    if let Some((_, producer)) = best {
-        return Some(producer);
+    // A known wrapper can use the sole backend when it has no statically discoverable routes.
+    if known_wrapper
+        && let [producer] = producers
+        && producer.canonical_routes.is_empty()
+    {
+        best.push((producer, producer.prefix));
     }
-
-    // If there is only one producer and it has no statically scanned routes yet (e.g. Express),
-    // map the custom client to it as the single backend in this workspace.
-    if producers.len() == 1 {
-        return Some(&producers[0]);
-    }
-
-    None
+    best
 }
 
+// Recognize the existing wrappers that can be inferred without any route evidence.
+fn is_known_wrapper(callee: &str) -> bool {
+    matches!(
+        callee,
+        "getClient().fetch" | "$fetch" | "apiClient" | "httpClient"
+    )
+}
+
+// Collect wrapper calls while skipping build output and dependency directories.
 fn collect_consumer_wrapper_paths(
     dir: &Path,
     depth: usize,
@@ -616,44 +673,48 @@ fn is_scannable_ts_source(file_name: &str) -> bool {
         || lower.ends_with(".mjs")
 }
 
+// Collect relative calls from known function wrappers and simple HTTP client objects.
 fn extract_wrapper_calls_from_source(source: &str, out: &mut BTreeMap<String, BTreeSet<String>>) {
-    const PATTERNS: &[(&str, &str)] = &[
-        ("getClient().fetch", "getClient().fetch"),
-        ("$fetch", "$fetch"),
-        ("apiClient.get", "apiClient"),
-        ("apiClient.post", "apiClient"),
-        ("apiClient.put", "apiClient"),
-        ("apiClient.patch", "apiClient"),
-        ("apiClient.delete", "apiClient"),
-        ("apiClient.fetch", "apiClient"),
-        ("httpClient.get", "httpClient"),
-        ("httpClient.post", "httpClient"),
-        ("httpClient.put", "httpClient"),
-        ("httpClient.patch", "httpClient"),
-        ("httpClient.delete", "httpClient"),
-        ("httpClient.fetch", "httpClient"),
-    ];
-
-    for (needle, callee) in PATTERNS {
-        let mut search_from = 0usize;
-        while let Some(rel_idx) = source[search_from..].find(needle) {
-            let start = search_from + rel_idx;
-            let after = start + needle.len();
-            search_from = after;
-
-            // Avoid matching inside a longer identifier (e.g. `my$fetch` or `xapiClient.get`)
-            if start > 0 {
-                let prev = source.as_bytes()[start - 1];
-                if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'$' {
-                    continue;
-                }
+    for callee in ["getClient().fetch", "$fetch"] {
+        for (start, _) in source.match_indices(callee) {
+            if source[..start].ends_with(is_identifier_char) {
+                continue;
             }
-
-            if let Some(path) = extract_first_relative_path_arg(&source[after..]) {
-                out.entry((*callee).to_string()).or_default().insert(path);
+            if let Some(path) = extract_first_relative_path_arg(&source[start + callee.len()..]) {
+                out.entry(callee.to_owned()).or_default().insert(path);
             }
         }
     }
+
+    // A custom object name needs a recognized HTTP method and a literal relative path.
+    for (dot, _) in source.match_indices('.') {
+        let (object, member) = source.split_at(dot);
+        let callee = object
+            .rsplit(|ch| !is_identifier_char(ch))
+            .next()
+            .unwrap_or("");
+        let before = &object[..object.len() - callee.len()];
+        if !callee.starts_with(|ch: char| is_identifier_char(ch) && !ch.is_ascii_digit())
+            || before.ends_with('.')
+            || matches!(callee, "axios" | "fetch")
+        {
+            continue;
+        }
+        let method = member[1..]
+            .split(|ch| !is_identifier_char(ch))
+            .next()
+            .unwrap_or("");
+        if (method == "fetch" || crate::model::HttpMethod::parse(method).is_some())
+            && let Some(path) = extract_first_relative_path_arg(&member[1 + method.len()..])
+        {
+            out.entry(callee.to_owned()).or_default().insert(path);
+        }
+    }
+}
+
+// Identify the characters used by simple JavaScript client names.
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$')
 }
 
 fn extract_first_relative_path_arg(rest: &str) -> Option<String> {
@@ -1084,6 +1145,25 @@ mod tests {
 
     use super::*;
     use crate::config::ServiceConfig;
+    use crate::laravel::extract_laravel_routes;
+
+    // Supply Laravel route evidence for the core scanner tests.
+    fn laravel_catalog(root: &Path, name: &str, config: &RouteSourceConfig) -> Vec<String> {
+        config
+            .files
+            .iter()
+            .filter_map(|file| read_repo_file_preferring_head(root, file).map(|raw| (file, raw)))
+            .flat_map(|(file, raw)| {
+                extract_laravel_routes(
+                    name,
+                    &file.to_string_lossy(),
+                    &raw,
+                    config.prefix.as_deref(),
+                )
+            })
+            .map(|route| route.endpoint.normalized_path)
+            .collect()
+    }
 
     fn init_git_repo(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
@@ -1339,7 +1419,7 @@ mod tests {
     }
 
     #[test]
-    // Verifica que la configuración detectada mantenga la ruta base y omita las credenciales.
+    // Verify that discovery keeps the base path and omits credentials.
     fn build_workspace_config_detects_env_urls_and_maps_custom_clients_to_matching_producer() {
         let tmp =
             std::env::temp_dir().join(format!("laine-ws-autodetect-test-{}", std::process::id()));
@@ -1391,7 +1471,8 @@ export function reset() {
         .unwrap();
 
         let repos = scan_directory(&tmp).expect("scan should succeed");
-        let cfg = build_workspace_config(&repos, &tmp, false);
+        let mut cfg = build_workspace_config(&repos, &tmp, false);
+        assert!(discover_workspace_clients(&mut cfg, &tmp, laravel_catalog).is_empty());
 
         assert_eq!(
             cfg.env.get("NUXT_PUBLIC_API").map(String::as_str),
@@ -1410,12 +1491,17 @@ export function reset() {
             cfg.clients
         );
         assert_eq!(cfg.clients[0].callee, "getClient().fetch");
+        assert_eq!(
+            cfg.clients[0].consumer_service.as_deref(),
+            Some("portal-web")
+        );
         assert_eq!(cfg.clients[0].target_service, "cerebro-web");
         assert_eq!(cfg.clients[0].path_prefix.as_deref(), Some("/api"));
 
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    // Verify that edits preserve overrides and prune mappings for removed repositories.
     #[test]
     fn infers_common_parent_dir_and_merges_workspace_edits_preserving_customizations() {
         let tmp = std::env::temp_dir().join(format!("laine-ws-merge-test-{}", std::process::id()));
@@ -1470,6 +1556,7 @@ export function reset() {
                 },
             ],
             clients: vec![CustomClientConfig {
+                consumer_service: None,
                 callee: "legacyClient".into(),
                 target_service: "portal-v1".into(),
                 path_prefix: None,
@@ -1496,7 +1583,9 @@ export function reset() {
             .filter(|r| r.name == "cerebro-web" || r.name == "portal-v2")
             .collect();
 
-        let merged = merge_workspace_config(&existing, &selected, tmp.join("configs").as_path());
+        let config_dir = tmp.join("configs");
+        let mut merged = merge_workspace_config(&existing, &selected, &config_dir);
+        assert!(discover_workspace_clients(&mut merged, &config_dir, laravel_catalog).is_empty());
         assert_eq!(merged.policy.fail_on, Severity::Critical);
         assert_eq!(merged.policy.ignore_endpoints, vec!["/health".to_string()]);
         assert_eq!(merged.cache_path, Some(".cache/custom.sqlite".into()));
@@ -1522,6 +1611,44 @@ export function reset() {
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    // A replacement repository with the same folder name must not inherit overrides.
+    #[test]
+    fn workspace_edit_does_not_transfer_overrides_to_a_same_named_repository() {
+        let tmp = std::env::temp_dir().join(format!("laine-ws-path-test-{}", std::process::id()));
+        let old = tmp.join("old/backend");
+        let new = tmp.join("new/backend");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        let existing = WorkspaceConfig::parse_toml(
+            r#"
+version = 1
+
+[[services]]
+name = "backend"
+path = "old/backend"
+openapi = "manual.yaml"
+base_urls = ["https://old.example"]
+
+[[clients]]
+callee = "legacyApi"
+target_service = "backend"
+"#,
+        )
+        .unwrap();
+
+        let kept = merge_workspace_config(&existing, &[inspect_repo_path(&old)], &tmp);
+        assert_eq!(kept.services, existing.services);
+        assert_eq!(kept.clients, existing.clients);
+
+        let replaced = merge_workspace_config(&existing, &[inspect_repo_path(&new)], &tmp);
+        assert_eq!(replaced.services[0].name, "backend");
+        assert_eq!(replaced.services[0].openapi, None);
+        assert!(replaced.services[0].base_urls.is_empty());
+        assert!(replaced.clients.is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // Confirm that committed producer routes take precedence over local changes.
     #[test]
     fn autodetects_correct_producer_from_head_even_when_worktree_renames_route() {
         let tmp =
@@ -1596,7 +1723,8 @@ export function reset() {
         commit_all(&portal);
 
         let repos = scan_directory(&tmp).unwrap();
-        let cfg = build_workspace_config(&repos, &tmp, false);
+        let mut cfg = build_workspace_config(&repos, &tmp, false);
+        assert!(discover_workspace_clients(&mut cfg, &tmp, laravel_catalog).is_empty());
 
         assert_eq!(cfg.clients.len(), 1);
         assert_eq!(cfg.clients[0].callee, "getClient().fetch");

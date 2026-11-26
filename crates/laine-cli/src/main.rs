@@ -9,7 +9,8 @@ use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use laine_cli::engine::{
-    AnalyzeRequest, ConsumerRevision, index_workspace, run_analysis_with_consumer_revision,
+    AnalyzeRequest, ConsumerRevision, catalog_workspace_routes, index_workspace,
+    run_analysis_with_consumer_revision,
 };
 use laine_cli::report::{omit_snippets, render_json, render_markdown, render_terminal};
 use laine_core::config::{
@@ -20,9 +21,10 @@ use laine_core::error::LaineError;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::{GitRepo, STAGED_REV};
 use laine_core::workspace::{
-    DiscoveredRepo, WorkspaceRegistry, build_workspace_config, infer_workspace_scan_dir,
-    inspect_repo_path, merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
-    scan_directory, validate_workspace_name,
+    ClientAmbiguity, DiscoveredRepo, WorkspaceRegistry, build_workspace_config,
+    discover_workspace_clients, infer_workspace_scan_dir, inspect_repo_path,
+    merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
+    same_repository_path, scan_directory, validate_workspace_name, workspace_service_path,
 };
 use selector::{ensure_selection_terminal, select_repositories};
 
@@ -537,11 +539,7 @@ fn handle_init(
                 }
             }
         } else {
-            match select_repositories(
-                &discovered,
-                &HashSet::new(),
-                "Select repositories for this workspace",
-            ) {
+            match select_repositories(&discovered, &[], "Select repositories for this workspace") {
                 Ok(repos) => repos,
                 Err(msg) => {
                     eprintln!("{msg}");
@@ -559,7 +557,9 @@ fn handle_init(
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let cfg = build_workspace_config(&selected, config_dir, false);
+        let mut cfg = build_workspace_config(&selected, config_dir, false);
+        let ambiguities =
+            discover_workspace_clients(&mut cfg, config_dir, catalog_workspace_routes);
         if let Err(err) =
             persist_initialized_workspace(&dest, workspace.as_deref(), force, Some(&cfg))
         {
@@ -575,20 +575,7 @@ fn handle_init(
         for repo in &selected {
             println!("  - {} ({})", repo.name, repo.detected_kind);
         }
-        if !cfg.clients.is_empty() {
-            println!("Auto-detected HTTP client wrapper(s):");
-            for client in &cfg.clients {
-                let prefix_note = client
-                    .path_prefix
-                    .as_deref()
-                    .map(|p| format!(" (prefix: {p})"))
-                    .unwrap_or_default();
-                println!(
-                    "  - `{}` -> {}{prefix_note}",
-                    client.callee, client.target_service
-                );
-            }
-        }
+        print_workspace_clients(&cfg, "Auto-detected", &ambiguities);
         if !cfg.env.is_empty() {
             println!("Auto-detected {} API URL env var(s).", cfg.env.len());
         }
@@ -692,7 +679,7 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
     }
 }
 
-/// Actualiza los repositorios de un workspace con una selección explícita o interactiva.
+/// Update a workspace's repositories from an explicit selection or the interactive picker.
 fn handle_workspace_edit(
     name: &str,
     scan: Option<PathBuf>,
@@ -753,22 +740,20 @@ fn handle_workspace_edit(
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let mut preselected_names = HashSet::new();
+    let mut preselected_paths = Vec::new();
     for svc in &existing.services {
-        preselected_names.insert(svc.name.clone());
-        let svc_abs = normalize_absolute_path(&if svc.path.is_absolute() {
-            svc.path.clone()
-        } else {
-            cfg_dir.join(&svc.path)
-        });
-        if !discovered
-            .iter()
-            .any(|d| d.name == svc.name || d.path == svc_abs)
+        let svc_abs = workspace_service_path(cfg_dir, svc);
+        if let Some(repo) = discovered
+            .iter_mut()
+            .find(|repo| same_repository_path(&repo.path, &svc_abs))
         {
-            let mut extra = inspect_repo_path(&svc_abs);
-            extra.name = svc.name.clone();
-            discovered.push(extra);
+            repo.name.clone_from(&svc.name);
+        } else {
+            let mut repo = inspect_repo_path(&svc_abs);
+            repo.name.clone_from(&svc.name);
+            discovered.push(repo);
         }
+        preselected_paths.push(svc_abs);
     }
     discovered.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -785,7 +770,7 @@ fn handle_workspace_edit(
     } else {
         match select_repositories(
             &discovered,
-            &preselected_names,
+            &preselected_paths,
             &format!("Edit repositories in workspace '{name}'"),
         ) {
             Ok(repos) => repos,
@@ -801,7 +786,18 @@ fn handle_workspace_edit(
         return ExitCode::FAILURE;
     }
 
-    let updated = merge_workspace_config(&existing, &selected, cfg_dir);
+    let mut updated = merge_workspace_config(&existing, &selected, cfg_dir);
+    let mut names = HashSet::new();
+    for service in &updated.services {
+        if !names.insert(&service.name) {
+            eprintln!(
+                "Multiple repositories would use the service name '{}'. Rename the existing service or select fewer repositories.",
+                service.name
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    let ambiguities = discover_workspace_clients(&mut updated, cfg_dir, catalog_workspace_routes);
     if let Err(err) = updated.save_to_path(cfg_path) {
         eprintln!("Failed to save {}: {err}", cfg_path.display());
         return ExitCode::FAILURE;
@@ -815,25 +811,41 @@ fn handle_workspace_edit(
     for svc in &updated.services {
         println!("  - {}", svc.name);
     }
-    if !updated.clients.is_empty() {
-        println!("Configured HTTP client wrapper(s):");
-        for client in &updated.clients {
+    print_workspace_clients(&updated, "Configured", &ambiguities);
+    ExitCode::SUCCESS
+}
+
+// Print scoped mappings and show the producer choices for unresolved ties.
+fn print_workspace_clients(config: &WorkspaceConfig, verb: &str, ambiguities: &[ClientAmbiguity]) {
+    if !config.clients.is_empty() {
+        println!("{verb} HTTP client wrapper(s):");
+        for client in &config.clients {
+            let consumer = client
+                .consumer_service
+                .as_deref()
+                .unwrap_or("workspace-wide");
             let prefix_note = client
                 .path_prefix
                 .as_deref()
                 .map(|p| format!(" (prefix: {p})"))
                 .unwrap_or_default();
             println!(
-                "  - `{}` -> {}{prefix_note}",
+                "  - {consumer}: `{}` -> {}{prefix_note}",
                 client.callee, client.target_service
             );
         }
     }
-    ExitCode::SUCCESS
+    for ambiguity in ambiguities {
+        eprintln!(
+            "Ambiguous HTTP client wrapper `{}` in '{}': candidates: {}. Set consumer_service and target_service in [[clients]] to choose a producer.",
+            ambiguity.callee,
+            ambiguity.consumer,
+            ambiguity.candidates.join(", ")
+        );
+    }
 }
 
-// Valida la raíz Git antes de dar de alta un servicio y guarda su referencia desde el TOML.
-// Actualiza los repositorios manteniendo el bloqueo hasta guardar el TOML.
+// Update repositories under a config write lock and prune client references on removal.
 fn handle_repo(action: RepoAction) -> ExitCode {
     match action {
         RepoAction::Add {
@@ -964,7 +976,9 @@ fn handle_repo(action: RepoAction) -> ExitCode {
                 );
                 return ExitCode::FAILURE;
             }
-            cfg.clients.retain(|c| c.target_service != name);
+            cfg.clients.retain(|client| {
+                client.target_service != name && client.consumer_service.as_deref() != Some(&name)
+            });
 
             match cfg.save_to_path(&target_cfg_path) {
                 Ok(()) => {
@@ -1089,6 +1103,7 @@ fn lock_cli_update(path: &Path) -> Result<File, ()> {
     lock_config_update(path).map_err(|err| eprintln!("Failed to lock {}: {err}", path.display()))
 }
 
+// Resolve an explicit selection by service name or, for renamed services, the folder name.
 fn filter_selected_repos(
     discovered: &[DiscoveredRepo],
     select: &[String],
@@ -1099,19 +1114,31 @@ fn filter_selected_repos(
         if name.is_empty() {
             continue;
         }
-        if let Some(repo) = discovered.iter().find(|r| r.name == name) {
-            if !selected
-                .iter()
-                .any(|r: &DiscoveredRepo| r.name == repo.name)
-            {
-                selected.push(repo.clone());
+        let mut matched: Vec<_> = discovered.iter().filter(|repo| repo.name == name).collect();
+        if matched.is_empty() {
+            matched.extend(
+                discovered
+                    .iter()
+                    .filter(|repo| repo.path.file_name().is_some_and(|folder| folder == name)),
+            );
+        }
+        match matched.as_slice() {
+            [] => {
+                let available: Vec<&str> = discovered.iter().map(|r| r.name.as_str()).collect();
+                return Err(format!(
+                    "Repository '{name}' was not found in scan results (available: {})",
+                    available.join(", ")
+                ));
             }
-        } else {
-            let available: Vec<&str> = discovered.iter().map(|r| r.name.as_str()).collect();
-            return Err(format!(
-                "Repository '{name}' was not found in scan results (available: {})",
-                available.join(", ")
-            ));
+            [repo] => {
+                if !selected
+                    .iter()
+                    .any(|r: &DiscoveredRepo| same_repository_path(&r.path, &repo.path))
+                {
+                    selected.push((*repo).clone());
+                }
+            }
+            _ => return Err(format!("Repository name '{name}' matches multiple paths.")),
         }
     }
     Ok(selected)

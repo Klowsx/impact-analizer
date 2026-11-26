@@ -6249,6 +6249,7 @@ export async function run(id: string) {
     fn cross_file_helper_custom_client_zod_parse_and_swr_work() {
         let services = user_services();
         let clients = vec![CustomClientConfig {
+            consumer_service: None,
             callee: "getClient().fetch".into(),
             target_service: "user-service".into(),
             path_prefix: Some("/api".into()),

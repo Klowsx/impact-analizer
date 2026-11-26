@@ -496,7 +496,7 @@ pub fn run_analysis_with_consumer_revision(
                     Some(inputs) => inputs,
                     None => load_consumer_inputs(&consumer_git, &consumer_rev)?,
                 };
-                let extracted = extract_consumer_repo(inputs, &config);
+                let extracted = extract_consumer_repo(inputs, &config, &service.name);
                 if let Some(cache_db) = cache.as_ref()
                     && let Ok(payload) = serde_json::to_string(&extracted)
                 {
@@ -612,7 +612,11 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
         if is_valid_hit {
             cache_hits += 1;
         } else {
-            let snapshot = extract_consumer_repo(load_consumer_inputs(&git, &head_sha)?, &config);
+            let snapshot = extract_consumer_repo(
+                load_consumer_inputs(&git, &head_sha)?,
+                &config,
+                &service.name,
+            );
             let payload = serde_json::to_string(&snapshot)
                 .map_err(|err| LaineError::Cache(err.to_string()))?;
             cache.put_repo_snapshot(&service.name, &head_sha, &config_hash, &payload)?;
@@ -655,8 +659,13 @@ fn load_consumer_inputs(git: &GitRepo, rev: &str) -> Result<ConsumerInputs> {
     })
 }
 
-// Extracts consumer facts from the files in a repository snapshot.
-fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> CachedConsumerRepo {
+// Extract facts from the snapshot with the HTTP client mappings for this repository.
+fn extract_consumer_repo(
+    inputs: ConsumerInputs,
+    config: &WorkspaceConfig,
+    consumer: &str,
+) -> CachedConsumerRepo {
+    let clients = config.clients_for_consumer(consumer);
     let mut extraction = FileExtraction::from_reads(&inputs.candidates, &inputs.sources);
     let file_contents: Vec<(String, String)> = inputs.sources.into_iter().collect();
     let mut ts_files: Vec<_> = file_contents
@@ -669,7 +678,7 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
         |importer: &str, specifier: &str| resolver.resolve_import(importer, specifier);
     let ts_context = ExtractContext {
         services: &config.services,
-        clients: &config.clients,
+        clients: &clients,
         env: &config.env,
     };
     let axios_imports = collect_imported_axios_clients(&ts_files, ts_context, &resolve_import);
@@ -702,7 +711,7 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
                     source,
                     PyExtractContext {
                         services: &config.services,
-                        clients: &config.clients,
+                        clients: &clients,
                         env: &config.env,
                     },
                 );
@@ -966,6 +975,26 @@ fn apply_cached_consumer_repo(
             reason: unresolved.reason.clone(),
         });
     }
+}
+
+/// Build the workspace scan's route catalog from the same extractors used by analysis.
+pub fn catalog_workspace_routes(
+    root: &Path,
+    service_name: &str,
+    route_cfg: &RouteSourceConfig,
+) -> Vec<String> {
+    let git = GitRepo::new(root);
+    let rev = git
+        .resolve_revision("HEAD")
+        .unwrap_or_else(|_| WORKTREE_REV.to_owned());
+    extract_producer_routes(&git, service_name, &rev, route_cfg)
+        .map(|(routes, _)| {
+            routes
+                .into_iter()
+                .map(|route| route.endpoint.normalized_path)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // Extracts routes and keeps unresolved mounts tied to the analyzed revision.

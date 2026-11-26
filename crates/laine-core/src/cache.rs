@@ -261,6 +261,7 @@ mod tests {
                 base_urls: vec!["http://customer-service".into()],
             }],
             clients: vec![CustomClientConfig {
+                consumer_service: None,
                 callee: "apiClient".into(),
                 target_service: "customer-service".into(),
                 path_prefix: Some("/api".into()),

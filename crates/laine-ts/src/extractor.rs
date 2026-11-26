@@ -362,8 +362,8 @@ enum UrlEval {
 
 #[derive(Debug, Clone)]
 enum CallTarget {
-    Fetch(HttpMethod),
-    UseFetch(HttpMethod),
+    Fetch(Option<HttpMethod>),
+    UseFetch(Option<HttpMethod>),
     Axios(HttpMethod),
     AxiosInstance {
         base_url: String,
@@ -372,7 +372,7 @@ enum CallTarget {
     Custom {
         target_service: String,
         path_prefix: Option<String>,
-        method: HttpMethod,
+        method: Option<HttpMethod>,
         is_use_fetch: bool,
     },
 }
@@ -794,12 +794,13 @@ impl<'s> FileExtractor<'s> {
         None
     }
 
+    // Reconoce clientes HTTP y separa los métodos estáticos de las opciones dinámicas.
     fn classify_http_call(&self, call: &CallExpression<'_>) -> Option<CallTarget> {
         // 1. Check configured custom clients first (so `$fetch`, `getClient().fetch`, `apiClient.post` work).
         if let Some(callee_str) = format_callee_expr(unwrap_expr(&call.callee)) {
             for client in self.ctx.clients {
                 if callee_str == client.callee {
-                    let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+                    let method = options_http_method(call);
                     return Some(CallTarget::Custom {
                         target_service: client.target_service.clone(),
                         path_prefix: client.path_prefix.clone(),
@@ -812,7 +813,7 @@ impl<'s> FileExtractor<'s> {
                     && let Some(method_name) = rest.strip_prefix('.')
                 {
                     if method_name == "fetch" || is_use_fetch_callee(method_name) {
-                        let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+                        let method = options_http_method(call);
                         return Some(CallTarget::Custom {
                             target_service: client.target_service.clone(),
                             path_prefix: client.path_prefix.clone(),
@@ -824,7 +825,7 @@ impl<'s> FileExtractor<'s> {
                         return Some(CallTarget::Custom {
                             target_service: client.target_service.clone(),
                             path_prefix: client.path_prefix.clone(),
-                            method,
+                            method: Some(method),
                             is_use_fetch: false,
                         });
                     }
@@ -835,13 +836,13 @@ impl<'s> FileExtractor<'s> {
         // 2. Built-in `fetch`, `useFetch` / `useLazyFetch`, `axios.<method>`, and local `axios.create(...)` instances.
         match unwrap_expr(&call.callee) {
             Expression::Identifier(ident) if ident.name == "fetch" => {
-                let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+                let method = options_http_method(call);
                 Some(CallTarget::Fetch(method))
             }
             Expression::Identifier(ident)
                 if ident.name == "useFetch" || ident.name == "useLazyFetch" =>
             {
-                let method = extract_options_method(call).unwrap_or(HttpMethod::Get);
+                let method = options_http_method(call);
                 Some(CallTarget::UseFetch(method))
             }
             Expression::StaticMemberExpression(member) => {
@@ -866,7 +867,7 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
-    // Extrae llamadas HTTP y registra diagnósticos para bases ambiguas.
+    // Extrae llamadas HTTP y conserva diagnósticos para métodos y destinos indeterminados.
     fn process_http_call(&mut self, call: &CallExpression<'_>) -> Option<(CallResultShape, usize)> {
         let target = self.classify_http_call(call)?;
         if !self.seen_call_spans.insert(call.span.start) {
@@ -878,9 +879,11 @@ impl<'s> FileExtractor<'s> {
             CallTarget::UseFetch(m) => {
                 (HttpClientKind::Fetch, *m, CallResultShape::UseFetchResponse)
             }
-            CallTarget::Axios(m) | CallTarget::AxiosInstance { method: m, .. } => {
-                (HttpClientKind::Axios, *m, CallResultShape::AxiosResponse)
-            }
+            CallTarget::Axios(m) | CallTarget::AxiosInstance { method: m, .. } => (
+                HttpClientKind::Axios,
+                Some(*m),
+                CallResultShape::AxiosResponse,
+            ),
             CallTarget::Custom {
                 method: m,
                 is_use_fetch,
@@ -897,6 +900,15 @@ impl<'s> FileExtractor<'s> {
         };
 
         let (line, snippet) = self.location(call.span);
+        let Some(method) = method else {
+            self.unresolved_calls.push(ExtractedUnresolvedCall {
+                client: client_kind,
+                line,
+                snippet,
+                reason: "HTTP method cannot be resolved statically".into(),
+            });
+            return None;
+        };
         let response_type = self
             .extract_response_type(call)
             .or_else(|| self.current_return_type());
@@ -1930,29 +1942,42 @@ fn unwrap_expr<'a>(mut expr: &'a Expression<'a>) -> &'a Expression<'a> {
     }
 }
 
-fn extract_options_method(call: &CallExpression<'_>) -> Option<HttpMethod> {
-    let second_arg = call.arguments.get(1)?;
-    let Argument::ObjectExpression(obj) = second_arg else {
-        return None;
+// Usa GET para opciones ausentes y conserva como desconocido cualquier método que pueda variar.
+pub(crate) fn options_http_method(call: &CallExpression<'_>) -> Option<HttpMethod> {
+    let Some(second_arg) = call.arguments.get(1) else {
+        return Some(HttpMethod::Get);
+    };
+    let options = unwrap_expr(second_arg.as_expression()?);
+    let Expression::ObjectExpression(object) = options else {
+        return matches!(options, Expression::NullLiteral(_)).then_some(HttpMethod::Get);
     };
 
-    for prop in &obj.properties {
-        let ObjectPropertyKind::ObjectProperty(kv) = prop else {
-            continue;
+    // La última propiedad prevalece e incluso un spread puede sustituir un método anterior.
+    for property in object.properties.iter().rev() {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
         };
-        if property_key_name(&kv.key).as_deref() == Some("method")
-            && let Expression::StringLiteral(lit) = unwrap_expr(&kv.value)
-        {
-            return HttpMethod::parse(lit.value.as_str()?);
+        match property_key_name(&property.key).as_deref() {
+            Some("method") => {
+                let Expression::StringLiteral(literal) = unwrap_expr(&property.value) else {
+                    return None;
+                };
+                return HttpMethod::parse(literal.value.as_str()?);
+            }
+            None if property.key.is_computed() => return None,
+            _ => {}
         }
     }
-    None
+    Some(HttpMethod::Get)
 }
 
+// Devuelve el nombre de una clave que se conoce sin evaluar código.
 fn property_key_name(key: &PropertyKey<'_>) -> Option<String> {
     match key {
         PropertyKey::StaticIdentifier(ident) => Some(ident.name.to_string()),
-        PropertyKey::StringLiteral(lit) => lit.value.as_str().map(ToOwned::to_owned),
+        PropertyKey::StaticStringLiteral(lit) | PropertyKey::StringLiteral(lit) => {
+            lit.value.as_str().map(ToOwned::to_owned)
+        }
         _ => None,
     }
 }
@@ -2037,6 +2062,48 @@ mod tests {
             routes: None,
             base_urls: vec!["http://customer-service".into()],
         }]
+    }
+
+    // Distingue GET por defecto, métodos literales y opciones capaces de sobrescribirlos.
+    #[test]
+    fn reports_unknown_methods_without_linking_them_to_get() {
+        let source = r#"fetch('http://customer-service/default');
+fetch('http://customer-service/options', { headers: {} });
+fetch('http://customer-service/known', { ...options, method: 'POST' });
+fetch('http://customer-service/dynamic', { method: verb });
+fetch('http://customer-service/override', { method: 'POST', ...options });
+fetch('http://customer-service/computed', { [key]: verb });
+fetch('http://customer-service/opaque', options);
+useFetch('http://customer-service/composable', { method: verb });
+"#;
+        let result = extract_file("api.ts", source, &customer_services()).unwrap();
+        let calls = result
+            .calls
+            .iter()
+            .map(|call| (call.normalized_path.as_str(), call.method))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            calls,
+            [
+                ("/default", HttpMethod::Get),
+                ("/options", HttpMethod::Get),
+                ("/known", HttpMethod::Post)
+            ]
+        );
+        assert_eq!(
+            result
+                .unresolved_calls
+                .iter()
+                .map(|call| call.line)
+                .collect::<Vec<_>>(),
+            [4, 5, 6, 7, 8]
+        );
+        assert!(
+            result
+                .unresolved_calls
+                .iter()
+                .all(|call| call.reason == "HTTP method cannot be resolved statically")
+        );
     }
 
     #[test]

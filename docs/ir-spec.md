@@ -133,9 +133,12 @@ Ordered from lowest to highest:
 | `change` | [`ContractChange`](#36-contractchange) | Yes | Internally tagged by `"kind"` | Structured description of the breaking producer change. |
 | `severity` | [`Severity`](#severity-uppercase) | Yes | — | Blast-radius classification. |
 | `confidence` | [`Confidence`](#confidence-uppercase) | Yes | — | Certainty level of the producer change (`"CONFIRMED"`). |
-| `producer_evidence` | [`Evidence`](#34-endpointid--evidence) | Yes | — | Exact location in the producer contract or route file. |
+| `producer_evidence` | `ProducerEvidence` | Yes | — | Source in base for removals and response type changes. Source in head for request changes. |
+| `producer_evidence_comparison` | `ProducerEvidence` | No | Present for type changes | Source for the other revision of the type change. |
 | `consumers` | `Array<`[`AffectedConsumer`](#37-affectedconsumer--indirectconsumer)`>` | Yes | Sorted deterministically | Direct consumer sites affected by this change. |
 | `indirect_consumers` | `Array<`[`IndirectConsumer`](#37-affectedconsumer--indirectconsumer)`>` | No | Omitted when empty (`skip_serializing_if`) | Transitive downstream repositories discovered via cycle-safe BFS. |
+
+`ProducerEvidence` includes `repo`, `revision`, `file` and `description`. OpenAPI evidence includes a `json_pointer` to the declaration, which may be inside a referenced component. When the source has a verified location, `line` is one-based and `span` records its start and exclusive end with one-based lines and columns. Code routes provide a line when the extractor supplies it. `snippet` is reserved for literal source and is empty when omitted.
 
 ### 3.6 `ContractChange`
 
@@ -238,10 +241,12 @@ Laine strictly separates **how sure we are** (`Confidence`) from **how severe th
       "confidence": "CONFIRMED",
       "producer_evidence": {
         "repo": "customer-service",
-        "revision": "9f8e7d6c5b4a3210fedcba0987654321fedcba09",
+        "revision": "1a2b3c4d5e6f78901234567890abcdef12345678",
         "file": "openapi.yaml",
         "line": 24,
-        "snippet": "field `fullName`"
+        "json_pointer": "/components/schemas/Customer/properties/fullName",
+        "description": "Response field fullName (string)",
+        "snippet": ""
       },
       "consumers": [
         {
@@ -293,7 +298,8 @@ Laine strictly separates **how sure we are** (`Confidence`) from **how severe th
         "revision": "9f8e7d6c5b4a3210fedcba0987654321fedcba09",
         "file": "openapi.yaml",
         "line": 42,
-        "snippet": "required header parameter `X-Tenant-Id` (string)"
+        "description": "Required header parameter X-Tenant-Id (string)",
+        "snippet": ""
       },
       "consumers": [
         {

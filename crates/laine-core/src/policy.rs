@@ -124,9 +124,11 @@ fn endpoint_matches_ignore_pattern(endpoint: &EndpointId, raw_pattern: &str) -> 
 mod tests {
     use super::*;
     use crate::model::{
-        AnalysisStats, Confidence, Evidence, ImpactFinding, Severity, UnresolvedCall,
+        AnalysisStats, Confidence, Evidence, ImpactFinding, ProducerEvidence, Severity,
+        UnresolvedCall,
     };
 
+    // Crea un hallazgo con evidencia de una operación de prueba.
     fn mk_finding(id: &str, method: HttpMethod, path: &str, severity: Severity) -> ImpactFinding {
         ImpactFinding {
             id: id.into(),
@@ -139,13 +141,15 @@ mod tests {
             },
             severity,
             confidence: Confidence::Confirmed,
-            producer_evidence: Evidence {
+            producer_evidence: ProducerEvidence {
                 repo: "customer-service".into(),
                 revision: "abc1234".into(),
                 file: "openapi.yaml".into(),
-                line: 10,
+                line: Some(10),
                 snippet: format!("{} {path}", method.as_str()),
+                ..ProducerEvidence::default()
             },
+            producer_evidence_comparison: None,
             consumers: Vec::new(),
             indirect_consumers: Vec::new(),
         }

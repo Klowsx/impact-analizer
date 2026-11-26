@@ -4,17 +4,17 @@ use crate::graph::DependencyGraph;
 use crate::model::{
     AffectedConsumer, AnalysisReport, AnalysisStats, Confidence, ContractChange,
     ContractDiscrepancy, EndpointId, Evidence, HttpMethod, ImpactFinding, IndirectConsumer,
-    Severity, UnresolvedCall,
+    ProducerEvidence, Severity, UnresolvedCall,
 };
-use crate::openapi::{canonical_route_key, find_field_line, find_parameter_line};
+use crate::openapi::{ApiContract, canonical_route_key};
 
 pub struct ImpactInput<'a> {
     pub target_repo: &'a str,
     pub base_rev: &'a str,
     pub head_rev: &'a str,
     pub source_file: &'a str,
-    pub base_source_raw: &'a str,
-    pub head_source_raw: &'a str,
+    pub base_contract: Option<&'a ApiContract>,
+    pub head_contract: Option<&'a ApiContract>,
     /// Optional exact `(file, line)` source locations for code-extracted routes keyed by
     /// `(service, method, canonical_route_key)`.
     pub route_locations: BTreeMap<(String, HttpMethod, String), (String, usize)>,
@@ -52,40 +52,11 @@ fn consumers_for_endpoint(graph: &DependencyGraph, endpoint: &EndpointId) -> Vec
 }
 
 /// Cruza los cambios de contrato con el grafo para producir un informe reproducible.
-pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> AnalysisReport {
+pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> AnalysisReport {
     let mut findings = Vec::new();
-    let head_or_base_raw = if input.head_source_raw.is_empty() {
-        input.base_source_raw
-    } else {
-        input.head_source_raw
-    };
-
-    for (idx, change) in input.changes.into_iter().enumerate() {
-        let mut producer_file = input.source_file.to_string();
-        let (producer_line, producer_snippet, consumers) = match &change {
-            ContractChange::EndpointRemoved { endpoint } => {
-                let key = (
-                    endpoint.service.clone(),
-                    endpoint.method,
-                    canonical_route_key(&endpoint.normalized_path),
-                );
-                let line = if let Some((file, exact_line)) = input.route_locations.get(&key) {
-                    producer_file = file.clone();
-                    *exact_line
-                } else {
-                    find_field_line(input.base_source_raw, &endpoint.normalized_path)
-                };
-                let consumers = consumers_for_endpoint(graph, endpoint);
-                (
-                    line,
-                    format!(
-                        "{} {} (removed)",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    ),
-                    consumers,
-                )
-            }
+    for (idx, change) in std::mem::take(&mut input.changes).into_iter().enumerate() {
+        let (producer_evidence, producer_evidence_comparison) = producer_sources(&input, &change);
+        let consumers = match &change {
             ContractChange::ResponseFieldRemoved {
                 endpoint,
                 field_path,
@@ -96,15 +67,13 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                 field_path,
                 ..
             } => {
-                let line = find_field_line(input.base_source_raw, field_path);
                 let hits = graph.consumers_of_field(
                     &endpoint.service,
                     endpoint.method,
                     &endpoint.normalized_path,
                     field_path,
                 );
-                let consumers = hits
-                    .into_iter()
+                hits.into_iter()
                     .map(|hit| {
                         let step_label = if hit.source_confidence == Confidence::Likely {
                             "typed contract"
@@ -143,50 +112,9 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                             dependency_path,
                         }
                     })
-                    .collect::<Vec<_>>();
-                (line, format!("field `{field_path}`"), consumers)
+                    .collect::<Vec<_>>()
             }
-            ContractChange::RequestFieldAddedRequired {
-                endpoint,
-                field_path,
-                field_type,
-            } => {
-                let line = find_field_line(head_or_base_raw, field_path);
-                let consumers = consumers_for_endpoint(graph, endpoint);
-                (
-                    line,
-                    format!("required request field `{field_path}` ({field_type})"),
-                    consumers,
-                )
-            }
-            ContractChange::RequestFieldTypeChanged {
-                endpoint,
-                field_path,
-                previous_type,
-                new_type,
-            } => {
-                let line = find_field_line(head_or_base_raw, field_path);
-                let consumers = consumers_for_endpoint(graph, endpoint);
-                (
-                    line,
-                    format!("request field `{field_path}` ({previous_type} -> {new_type})"),
-                    consumers,
-                )
-            }
-            ContractChange::RequiredParameterAdded {
-                endpoint,
-                location,
-                name,
-                param_type,
-            } => {
-                let line = find_parameter_line(head_or_base_raw, name);
-                let consumers = consumers_for_endpoint(graph, endpoint);
-                (
-                    line,
-                    format!("required {location} parameter `{name}` ({param_type})"),
-                    consumers,
-                )
-            }
+            _ => consumers_for_endpoint(graph, change.endpoint()),
         };
 
         let severity = match (&change, consumers.is_empty()) {
@@ -228,13 +156,8 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
             change,
             severity,
             confidence: Confidence::Confirmed,
-            producer_evidence: Evidence {
-                repo: input.target_repo.to_string(),
-                revision: input.head_rev.to_string(),
-                file: producer_file,
-                line: producer_line,
-                snippet: producer_snippet,
-            },
+            producer_evidence,
+            producer_evidence_comparison,
             consumers,
             indirect_consumers,
         });
@@ -263,11 +186,102 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
     }
 }
 
+// Selecciona el lado del diff que define el cambio y conserva ambos lados para cambios de tipo.
+fn producer_sources(
+    input: &ImpactInput<'_>,
+    change: &ContractChange,
+) -> (ProducerEvidence, Option<ProducerEvidence>) {
+    let removed = matches!(
+        change,
+        ContractChange::EndpointRemoved { .. } | ContractChange::ResponseFieldRemoved { .. }
+    );
+    let response_type = matches!(change, ContractChange::ResponseFieldTypeChanged { .. });
+    let type_changed =
+        response_type || matches!(change, ContractChange::RequestFieldTypeChanged { .. });
+    let base_first = removed || response_type;
+    let evidence = |base| {
+        let (contract, revision) = if base {
+            (input.base_contract, input.base_rev)
+        } else {
+            (input.head_contract, input.head_rev)
+        };
+        let mut result = ProducerEvidence {
+            repo: input.target_repo.to_string(),
+            revision: revision.to_owned(),
+            file: input.source_file.to_owned(),
+            description: producer_description(change, base),
+            ..ProducerEvidence::default()
+        };
+        if let Some(source) = contract.and_then(|contract| contract.source_for_change(change)) {
+            result.json_pointer = Some(source.pointer.clone());
+            result.span = source.span.clone();
+            result.line = source.span.as_ref().map(|span| span.line);
+        } else if matches!(change, ContractChange::EndpointRemoved { .. }) {
+            let endpoint = change.endpoint();
+            let key = (
+                endpoint.service.clone(),
+                endpoint.method,
+                canonical_route_key(&endpoint.normalized_path),
+            );
+            if let Some((file, line)) = input.route_locations.get(&key) {
+                result.file.clone_from(file);
+                result.line = Some(*line);
+            }
+        }
+        result
+    };
+    (
+        evidence(base_first),
+        type_changed.then(|| evidence(!base_first)),
+    )
+}
+
+// Describe la declaración de cada lado sin presentarla como un fragmento de código literal.
+fn producer_description(change: &ContractChange, base: bool) -> String {
+    match change {
+        ContractChange::EndpointRemoved { endpoint } => {
+            format!("{} {}", endpoint.method.as_str(), endpoint.normalized_path)
+        }
+        ContractChange::ResponseFieldRemoved {
+            field_path,
+            previous_type,
+            ..
+        } => format!("Response field {field_path} ({previous_type})"),
+        ContractChange::ResponseFieldTypeChanged {
+            field_path,
+            previous_type,
+            new_type,
+            ..
+        }
+        | ContractChange::RequestFieldTypeChanged {
+            field_path,
+            previous_type,
+            new_type,
+            ..
+        } => {
+            let ty = if base { previous_type } else { new_type };
+            format!("Field {field_path} ({ty})")
+        }
+        ContractChange::RequestFieldAddedRequired {
+            field_path,
+            field_type,
+            ..
+        } => format!("Required request field {field_path} ({field_type})"),
+        ContractChange::RequiredParameterAdded {
+            location,
+            name,
+            param_type,
+            ..
+        } => format!("Required {location} parameter {name} ({param_type})"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::HttpMethod;
 
+    // Comprueba que los cambios de request apunten al contrato de head.
     #[test]
     fn request_side_changes_map_to_endpoint_consumers_and_head_lines() {
         let mut graph = DependencyGraph::new();
@@ -306,6 +320,8 @@ paths:
                   type: string
 ";
 
+        let head_contract =
+            crate::openapi::extract_contract("customer-service", head_spec).unwrap();
         let post_ep = EndpointId {
             service: "customer-service".into(),
             method: HttpMethod::Post,
@@ -324,8 +340,8 @@ paths:
                 base_rev: "base000",
                 head_rev: "head111",
                 source_file: "openapi.yaml",
-                base_source_raw: "",
-                head_source_raw: head_spec,
+                base_contract: None,
+                head_contract: Some(&head_contract),
                 route_locations: BTreeMap::new(),
                 changes: vec![
                     ContractChange::RequestFieldAddedRequired {
@@ -365,11 +381,22 @@ paths:
             assert_eq!(finding.severity, Severity::High);
             assert_eq!(finding.consumers.len(), 1);
             assert_eq!(finding.consumers[0].repo, "checkout-web");
-            assert!(finding.producer_evidence.line > 1);
+            assert!(finding.producer_evidence.line.unwrap() > 1);
+            assert_eq!(finding.producer_evidence.revision, "head111");
         }
-        assert_eq!(report.findings[0].producer_evidence.line, 14);
-        assert_eq!(report.findings[1].producer_evidence.line, 16);
-        assert_eq!(report.findings[2].producer_evidence.line, 6);
+        assert_eq!(report.findings[0].producer_evidence.line, Some(14));
+        assert_eq!(report.findings[1].producer_evidence.line, Some(16));
+        assert_eq!(report.findings[2].producer_evidence.line, Some(6));
+        assert_eq!(
+            report.findings[1]
+                .producer_evidence_comparison
+                .as_ref()
+                .unwrap()
+                .revision,
+            "base000"
+        );
+        let missing = serde_json::to_value(&report.findings[3].producer_evidence).unwrap();
+        assert!(missing.get("line").is_none());
 
         // Finding 3 targets GET /customers which has 0 consumers -> Severity::Medium
         assert_eq!(report.findings[3].severity, Severity::Medium);

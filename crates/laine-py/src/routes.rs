@@ -29,15 +29,15 @@ pub fn extract_fastapi_routes(
     )
 }
 
-/// Extracts Flask HTTP routes from a Python module.
+/// Extrae las rutas HTTP de Flask de un módulo Python.
 ///
 /// Supports:
 /// - `@app.route("/customers/<int:id>", methods=["GET", "POST"])` (defaults to `GET` when
 ///   `methods` is omitted)
 /// - `@app.get/post/put/patch/delete(...)` (and blueprint variables like `@bp.route(...)`)
 /// - `bp = Blueprint("name", __name__, url_prefix="/api")` (and `flask.Blueprint(...)`)
-/// - `app.register_blueprint(bp, url_prefix="/v1")` (combining `mount_prefix` +
-///   `register_blueprint` prefix + `Blueprint` prefix + route path)
+/// - `app.register_blueprint(bp, url_prefix="/v1")` overrides the `Blueprint` default prefix.
+///   Prefixes from parent blueprints and `mount_prefix` still apply.
 /// - Path parameter normalization (`<int:id>`, `<string:slug>`, `<id>` -> `:id`, `:slug`) via
 ///   [`laine_core::routes::normalize_route_path`]
 /// - Skipping `#` comments and triple-quoted docstrings while preserving exact 1-based line numbers
@@ -83,6 +83,7 @@ pub(crate) struct CallArg {
     pub offset: usize,
 }
 
+// Extrae decoradores y montajes y compone las rutas según el framework.
 fn extract_python_routes(
     service: &str,
     file_path: &str,
@@ -168,7 +169,8 @@ fn extract_python_routes(
 
     let mut routes = Vec::new();
     for dec in decorators {
-        let chains = resolve_prefix_chains(&dec.target, mount_prefix, &router_prefixes, &mounts);
+        let chains =
+            resolve_prefix_chains(&dec.target, mount_prefix, &router_prefixes, &mounts, style);
         let snippet = raw_lines
             .get(dec.line.saturating_sub(1))
             .map(|l| l.trim().to_string())
@@ -355,24 +357,35 @@ fn try_parse_mount_call(
     ))
 }
 
+// Reúne las cadenas de prefijos que llevan a un router o blueprint.
 fn resolve_prefix_chains(
     target: &str,
     mount_prefix: Option<&str>,
     router_prefixes: &BTreeMap<String, String>,
     mounts: &BTreeMap<String, Vec<MountEntry>>,
+    style: PyRouteStyle,
 ) -> Vec<Vec<String>> {
     let mut visited = HashSet::new();
-    resolve_prefix_chains_inner(target, mount_prefix, router_prefixes, mounts, &mut visited)
+    resolve_prefix_chains_inner(
+        target,
+        mount_prefix,
+        router_prefixes,
+        mounts,
+        style,
+        &mut visited,
+    )
 }
 
+// Recorre los montajes padre y aplica la regla de prefijos de cada framework.
 fn resolve_prefix_chains_inner(
     target: &str,
     mount_prefix: Option<&str>,
     router_prefixes: &BTreeMap<String, String>,
     mounts: &BTreeMap<String, Vec<MountEntry>>,
+    style: PyRouteStyle,
     visited: &mut HashSet<String>,
 ) -> Vec<Vec<String>> {
-    let own_prefix = router_prefixes.get(target).cloned();
+    let own_prefix = router_prefixes.get(target);
 
     if !visited.insert(target.to_string()) {
         let mut chain = Vec::new();
@@ -380,7 +393,7 @@ fn resolve_prefix_chains_inner(
             chain.push(mp.to_string());
         }
         if let Some(op) = own_prefix {
-            chain.push(op);
+            chain.push(op.clone());
         }
         return vec![chain];
     }
@@ -393,14 +406,18 @@ fn resolve_prefix_chains_inner(
                 mount_prefix,
                 router_prefixes,
                 mounts,
+                style,
                 visited,
             );
             for mut chain in parent_chains {
-                if let Some(call_prefix) = &entry.prefix {
-                    chain.push(call_prefix.clone());
-                }
-                if let Some(op) = &own_prefix {
-                    chain.push(op.clone());
+                match style {
+                    PyRouteStyle::FastApi => {
+                        chain.extend(entry.prefix.iter().chain(own_prefix).cloned());
+                    }
+                    PyRouteStyle::Flask => {
+                        // Incluso un prefijo vacío sustituye al valor del constructor.
+                        chain.extend(entry.prefix.as_ref().or(own_prefix).cloned());
+                    }
                 }
                 all_chains.push(chain);
             }
@@ -412,7 +429,7 @@ fn resolve_prefix_chains_inner(
             chain.push(mp.to_string());
         }
         if let Some(op) = own_prefix {
-            chain.push(op);
+            chain.push(op.clone());
         }
         vec![chain]
     };
@@ -1015,6 +1032,7 @@ def get_customer(customer_id: str):
         );
     }
 
+    // Verifica que el prefijo del registro sustituye al del constructor del blueprint.
     #[test]
     fn extracts_flask_routes_with_blueprint_converters_methods_and_docstrings() {
         let py = r#"from flask import Blueprint, Flask
@@ -1071,10 +1089,10 @@ app.register_blueprint(bp, url_prefix="/v1")
             summary,
             vec![
                 (HttpMethod::Get, "/health", 12),
-                (HttpMethod::Get, "/v1/api/customers/:id", 16),
-                (HttpMethod::Post, "/v1/api/customers/:id", 16),
-                (HttpMethod::Get, "/v1/api/posts/:slug", 20),
-                (HttpMethod::Delete, "/v1/api/items/:id", 24),
+                (HttpMethod::Get, "/v1/customers/:id", 16),
+                (HttpMethod::Post, "/v1/customers/:id", 16),
+                (HttpMethod::Get, "/v1/posts/:slug", 20),
+                (HttpMethod::Delete, "/v1/items/:id", 24),
                 (HttpMethod::Put, "/settings", 28),
                 (HttpMethod::Patch, "/settings", 32),
             ]
@@ -1110,6 +1128,7 @@ def cafe_handler(cafe_id: int):
         assert_eq!(routes[1].line, 6);
     }
 
+    // Comprueba las reglas de prefijos en routers anidados y en fábricas Flask.
     #[test]
     fn extracts_nested_fastapi_routers_and_flask_app_factory_routes() {
         let fastapi = r#"from fastapi import APIRouter, FastAPI
@@ -1159,8 +1178,40 @@ def create_app():
         assert_eq!(
             summary,
             vec![
-                (HttpMethod::Get, "/api/codes/:code", 7),
-                (HttpMethod::Patch, "/api/codes/:code", 7),
+                (HttpMethod::Get, "/api/:code", 7),
+                (HttpMethod::Patch, "/api/:code", 7),
+            ]
+        );
+    }
+
+    // Verifica el prefijo por defecto y las sustituciones en montajes del mismo blueprint.
+    #[test]
+    fn resolves_default_empty_and_nested_blueprint_prefixes() {
+        let flask = r#"from flask import Blueprint, Flask
+app = Flask(__name__)
+outer = Blueprint("outer", __name__, url_prefix="/outer-default")
+child = Blueprint("child", __name__, url_prefix="/child-default")
+
+@child.get("/x")
+def handler():
+    return {}
+
+outer.register_blueprint(child, url_prefix="/child-override")
+app.register_blueprint(outer, url_prefix="/v2")
+app.register_blueprint(child)
+app.register_blueprint(child, name="child_empty", url_prefix="")
+"#;
+        let routes = extract_flask_routes("service", "app.py", flask, Some("/proxy"));
+        let paths: Vec<_> = routes
+            .iter()
+            .map(|route| route.endpoint.normalized_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/proxy/v2/child-override/x",
+                "/proxy/child-default/x",
+                "/proxy/x"
             ]
         );
     }

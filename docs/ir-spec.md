@@ -155,17 +155,29 @@ Internally tagged enum (`#[serde(tag = "kind", rename_all = "snake_case")]`). Ba
 
 | `kind` | Additional Fields | Producer Evidence Line Source | Matched Consumers |
 |---|---|---|---|
-| `"endpoint_removed"` | `endpoint: EndpointId` | Base spec / route file | All consumers with `Consumes` edge to `endpoint`. |
+| `"endpoint_removed"` | `endpoint: EndpointId` | Base spec / route file | Every caller with a `Consumes` edge to the endpoint. |
 | `"response_field_removed"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string`, `previous_type: string` | Base spec | Consumers with `ReadsField` edge matching `field_path` (or nested child). |
 | `"response_field_type_changed"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string`, `previous_type: string`, `new_type: string` | Base spec | Consumers with `ReadsField` edge matching `field_path` (or nested child). |
 | `"response_field_made_optional"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string` | Head spec with base comparison | Consumers with matching field reads. |
-| `"body_type_changed"` | `endpoint: EndpointId`, `status_code?: string`, `previous_type: string`, `new_type: string` | Base spec for a response, head spec for a request | Callers of the endpoint with `POSSIBLE` confidence. `status_code` is present for responses. |
-| `"request_parameter_type_changed"` | `endpoint: EndpointId`, `location: string`, `name: string`, `previous_type: string`, `new_type: string` | Head spec with base comparison | Callers of the endpoint with `POSSIBLE` confidence. |
-| `"request_field_added_required"` | `endpoint: EndpointId`, `field_path: string`, `field_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |
-| `"request_field_type_changed"` | `endpoint: EndpointId`, `field_path: string`, `previous_type: string`, `new_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |
-| `"required_parameter_added"` | `endpoint: EndpointId`, `location: string`, `name: string`, `param_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |
+| `"body_type_changed"` | `endpoint: EndpointId`, `status_code?: string`, `previous_type: string`, `new_type: string` | Base spec for a response, head spec for a request | Callers with incompatible or unverified request arguments, or possible response consumers. `status_code` is present for responses. |
+| `"request_parameter_type_changed"` | `endpoint: EndpointId`, `location: string`, `name: string`, `previous_type: string`, `new_type: string` | Head spec with base comparison | Endpoint callers with incompatible or unresolved parameter values. |
+| `"request_field_added_required"` | `endpoint: EndpointId`, `field_path: string`, `field_type: string` | Head spec (fallback: base) | Endpoint callers with missing, incompatible, or unresolved arguments. |
+| `"request_field_type_changed"` | `endpoint: EndpointId`, `field_path: string`, `previous_type: string`, `new_type: string` | Head spec (fallback: base) | Endpoint callers with incompatible or unverified field values. |
+| `"required_parameter_added"` | `endpoint: EndpointId`, `location: string`, `name: string`, `param_type: string` | Head spec (fallback: base) | Endpoint callers with missing, incompatible, or unresolved arguments. |
 
 ### 3.7 `AffectedConsumer` & `IndirectConsumer`
+
+For request changes, the consumer's evidence and dependency path identify the argument by
+section and contract name, for example `Incompatible HTTP body argument "customer.tenant"`
+or `Unverified HTTP header argument "X-Mode"`. Root request body changes use `"<root>"`.
+Evidence points to the argument, its enclosing section, or the call site,
+using the most specific available source line.
+Header name matching is case-insensitive. Request values are excluded from evidence.
+
+Direct calls in Vue script blocks use the same argument extraction as TypeScript and JavaScript.
+The cross-file pass tracks response reads. It does not resolve request values passed through
+wrapper parameters. Recognized endpoint calls with unverified arguments remain `POSSIBLE`.
+Opaque values such as a `Headers` instance and ambiguous query collisions also remain unverified.
 
 #### `AffectedConsumer`
 | Field | JSON Type | Description |
@@ -214,8 +226,9 @@ Laine strictly separates **how sure we are** (`Confidence`) from **how severe th
 | `response_field_removed` / `response_field_type_changed` | `>= 1` (AST/scanner field read) | `HIGH` | `CONFIRMED` |
 | `response_field_removed` / `response_field_type_changed` | `>= 1` (TS generic type contract only) | `HIGH` | `LIKELY` |
 | `response_field_removed` / `response_field_type_changed` | `0` | `MEDIUM` | _(none)_ |
-| `request_field_added_required` / `request_field_type_changed` / `required_parameter_added` | `>= 1` (endpoint callers) | `HIGH` | `CONFIRMED` |
-| `request_field_added_required` / `request_field_type_changed` / `required_parameter_added` | `0` | `MEDIUM` | _(none)_ |
+| Request field, body, or parameter change | `>= 1` (static argument proves incompatibility) | `HIGH` | Up to `CONFIRMED` |
+| Request field, body, or parameter change | `>= 1` (argument is unavailable or dynamic) | `HIGH` | `POSSIBLE` |
+| Request field, body, or parameter change | `0` | `MEDIUM` | _(none)_ |
 | Transitive downstream repo (consumer of a direct consumer) | `>= 1` | Inherited from finding | `POSSIBLE` (in `indirect_consumers`) |
 | Unresolvable dynamic HTTP call | N/A | N/A (policy-configurable) | `UNKNOWN` (in `unresolved_calls`) |
 

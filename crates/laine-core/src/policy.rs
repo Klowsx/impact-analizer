@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::PolicyConfig;
 use crate::graph::route_covers;
-use crate::model::{AnalysisReport, ContractChange, EndpointId, HttpMethod};
+use crate::model::{AnalysisReport, EndpointId, HttpMethod};
 use crate::openapi::canonical_route_key;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,7 +24,7 @@ pub fn filter_ignored_findings(report: &mut AnalysisReport, policy: &PolicyConfi
     }
 
     report.findings.retain(|finding| {
-        let endpoint = change_endpoint(&finding.change);
+        let endpoint = finding.change.endpoint();
         !policy
             .ignore_endpoints
             .iter()
@@ -78,17 +78,6 @@ pub fn evaluate_policy(report: &AnalysisReport, policy: &PolicyConfig) -> Policy
     }
 }
 
-fn change_endpoint(change: &ContractChange) -> &EndpointId {
-    match change {
-        ContractChange::EndpointRemoved { endpoint }
-        | ContractChange::ResponseFieldRemoved { endpoint, .. }
-        | ContractChange::ResponseFieldTypeChanged { endpoint, .. }
-        | ContractChange::RequestFieldAddedRequired { endpoint, .. }
-        | ContractChange::RequestFieldTypeChanged { endpoint, .. }
-        | ContractChange::RequiredParameterAdded { endpoint, .. } => endpoint,
-    }
-}
-
 // Aplica el método y el patrón configurado sin expandir un literal por la ruta del contrato.
 fn endpoint_matches_ignore_pattern(endpoint: &EndpointId, raw_pattern: &str) -> bool {
     let trimmed = raw_pattern.trim();
@@ -123,6 +112,7 @@ fn endpoint_matches_ignore_pattern(endpoint: &EndpointId, raw_pattern: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ContractChange;
     use crate::model::{
         AnalysisStats, Confidence, Evidence, ImpactFinding, ProducerEvidence, Severity,
         UnresolvedCall,
@@ -163,6 +153,11 @@ mod tests {
             schema_version: 1,
             target_repo: "customer-service".into(),
             policy: None,
+            coverage: None,
+            diagnostics: Vec::new(),
+            exit_code: None,
+            workspace: None,
+            consumer_revisions: Default::default(),
             base_rev: "base".into(),
             head_rev: "head".into(),
             stats: AnalysisStats::default(),

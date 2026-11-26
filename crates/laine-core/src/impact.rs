@@ -12,7 +12,8 @@ pub struct ImpactInput<'a> {
     pub target_repo: &'a str,
     pub base_rev: &'a str,
     pub head_rev: &'a str,
-    pub source_file: &'a str,
+    pub base_source_file: &'a str,
+    pub head_source_file: &'a str,
     pub base_contract: Option<&'a ApiContract>,
     pub head_contract: Option<&'a ApiContract>,
     /// Optional exact `(file, line)` source locations for code-extracted routes keyed by
@@ -66,6 +67,11 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
                 endpoint,
                 field_path,
                 ..
+            }
+            | ContractChange::ResponseFieldMadeOptional {
+                endpoint,
+                field_path,
+                ..
             } => {
                 let hits = graph.consumers_of_field(
                     &endpoint.service,
@@ -113,6 +119,16 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
                         }
                     })
                     .collect::<Vec<_>>()
+            }
+            ContractChange::RequestParameterTypeChanged { .. }
+            | ContractChange::BodyTypeChanged { .. } => {
+                consumers_for_endpoint(graph, change.endpoint())
+                    .into_iter()
+                    .map(|mut consumer| {
+                        consumer.confidence = consumer.confidence.min(Confidence::Possible);
+                        consumer
+                    })
+                    .collect()
             }
             _ => consumers_for_endpoint(graph, change.endpoint()),
         };
@@ -179,6 +195,11 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
         base_rev: input.base_rev.to_string(),
         head_rev: input.head_rev.to_string(),
         policy: None,
+        coverage: None,
+        diagnostics: Vec::new(),
+        exit_code: None,
+        workspace: None,
+        consumer_revisions: BTreeMap::new(),
         stats: input.stats,
         findings,
         unresolved_calls,
@@ -195,24 +216,40 @@ fn producer_sources(
         change,
         ContractChange::EndpointRemoved { .. } | ContractChange::ResponseFieldRemoved { .. }
     );
-    let response_type = matches!(change, ContractChange::ResponseFieldTypeChanged { .. });
-    let type_changed =
-        response_type || matches!(change, ContractChange::RequestFieldTypeChanged { .. });
+    let response_type = matches!(
+        change,
+        ContractChange::ResponseFieldTypeChanged { .. }
+            | ContractChange::BodyTypeChanged {
+                status_code: Some(_),
+                ..
+            }
+    );
+    let type_changed = response_type
+        || matches!(
+            change,
+            ContractChange::RequestFieldTypeChanged { .. }
+                | ContractChange::RequestParameterTypeChanged { .. }
+                | ContractChange::BodyTypeChanged { .. }
+                | ContractChange::ResponseFieldMadeOptional { .. }
+        );
     let base_first = removed || response_type;
     let evidence = |base| {
-        let (contract, revision) = if base {
-            (input.base_contract, input.base_rev)
+        let (contract, revision, file) = if base {
+            (input.base_contract, input.base_rev, input.base_source_file)
         } else {
-            (input.head_contract, input.head_rev)
+            (input.head_contract, input.head_rev, input.head_source_file)
         };
         let mut result = ProducerEvidence {
             repo: input.target_repo.to_string(),
             revision: revision.to_owned(),
-            file: input.source_file.to_owned(),
+            file: file.to_owned(),
             description: producer_description(change, base),
             ..ProducerEvidence::default()
         };
         if let Some(source) = contract.and_then(|contract| contract.source_for_change(change)) {
+            if !source.file.is_empty() {
+                result.file.clone_from(&source.file);
+            }
             result.json_pointer = Some(source.pointer.clone());
             result.span = source.span.clone();
             result.line = source.span.as_ref().map(|span| span.line);
@@ -261,6 +298,34 @@ fn producer_description(change: &ContractChange, base: bool) -> String {
         } => {
             let ty = if base { previous_type } else { new_type };
             format!("Field {field_path} ({ty})")
+        }
+        ContractChange::ResponseFieldMadeOptional { field_path, .. } => {
+            let presence = if base { "required" } else { "optional" };
+            format!("Response field {field_path} ({presence})")
+        }
+        ContractChange::BodyTypeChanged {
+            status_code,
+            previous_type,
+            new_type,
+            ..
+        } => {
+            let ty = if base { previous_type } else { new_type };
+            let body = if status_code.is_some() {
+                "Response"
+            } else {
+                "Request"
+            };
+            format!("{body} body ({ty})")
+        }
+        ContractChange::RequestParameterTypeChanged {
+            location,
+            name,
+            previous_type,
+            new_type,
+            ..
+        } => {
+            let ty = if base { previous_type } else { new_type };
+            format!("{location} parameter {name} ({ty})")
         }
         ContractChange::RequestFieldAddedRequired {
             field_path,
@@ -339,7 +404,8 @@ paths:
                 target_repo: "customer-service",
                 base_rev: "base000",
                 head_rev: "head111",
-                source_file: "openapi.yaml",
+                base_source_file: "openapi.yaml",
+                head_source_file: "openapi.yaml",
                 base_contract: None,
                 head_contract: Some(&head_contract),
                 route_locations: BTreeMap::new(),

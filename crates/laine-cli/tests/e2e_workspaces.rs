@@ -509,3 +509,78 @@ fn workspace_edit_and_repo_add_remove_update_registered_workspace() {
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+// Comprueba que los procesos concurrentes conservan todas las altas y que reemplazar exige una opción.
+#[test]
+fn serializes_workspace_updates_and_requires_explicit_replacement() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-lock-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let state = tmp.join("state");
+    let config = tmp.join("laine.toml");
+    let replacement = tmp.join("replacement.toml");
+    let left = tmp.join("left");
+    let right = tmp.join("right");
+    init_repo(&left);
+    init_repo(&right);
+    let cli = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_laine"));
+        cmd.env("LAINE_HOME", &state).current_dir(&tmp);
+        cmd
+    };
+
+    let lock = laine_core::config::lock_config_update(&config).unwrap();
+    let mut left_process = cli().args(["repo", "add", "left"]).spawn().unwrap();
+    let mut right_process = cli().args(["repo", "add", "right"]).spawn().unwrap();
+    drop(lock);
+    assert!(left_process.wait().unwrap().success());
+    assert!(right_process.wait().unwrap().success());
+    let stored = WorkspaceConfig::load_from_path(&config).unwrap();
+    assert!(stored.find_service("left").is_some());
+    assert!(stored.find_service("right").is_some());
+
+    fs::copy(&config, &replacement).unwrap();
+    let mut first = cli()
+        .args(["workspace", "add", "left", "laine.toml"])
+        .spawn()
+        .unwrap();
+    let mut second = cli()
+        .args(["workspace", "add", "right", "laine.toml"])
+        .spawn()
+        .unwrap();
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+
+    let duplicate = cli()
+        .args(["workspace", "add", "left", "replacement.toml"])
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("--replace"));
+    assert!(
+        cli()
+            .args(["workspace", "add", "left", "replacement.toml", "--replace"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let invalid = cli()
+        .args(["init", "unused.toml", "--workspace", "../outside"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(!tmp.join("unused.toml").exists());
+
+    let registry =
+        laine_core::workspace::WorkspaceRegistry::load_from_path(&state.join("workspaces.toml"))
+            .unwrap();
+    assert_eq!(
+        registry.workspaces["left"],
+        laine_core::workspace::normalize_absolute_path(&replacement)
+    );
+    assert_eq!(
+        registry.workspaces["right"],
+        laine_core::workspace::normalize_absolute_path(&config)
+    );
+    fs::remove_dir_all(&tmp).unwrap();
+}

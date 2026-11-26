@@ -1,10 +1,32 @@
+use oxc_span::SourceType;
+
 /// An extracted `<script>` block from a Vue Single File Component (`.vue`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VueScriptBlock {
     /// Script source with leading `\n` padding so 1-based line numbers match the original `.vue` file.
     pub code: String,
-    /// `true` when the opening `<script>` tag specifies `lang="ts"` / `lang="tsx"` (single or double quotes).
-    pub is_ts: bool,
+    pub lang: VueScriptLang,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VueScriptLang {
+    #[default]
+    Js,
+    Jsx,
+    Ts,
+    Tsx,
+}
+
+impl VueScriptLang {
+    // Selecciona el mismo modo de parser para todos los extractores.
+    pub(crate) fn source_type(self) -> SourceType {
+        match self {
+            Self::Js => SourceType::mjs(),
+            Self::Jsx => SourceType::jsx().with_module(true),
+            Self::Ts => SourceType::ts().with_module(true),
+            Self::Tsx => SourceType::tsx().with_module(true),
+        }
+    }
 }
 
 /// A JavaScript/TypeScript expression extracted from a Vue Single File Component `<template>` block.
@@ -28,6 +50,7 @@ pub fn extract_vue_scripts(source: &str) -> Vec<VueScriptBlock> {
 
 /// Extracts every `<script ...>...</script>` block along with a flag indicating
 /// whether the opening `<script>` tag includes the `setup` attribute.
+// Conserva el lenguaje y la posición original de cada bloque de script.
 pub(crate) fn extract_vue_scripts_with_setup(source: &str) -> Vec<(VueScriptBlock, bool)> {
     let lower = source.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -63,7 +86,7 @@ pub(crate) fn extract_vue_scripts_with_setup(source: &str) -> Vec<(VueScriptBloc
                 continue;
             }
 
-            let (is_ts, is_setup) = parse_script_tag_attrs(attrs);
+            let (lang, is_setup) = parse_script_tag_attrs(attrs);
             let body_start = tag_end + 1;
             let Some((body_end, after_close)) = find_closing_tag(&lower, "</script", body_start)
             else {
@@ -79,7 +102,7 @@ pub(crate) fn extract_vue_scripts_with_setup(source: &str) -> Vec<(VueScriptBloc
             }
             code.push_str(body);
 
-            blocks.push((VueScriptBlock { code, is_ts }, is_setup));
+            blocks.push((VueScriptBlock { code, lang }, is_setup));
             cursor = after_close;
             continue;
         }
@@ -589,10 +612,11 @@ fn find_closing_tag(lower: &str, close_tag: &str, start: usize) -> Option<(usize
     None
 }
 
-fn parse_script_tag_attrs(attrs: &str) -> (bool, bool) {
+// Distingue JS, JSX, TS y TSX en la etiqueta de apertura.
+fn parse_script_tag_attrs(attrs: &str) -> (VueScriptLang, bool) {
     let bytes = attrs.as_bytes();
     let mut i = 0;
-    let mut is_ts = false;
+    let mut lang = VueScriptLang::Js;
     let mut is_setup = false;
 
     while i < bytes.len() {
@@ -650,12 +674,17 @@ fn parse_script_tag_attrs(attrs: &str) -> (bool, bool) {
             };
 
             if name == "lang" {
-                is_ts = matches!(value.trim(), "ts" | "tsx");
+                lang = match value.trim() {
+                    "jsx" => VueScriptLang::Jsx,
+                    "ts" => VueScriptLang::Ts,
+                    "tsx" => VueScriptLang::Tsx,
+                    _ => VueScriptLang::Js,
+                };
             }
         }
     }
 
-    (is_ts, is_setup)
+    (lang, is_setup)
 }
 
 #[cfg(test)]
@@ -684,7 +713,7 @@ mod tests {
         let sfc = "<template>\n  <div>{{ label }}</div>\n</template>\n\n<script setup lang=\"ts\">\nconst label = 'hello';\nconst count: number = 42;\n</script>\n";
         let blocks = extract_vue_scripts(sfc);
         assert_eq!(blocks.len(), 1);
-        assert!(blocks[0].is_ts);
+        assert_eq!(blocks[0].lang, VueScriptLang::Ts);
 
         let lines: Vec<&str> = blocks[0].code.lines().collect();
         // Lines 1..=5 are empty (template + blank + opening `<script>` line), line 6 is `const label = 'hello';`.
@@ -692,6 +721,7 @@ mod tests {
         assert_eq!(lines[6], "const count: number = 42;");
     }
 
+    // Verifica que el extractor conserve el lenguaje de bloques mezclados.
     #[test]
     fn detects_ts_and_js_script_variants_and_multiple_blocks() {
         let sfc = r#"
@@ -706,8 +736,28 @@ const ok: boolean = true;
 "#;
         let blocks = extract_vue_scripts(sfc);
         assert_eq!(blocks.len(), 2);
-        assert!(!blocks[0].is_ts);
-        assert!(blocks[1].is_ts);
+        assert_eq!(blocks[0].lang, VueScriptLang::Js);
+        assert_eq!(blocks[1].lang, VueScriptLang::Tsx);
+    }
+
+    // Comprueba que TSX conserve llamadas, lecturas y tipos en las distintas pasadas.
+    #[test]
+    fn extracts_calls_types_and_zod_from_vue_tsx_blocks() {
+        let source = r#"<script setup lang="tsx">
+interface User { fullName: string }
+const UserSchema = z.object({ fullName: z.string() });
+const response = await fetch('http://customer-service/users');
+const user = (await response.json()) as User;
+const view = <div>{user.fullName}</div>;
+</script>"#;
+        let extracted = extract_file("User.vue", source, &customer_services()).unwrap();
+        assert_eq!(extracted.calls[0].line, 4);
+        assert_eq!(extracted.field_reads[0].field_path, "fullName");
+        assert_eq!(extracted.field_reads[0].line, 6);
+        let types = crate::types::extract_type_definitions("User.vue", source).unwrap();
+        assert!(types.iter().any(|ty| ty.name == "User"));
+        let schemas = crate::zod::extract_zod_schemas("User.vue", source).unwrap();
+        assert!(schemas.iter().any(|schema| schema.name == "UserSchema"));
     }
 
     #[test]

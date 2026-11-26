@@ -8,6 +8,157 @@ use laine_core::config::WorkspaceConfig;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::model::Severity;
 
+// Comprueba la ubicación del caché por defecto y el análisis cuando SQLite no está disponible.
+#[test]
+fn stores_default_cache_in_user_state_and_falls_back_when_unavailable() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-cache-state-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let paths = create_demo_workspace(&tmp.join("workspace")).unwrap();
+    let state = tmp.join("state");
+    let bin = env!("CARGO_BIN_EXE_laine");
+    let index = || {
+        Command::new(bin)
+            .env("LAINE_HOME", &state)
+            .args(["index", "--config"])
+            .arg(&paths.config_path)
+            .output()
+            .unwrap()
+    };
+    assert!(index().status.success());
+    assert!(!paths.root.join(".laine-cache.db").exists());
+    let caches = fs::read_dir(state.join("cache"))
+        .unwrap()
+        .collect::<std::io::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(caches.len(), 1);
+    assert_eq!(caches[0].path().extension().unwrap(), "sqlite3");
+
+    let invalid = tmp.join("unavailable-cache");
+    fs::create_dir(&invalid).unwrap();
+    let mut config = WorkspaceConfig::load_from_path(&paths.config_path).unwrap();
+    config.cache_path = Some(invalid);
+    config.save_to_path(&paths.config_path).unwrap();
+    let analyze = |no_cache| {
+        let mut command = Command::new(bin);
+        command
+            .env("LAINE_HOME", &state)
+            .args(["analyze", "--config"])
+            .arg(&paths.config_path)
+            .args([
+                "--repo",
+                "customer-service",
+                "--base",
+                "main",
+                "--head",
+                "main",
+                "--format=json",
+            ]);
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(0));
+        output.stdout
+    };
+    assert_eq!(analyze(false), analyze(true));
+    assert_eq!(index().status.code(), Some(1));
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
+// Verifica que stdout JSON sea consumible tanto para resultados como para errores.
+#[test]
+fn reports_exit_codes_errors_and_optional_workspace_roots_in_json() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-json-contract-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let paths = create_demo_workspace(&tmp).unwrap();
+    let bin = env!("CARGO_BIN_EXE_laine");
+    let mut workspace_id = String::new();
+
+    for (head, expected, local_roots) in
+        [("main", 0, false), ("feature/split-customer-name", 2, true)]
+    {
+        let mut process = Command::new(bin);
+        process
+            .args(["analyze", "--config"])
+            .arg(&paths.config_path)
+            .args([
+                "--repo",
+                "customer-service",
+                "--base",
+                "main",
+                "--head",
+                head,
+                "--format=json",
+            ]);
+        if local_roots {
+            process.arg("--include-repo-roots");
+        }
+        let output = process.output().unwrap();
+        assert_eq!(output.status.code(), Some(expected));
+        assert!(output.stderr.is_empty());
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["exit_code"], expected);
+        assert_eq!(report["policy"]["exit_code"], expected);
+        assert_eq!(report["coverage"]["complete"], true);
+        let id = report["workspace"]["id"].as_str().unwrap();
+        if local_roots {
+            assert_eq!(id, workspace_id);
+            let producer = report["workspace"]["repo_roots"]["customer-service"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                fs::canonicalize(producer).unwrap(),
+                fs::canonicalize(&paths.customer_service).unwrap()
+            );
+        } else {
+            assert_eq!(id.len(), 16);
+            assert!(report["workspace"].get("repo_roots").is_none());
+            workspace_id = id.to_owned();
+        }
+    }
+
+    let usage = Command::new(bin)
+        .args(["analyze", "--format", "json"])
+        .output()
+        .unwrap();
+    assert_eq!(usage.status.code(), Some(64));
+    assert!(usage.stderr.is_empty());
+    let report: serde_json::Value = serde_json::from_slice(&usage.stdout).unwrap();
+    assert_eq!(report["status"], "error");
+    assert_eq!(report["exit_code"], 64);
+    assert_eq!(report["diagnostics"][0]["code"], "invalid_arguments");
+    assert_eq!(
+        report["diagnostics"][0]["remediation"],
+        "check_command_help"
+    );
+
+    let malformed = tmp.join("invalid.toml");
+    fs::write(&malformed, "FICTITIOUS_CONFIG = [ @").unwrap();
+    for command in ["analyze", "check"] {
+        let result = Command::new(bin)
+            .args([command, "--config"])
+            .arg(&malformed)
+            .env("LAINE_HOME", tmp.join("laine-home"))
+            .args(["--repo", "customer-service", "--format=json"])
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert!(result.stderr.is_empty());
+        let text = String::from_utf8(result.stdout).unwrap();
+        assert!(!text.contains("FICTITIOUS_CONFIG"));
+        let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["status"], "error");
+        assert_eq!(report["exit_code"], 1);
+        assert_eq!(report["diagnostics"][0]["code"], "invalid_config_syntax");
+        assert_eq!(
+            report["diagnostics"][0]["remediation"],
+            "repair_workspace_toml"
+        );
+    }
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
 // Verifica que dos productores con la misma URL den el mismo diagnóstico en cualquier orden.
 #[test]
 fn reports_ambiguous_service_urls_consistently_with_and_without_cache() {
@@ -86,11 +237,15 @@ fn reports_ambiguous_service_urls_consistently_with_and_without_cache() {
     fs::remove_dir_all(&tmp).unwrap();
 }
 
+// Verifica el caché explícito y la equivalencia de las salidas caliente y sin caché.
 #[test]
 fn index_workspace_populates_sqlite_cache_and_matches_uncached_json_byte_for_byte() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-cache-{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp);
     let paths = create_demo_workspace(&tmp).expect("demo workspace should generate");
+    let mut config = WorkspaceConfig::load_from_path(&paths.config_path).unwrap();
+    config.cache_path = Some(".laine-cache.db".into());
+    config.save_to_path(&paths.config_path).unwrap();
 
     // Run 1: cold cache -> all 4 repos are cache misses and .laine-cache.db is created
     let summary_1 = index_workspace(&paths.config_path).expect("first index run should succeed");
@@ -300,6 +455,7 @@ fn preserves_located_evidence_without_exporting_credentials() {
     let _ = fs::remove_dir_all(&tmp);
     let paths = create_demo_workspace(&tmp).expect("demo workspace should generate");
     let mut config = WorkspaceConfig::load_from_path(&paths.config_path).unwrap();
+    config.cache_path = Some(".laine-cache.db".into());
     config.services[0].base_urls = vec![
         "https://user:FICTITIOUS_PASSWORD@api.example:8443/v1?sig=FICTITIOUS_SIGNATURE#FICTITIOUS_FRAGMENT".into(),
     ];

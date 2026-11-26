@@ -1,25 +1,30 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use laine_core::cache::{IndexCache, compute_config_hash};
+use clap::ValueEnum;
+use laine_core::cache::{IndexCache, compute_config_hash, stable_fingerprint};
 use laine_core::config::{RouteFramework, RouteSourceConfig, WorkspaceConfig};
 use laine_core::error::{LaineError, Result};
-use laine_core::git::GitRepo;
+use laine_core::git::{GitRepo, STAGED_REV, WORKTREE_REV};
 use laine_core::graph::DependencyGraph;
 use laine_core::impact::{ImpactInput, analyze_impact};
-use laine_core::laravel::extract_laravel_routes;
+use laine_core::laravel::analyze_laravel_routes;
 use laine_core::model::{
-    AnalysisReport, AnalysisStats, Confidence, ContractChange, ContractDiscrepancy, Evidence,
-    HttpMethod, UnresolvedCall,
+    AnalysisCoverage, AnalysisReport, AnalysisStats, Confidence, ContractChange,
+    ContractDiscrepancy, Evidence, ExtractionDiagnostic, ExtractionFailure, ExtractionStage,
+    FileCoverage, HttpMethod, UnresolvedCall, WorkspaceIdentity,
 };
-use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
+use laine_core::openapi::{
+    OpenApiExtraction, canonical_route_key, diff_contracts, extract_contract_with_references,
+};
 use laine_core::policy::{evaluate_policy, filter_ignored_findings};
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
+use laine_core::workspace::{WorkspaceRegistry, normalize_absolute_path};
 use laine_py::{
     PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
 };
 use laine_ts::{
-    ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow,
+    ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow_with_limits,
     extract_express_routes, extract_file_with_context, extract_type_definitions,
     extract_zod_schemas, resolve_type_fields,
 };
@@ -32,6 +37,25 @@ pub struct AnalyzeRequest {
     pub target_repo: String,
     pub base_rev: String,
     pub head_rev: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum ConsumerRevision {
+    #[default]
+    Head,
+    Staged,
+    Worktree,
+}
+
+impl ConsumerRevision {
+    // Convierte la opción CLI a la revisión de Git o al nombre del snapshot local.
+    fn git_revision(self) -> &'static str {
+        match self {
+            Self::Head => "HEAD",
+            Self::Staged => STAGED_REV,
+            Self::Worktree => WORKTREE_REV,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,10 +99,114 @@ struct CachedUnresolvedCall {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 struct CachedConsumerRepo {
-    files_analyzed: usize,
+    extraction: FileExtraction,
     consumes: Vec<CachedConsumeEdge>,
     field_reads: Vec<CachedFieldReadEdge>,
     unresolved_calls: Vec<CachedUnresolvedCall>,
+}
+
+struct ConsumerInputs {
+    all_files: Vec<String>,
+    candidates: Vec<String>,
+    configs: BTreeMap<String, String>,
+    sources: BTreeMap<String, String>,
+}
+
+impl ConsumerInputs {
+    // Identifica un snapshot mutable por los archivos y contenidos usados para extraerlo.
+    fn cache_key(&self, revision: &str) -> Result<String> {
+        let sources = self
+            .all_files
+            .iter()
+            .map(|path| {
+                let contents = self.sources.get(path).or_else(|| self.configs.get(path));
+                (
+                    path,
+                    contents.map(|text| stable_fingerprint(text.as_bytes())),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bytes =
+            serde_json::to_vec(&sources).map_err(|err| LaineError::Cache(err.to_string()))?;
+        Ok(format!("{revision}:{}", stable_fingerprint(&bytes)))
+    }
+}
+
+struct OpenApiSnapshot {
+    file: String,
+    contents: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct FileExtraction {
+    coverage: FileCoverage,
+    failures: BTreeMap<String, ExtractionFailure>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    failure_lines: BTreeMap<String, Vec<usize>>,
+}
+
+impl FileExtraction {
+    // Cuenta los candidatos y detecta cuáles no llegaron de la lectura por lotes.
+    fn from_reads(files: &[String], contents: &BTreeMap<String, String>) -> Self {
+        let failures = files
+            .iter()
+            .filter(|file| !contents.contains_key(*file))
+            .map(|file| (file.clone(), ExtractionFailure::FileReadFailed))
+            .collect::<BTreeMap<_, _>>();
+        let read = contents.len();
+        Self {
+            coverage: FileCoverage {
+                discovered: files.len(),
+                read,
+                analyzed: read,
+                failed: failures.len(),
+            },
+            failures,
+            failure_lines: BTreeMap::new(),
+        }
+    }
+
+    // Descuenta un archivo que se pudo leer, pero cuya extracción falló.
+    fn record_parse_failure(&mut self, file: &str) {
+        self.record_incomplete(file, ExtractionFailure::FileParseFailed);
+    }
+
+    // Descuenta la cobertura de un archivo cuando se perdió parte de su evidencia.
+    fn record_incomplete(&mut self, file: &str, code: ExtractionFailure) {
+        if self.failures.insert(file.to_owned(), code).is_none() {
+            self.coverage.analyzed -= 1;
+            self.coverage.failed += 1;
+        }
+    }
+
+    // Añade el contexto de repositorio y revisión a fallos portables que también se cachean.
+    fn append_diagnostics(
+        &self,
+        diagnostics: &mut Vec<ExtractionDiagnostic>,
+        repo: &str,
+        revision: &str,
+        stage: ExtractionStage,
+    ) {
+        for (file, code) in &self.failures {
+            let lines = self.failure_lines.get(file);
+            let positions = lines
+                .into_iter()
+                .flatten()
+                .copied()
+                .map(Some)
+                .chain(lines.is_none().then_some(None));
+            diagnostics.extend(positions.map(|line| ExtractionDiagnostic {
+                repo: repo.to_owned(),
+                revision: revision.to_owned(),
+                file: file.clone(),
+                stage,
+                code: *code,
+                line,
+                json_pointer: None,
+                remediation: code.remediation().to_owned(),
+            }));
+        }
+    }
 }
 
 /// Runs a full cross-repository impact analysis without mutating any repository's working tree,
@@ -96,8 +224,27 @@ pub fn run_analysis(req: &AnalyzeRequest) -> Result<AnalysisReport> {
 ///
 /// When `no_cache` is `false`, per-repository consumer AST extractions are served from and
 /// persisted to the SQLite incremental cache keyed by `(repo, commit_sha, config_hash, schema_version)`.
-// Analiza dos snapshots del productor, conserva la evidencia y evalúa la política.
+// Ejecuta el análisis portable sin incluir rutas absolutas de los checkouts.
 pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result<AnalysisReport> {
+    run_analysis_with_local_paths(req, no_cache, false)
+}
+
+// Conserva la revisión HEAD de los consumidores al pedir solo el mapa local.
+pub fn run_analysis_with_local_paths(
+    req: &AnalyzeRequest,
+    no_cache: bool,
+    include_repo_roots: bool,
+) -> Result<AnalysisReport> {
+    run_analysis_with_consumer_revision(req, no_cache, include_repo_roots, ConsumerRevision::Head)
+}
+
+// Analiza los snapshots elegidos y reconstruye la extracción si el caché falla.
+pub fn run_analysis_with_consumer_revision(
+    req: &AnalyzeRequest,
+    no_cache: bool,
+    include_repo_roots: bool,
+    consumer_revision: ConsumerRevision,
+) -> Result<AnalysisReport> {
     let config = WorkspaceConfig::load_from_path(&req.config_path)?;
     let config_dir = config_directory(&req.config_path);
 
@@ -148,22 +295,54 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     graph.add_repository(&target_service.name);
 
     let mut files_analyzed = 0usize;
+    let mut producer_base = FileCoverage::default();
+    let mut producer_head = FileCoverage::default();
+    let mut consumers = FileCoverage::default();
+    let mut diagnostics = Vec::new();
     let mut contract_changes: Vec<ContractChange> = Vec::new();
     let mut discrepancies: Vec<ContractDiscrepancy> = Vec::new();
     let mut route_locations: BTreeMap<(String, HttpMethod, String), (String, usize)> =
         BTreeMap::new();
-    let mut source_file_display = String::new();
+    let mut base_source_file = String::new();
+    let mut head_source_file = String::new();
 
     // 1. Optional OpenAPI producer contract analysis
     let mut head_openapi_contract = None;
     let mut base_openapi_contract = None;
+    let mut head_openapi_complete = true;
     if let Some(openapi_rel) = target_service.openapi.as_deref() {
-        let base_raw = producer_git.read_file(&base_sha, openapi_rel)?;
-        let head_raw = producer_git.read_file(&head_sha, openapi_rel)?;
-        files_analyzed += 1;
-
-        let base_contract = extract_contract(&target_service.name, &base_raw)?;
-        let head_contract = extract_contract(&target_service.name, &head_raw)?;
+        let (base_document, head_document) =
+            read_openapi_snapshots(&producer_git, &base_sha, &head_sha, openapi_rel)?;
+        let before = extract_contract_with_references(
+            &target_service.name,
+            &base_document.file,
+            &base_document.contents,
+            |path| producer_git.read_file(&base_sha, Path::new(path)).ok(),
+        )?;
+        let after = extract_contract_with_references(
+            &target_service.name,
+            &head_document.file,
+            &head_document.contents,
+            |path| producer_git.read_file(&head_sha, Path::new(path)).ok(),
+        )?;
+        producer_base = record_openapi_coverage(
+            &before,
+            &mut diagnostics,
+            &target_service.name,
+            &base_sha,
+            ExtractionStage::ProducerBase,
+        );
+        producer_head = record_openapi_coverage(
+            &after,
+            &mut diagnostics,
+            &target_service.name,
+            &head_sha,
+            ExtractionStage::ProducerHead,
+        );
+        files_analyzed += producer_base.analyzed;
+        head_openapi_complete = after.diagnostics.is_empty();
+        let base_contract = before.contract;
+        let head_contract = after.contract;
         contract_changes.extend(diff_contracts(&base_contract, &head_contract));
 
         for (endpoint_id, endpoint) in &base_contract.endpoints {
@@ -184,18 +363,33 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
             }
         }
 
-        source_file_display = openapi_rel.to_string_lossy().replace('\\', "/");
+        base_source_file = base_document.file;
+        head_source_file = head_document.file;
         base_openapi_contract = Some(base_contract);
         head_openapi_contract = Some(head_contract);
     }
 
     // 2. Optional code-based producer route extraction (Express / Laravel / FastAPI / Flask)
     if let Some(route_cfg) = target_service.routes.as_ref() {
-        let (base_routes, base_files_count) =
+        let (base_routes, base_extraction) =
             extract_producer_routes(&producer_git, &target_service.name, &base_sha, route_cfg)?;
-        let (head_routes, _) =
+        let (head_routes, head_extraction) =
             extract_producer_routes(&producer_git, &target_service.name, &head_sha, route_cfg)?;
-        files_analyzed += base_files_count;
+        files_analyzed += base_extraction.coverage.analyzed;
+        producer_base.accumulate(base_extraction.coverage);
+        producer_head.accumulate(head_extraction.coverage);
+        base_extraction.append_diagnostics(
+            &mut diagnostics,
+            &target_service.name,
+            &base_sha,
+            ExtractionStage::ProducerBase,
+        );
+        head_extraction.append_diagnostics(
+            &mut diagnostics,
+            &target_service.name,
+            &head_sha,
+            ExtractionStage::ProducerHead,
+        );
 
         for route in &base_routes {
             graph.add_endpoint(
@@ -212,7 +406,13 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
                 .or_insert_with(|| (route.file.clone(), route.line));
         }
 
-        let route_changes = diff_routes(&base_routes, &head_routes);
+        // Con rutas incompletas no hay evidencia suficiente para afirmar que se eliminó un montaje.
+        let complete = base_extraction.coverage.failed == 0 && head_extraction.coverage.failed == 0;
+        let route_changes = if complete {
+            diff_routes(&base_routes, &head_routes)
+        } else {
+            Vec::new()
+        };
         let existing_removed: HashSet<_> = contract_changes
             .iter()
             .filter_map(|c| match c {
@@ -238,7 +438,10 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
             }
         }
 
-        if let Some(head_openapi) = head_openapi_contract.as_ref() {
+        if head_extraction.coverage.failed == 0
+            && head_openapi_complete
+            && let Some(head_openapi) = head_openapi_contract.as_ref()
+        {
             discrepancies = detect_openapi_discrepancies(head_openapi, &head_routes);
         }
     }
@@ -248,43 +451,59 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     let cache = if no_cache {
         None
     } else {
-        let cache_path = resolve_cache_path(config_dir, config.cache_path.as_deref());
-        Some(IndexCache::open(&cache_path)?)
+        resolve_cache_path(&req.config_path, config.cache_path.as_deref())
+            .and_then(|path| IndexCache::open(&path))
+            .ok()
     };
 
     let mut unresolved_calls = Vec::new();
+    let mut consumer_revisions = BTreeMap::new();
     for service in &config.services {
-        if service.name == target_service.name {
-            continue;
-        }
-
         graph.add_repository(&service.name);
         let consumer_path = resolve_repo_path(config_dir, &service.path);
         let consumer_git = GitRepo::new(&consumer_path);
-        let consumer_rev = consumer_git.resolve_revision("HEAD")?;
-
-        let cached_snapshot = if let Some(cache_db) = cache.as_ref() {
-            match cache_db.get_repo_snapshot(&service.name, &consumer_rev, &config_hash)? {
-                Some(raw_json) => serde_json::from_str::<CachedConsumerRepo>(&raw_json).ok(),
-                None => None,
-            }
+        let consumer_rev = consumer_git.resolve_revision(consumer_revision.git_revision())?;
+        consumer_revisions.insert(service.name.clone(), consumer_rev.clone());
+        let mutable_inputs =
+            if cache.is_some() && !matches!(consumer_revision, ConsumerRevision::Head) {
+                Some(load_consumer_inputs(&consumer_git, &consumer_rev)?)
+            } else {
+                None
+            };
+        let cache_key = if let Some(inputs) = &mutable_inputs {
+            inputs.cache_key(&consumer_rev)?
         } else {
-            None
+            consumer_rev.clone()
         };
+
+        let cached_snapshot = cache
+            .as_ref()
+            .and_then(|cache_db| {
+                cache_db
+                    .get_repo_snapshot(&service.name, &cache_key, &config_hash)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|raw| serde_json::from_str::<CachedConsumerRepo>(&raw).ok());
 
         let snapshot = match cached_snapshot {
             Some(hit) => hit,
             None => {
-                let extracted = extract_consumer_repo(&consumer_git, &consumer_rev, &config)?;
-                if let Some(cache_db) = cache.as_ref() {
-                    let payload = serde_json::to_string(&extracted)
-                        .map_err(|err| LaineError::Cache(err.to_string()))?;
-                    cache_db.put_repo_snapshot(
+                let inputs = match mutable_inputs {
+                    Some(inputs) => inputs,
+                    None => load_consumer_inputs(&consumer_git, &consumer_rev)?,
+                };
+                let extracted = extract_consumer_repo(inputs, &config);
+                if let Some(cache_db) = cache.as_ref()
+                    && let Ok(payload) = serde_json::to_string(&extracted)
+                {
+                    // Los resultados se pueden usar aunque solo falle su persistencia.
+                    let _ = cache_db.put_repo_snapshot(
                         &service.name,
-                        &consumer_rev,
+                        &cache_key,
                         &config_hash,
                         &payload,
-                    )?;
+                    );
                 }
                 extracted
             }
@@ -296,7 +515,14 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
             &snapshot,
             &mut graph,
             &mut unresolved_calls,
-            &mut files_analyzed,
+        );
+        files_analyzed += snapshot.extraction.coverage.analyzed;
+        consumers.accumulate(snapshot.extraction.coverage);
+        snapshot.extraction.append_diagnostics(
+            &mut diagnostics,
+            &service.name,
+            &consumer_rev,
+            ExtractionStage::Consumer,
         );
     }
 
@@ -313,7 +539,8 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
             target_repo: &target_service.name,
             base_rev: &base_sha,
             head_rev: &head_sha,
-            source_file: &source_file_display,
+            base_source_file: &base_source_file,
+            head_source_file: &head_source_file,
             base_contract: base_openapi_contract.as_ref(),
             head_contract: head_openapi_contract.as_ref(),
             route_locations,
@@ -325,17 +552,43 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     );
 
     filter_ignored_findings(&mut report, &config.policy);
-    report.policy = Some(evaluate_policy(&report, &config.policy));
+    diagnostics.sort();
+    report.coverage = Some(AnalysisCoverage {
+        complete: diagnostics.is_empty(),
+        producer_base,
+        producer_head,
+        consumers,
+    });
+    report.diagnostics = diagnostics;
+    let policy = evaluate_policy(&report, &config.policy);
+    report.exit_code = Some(policy.exit_code);
+    report.policy = Some(policy);
+    let id = workspace_identifier(&req.config_path);
+    let repo_roots = if include_repo_roots {
+        config
+            .services
+            .iter()
+            .map(|service| {
+                let path = normalize_absolute_path(&resolve_repo_path(config_dir, &service.path));
+                (service.name.clone(), path.to_string_lossy().into_owned())
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    report.workspace = Some(WorkspaceIdentity { id, repo_roots });
+    report.consumer_revisions = consumer_revisions;
 
     Ok(report)
 }
 
 /// Pre-computes and persists consumer AST extraction snapshots for every repository declared
 /// in `config_path`, populating the SQLite incremental cache for subsequent `laine analyze` runs.
+// Exige acceso al caché cuando se solicita explícitamente precalcularlo.
 pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
     let config = WorkspaceConfig::load_from_path(config_path)?;
     let config_dir = config_directory(config_path);
-    let cache_path = resolve_cache_path(config_dir, config.cache_path.as_deref());
+    let cache_path = resolve_cache_path(config_path, config.cache_path.as_deref())?;
     let cache = IndexCache::open(&cache_path)?;
     let config_hash = compute_config_hash(&config);
 
@@ -356,7 +609,7 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
         if is_valid_hit {
             cache_hits += 1;
         } else {
-            let snapshot = extract_consumer_repo(&git, &head_sha, &config)?;
+            let snapshot = extract_consumer_repo(load_consumer_inputs(&git, &head_sha)?, &config);
             let payload = serde_json::to_string(&snapshot)
                 .map_err(|err| LaineError::Cache(err.to_string()))?;
             cache.put_repo_snapshot(&service.name, &head_sha, &config_hash, &payload)?;
@@ -374,12 +627,8 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
     })
 }
 
-// Extrae hechos estructurados sin guardar fragmentos del código en los snapshots.
-fn extract_consumer_repo(
-    git: &GitRepo,
-    rev: &str,
-    config: &WorkspaceConfig,
-) -> Result<CachedConsumerRepo> {
+// Enumera y lee una sola vez los recursos que alimentan al analizador de consumidores.
+fn load_consumer_inputs(git: &GitRepo, rev: &str) -> Result<ConsumerInputs> {
     let all_tracked_files = git.list_files(rev)?;
     let candidate_files: Vec<String> = all_tracked_files
         .iter()
@@ -394,36 +643,53 @@ fn extract_consumer_repo(
         .collect();
     let tsconfig_sources = git.read_files_batch(rev, &tsconfig_files)?;
 
-    let file_contents: Vec<(String, String)> = git
-        .read_files_batch(rev, &candidate_files)?
-        .into_iter()
-        .collect();
+    let sources = git.read_files_batch(rev, &candidate_files)?;
+    Ok(ConsumerInputs {
+        all_files: all_tracked_files,
+        candidates: candidate_files,
+        configs: tsconfig_sources,
+        sources,
+    })
+}
+
+// Extrae hechos estructurados de los archivos del snapshot que ya se leyeron.
+fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> CachedConsumerRepo {
+    let mut extraction = FileExtraction::from_reads(&inputs.candidates, &inputs.sources);
+    let file_contents: Vec<(String, String)> = inputs.sources.into_iter().collect();
 
     // Pass 1 (parallel): build repo-wide TypeScript interface/type & Zod schema registry for
     // generic calls (`fetch<ReserveResponse>`), return-type annotations (`: Promise<UserDTO>`),
     // and Zod validators (`UserSchema.parse(data)` / `type User = z.infer<typeof UserSchema>`).
-    let per_file_types: Vec<(Vec<TypeContractDef>, Vec<TypeContractDef>)> = file_contents
+    let per_file_types: Vec<_> = file_contents
         .par_iter()
         .map(|(file_path, source)| {
             if is_analyzable_ts_or_js(file_path) {
-                let ts_defs = extract_type_definitions(file_path, source).unwrap_or_default();
-                let zod_defs = extract_zod_schemas(file_path, source).unwrap_or_default();
-                (ts_defs, zod_defs)
+                let ts_defs = extract_type_definitions(file_path, source);
+                let zod_defs = extract_zod_schemas(file_path, source);
+                let failed = ts_defs.is_err() || zod_defs.is_err();
+                (
+                    ts_defs.unwrap_or_default(),
+                    zod_defs.unwrap_or_default(),
+                    failed,
+                )
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), false)
             }
         })
         .collect();
 
     let mut type_registry: BTreeMap<String, TypeContractDef> = BTreeMap::new();
-    for (ts_defs, _) in &per_file_types {
+    for ((file, _), (ts_defs, _, failed)) in file_contents.iter().zip(&per_file_types) {
+        if *failed {
+            extraction.record_parse_failure(file);
+        }
         for def in ts_defs {
             type_registry
                 .entry(def.name.clone())
                 .or_insert_with(|| def.clone());
         }
     }
-    for (_, zod_defs) in per_file_types {
+    for (_, zod_defs, _) in per_file_types {
         for def in zod_defs {
             // Zod definitions take precedence over placeholder `z.infer` aliases from `types.rs`.
             type_registry.insert(def.name.clone(), def);
@@ -431,11 +697,7 @@ fn extract_consumer_repo(
     }
 
     // Pass 2 (parallel): extract HTTP calls, direct field reads (CONFIRMED), and generic type contracts (LIKELY).
-    let per_file_extracted: Vec<(
-        Vec<CachedConsumeEdge>,
-        Vec<CachedFieldReadEdge>,
-        Vec<CachedUnresolvedCall>,
-    )> = file_contents
+    let per_file_extracted: Vec<_> = file_contents
         .par_iter()
         .map(|(file_path, source)| {
             let mut consumes = Vec::new();
@@ -488,7 +750,7 @@ fn extract_consumer_repo(
                     });
                 }
 
-                return (consumes, field_reads, unresolved);
+                return Some((consumes, field_reads, unresolved));
             }
 
             let Ok(extracted) = extract_file_with_context(
@@ -500,7 +762,7 @@ fn extract_consumer_repo(
                     env: &config.env,
                 },
             ) else {
-                return (consumes, field_reads, unresolved);
+                return None;
             };
 
             for call in &extracted.calls {
@@ -556,7 +818,7 @@ fn extract_consumer_repo(
                 });
             }
 
-            (consumes, field_reads, unresolved)
+            Some((consumes, field_reads, unresolved))
         })
         .collect();
 
@@ -564,22 +826,26 @@ fn extract_consumer_repo(
     let mut field_reads = Vec::new();
     let mut unresolved_calls = Vec::new();
 
-    for (file_consumes, file_reads, file_unresolved) in per_file_extracted {
-        consumes.extend(file_consumes);
-        field_reads.extend(file_reads);
-        unresolved_calls.extend(file_unresolved);
+    for ((file, _), result) in file_contents.iter().zip(per_file_extracted) {
+        if let Some((file_consumes, file_reads, file_unresolved)) = result {
+            consumes.extend(file_consumes);
+            field_reads.extend(file_reads);
+            unresolved_calls.extend(file_unresolved);
+        } else {
+            extraction.record_parse_failure(file);
+        }
     }
 
     // Pass 3: Summary-based cross-file interprocedural dataflow across TS/JS/Vue modules
     // (`services/` -> `hooks`/`composables`/`stores` -> `components/`, JSX props, `useQuery`, etc.).
     let ts_files: Vec<(String, String)> = file_contents
         .iter()
-        .filter(|(p, _)| is_analyzable_ts_or_js(p))
+        .filter(|(p, _)| is_analyzable_ts_or_js(p) && !extraction.failures.contains_key(p))
         .cloned()
         .collect();
     if !ts_files.is_empty() {
-        let resolver = ModuleResolver::from_git_snapshot(&all_tracked_files, &tsconfig_sources);
-        let cross_reads = analyze_cross_file_dataflow(
+        let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
+        let cross = analyze_cross_file_dataflow_with_limits(
             &ts_files,
             ExtractContext {
                 services: &config.services,
@@ -588,7 +854,10 @@ fn extract_consumer_repo(
             },
             &|importer, specifier| resolver.resolve_import(importer, specifier),
         );
-        for item in cross_reads {
+        for file in cross.limited_files {
+            extraction.record_incomplete(&file, ExtractionFailure::DataflowLimitReached);
+        }
+        for item in cross.field_reads {
             field_reads.push(CachedFieldReadEdge {
                 file: item.read_file,
                 target_service: item.service,
@@ -649,12 +918,12 @@ fn extract_consumer_repo(
     unresolved_calls
         .sort_by(|a, b| (&a.file, a.line, &a.reason).cmp(&(&b.file, b.line, &b.reason)));
 
-    Ok(CachedConsumerRepo {
-        files_analyzed: file_contents.len(),
+    CachedConsumerRepo {
+        extraction,
         consumes,
         field_reads,
         unresolved_calls,
-    })
+    }
 }
 
 // Genera descripciones a partir de los hechos y conserva la ubicación de cada evidencia.
@@ -664,10 +933,7 @@ fn apply_cached_consumer_repo(
     snapshot: &CachedConsumerRepo,
     graph: &mut DependencyGraph,
     unresolved_calls: &mut Vec<UnresolvedCall>,
-    files_analyzed: &mut usize,
 ) {
-    *files_analyzed += snapshot.files_analyzed;
-
     for edge in &snapshot.consumes {
         graph.link_consumes(
             service_name,
@@ -714,19 +980,29 @@ fn apply_cached_consumer_repo(
     }
 }
 
-// Extrae las rutas y el número de archivos leídos en una revisión.
+// Extrae las rutas y conserva los fallos de lectura o parseo de esa revisión.
 fn extract_producer_routes(
     git: &GitRepo,
     service_name: &str,
     rev: &str,
     route_cfg: &RouteSourceConfig,
-) -> Result<(Vec<ExtractedRoute>, usize)> {
+) -> Result<(Vec<ExtractedRoute>, FileExtraction)> {
     let candidate_files: Vec<String> = if !route_cfg.files.is_empty() {
-        route_cfg
+        let present: HashSet<_> = git.list_files(rev)?.into_iter().collect();
+        let mut files: Vec<_> = route_cfg
             .files
             .iter()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-            .collect()
+            .map(|p| {
+                p.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .to_owned()
+            })
+            .filter(|file| present.contains(file))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files
     } else {
         let all_files = git.list_files(rev)?;
         match route_cfg.framework {
@@ -747,23 +1023,25 @@ fn extract_producer_routes(
 
     let mut routes = Vec::new();
     let batch_contents = git.read_files_batch(rev, &candidate_files)?;
-    let files_count = batch_contents.len();
+    let mut extraction = FileExtraction::from_reads(&candidate_files, &batch_contents);
 
     for (file, raw) in batch_contents {
         match route_cfg.framework {
             RouteFramework::Laravel => {
-                routes.extend(extract_laravel_routes(
-                    service_name,
-                    &file,
-                    &raw,
-                    route_cfg.prefix.as_deref(),
-                ));
+                let (found, unresolved) =
+                    analyze_laravel_routes(service_name, &file, &raw, route_cfg.prefix.as_deref());
+                routes.extend(found);
+                if !unresolved.is_empty() {
+                    extraction
+                        .record_incomplete(&file, ExtractionFailure::RouteDeclarationUnresolved);
+                    extraction.failure_lines.insert(file, unresolved);
+                }
             }
             RouteFramework::Express => {
-                if let Ok(extracted) =
-                    extract_express_routes(service_name, &file, &raw, route_cfg.prefix.as_deref())
+                match extract_express_routes(service_name, &file, &raw, route_cfg.prefix.as_deref())
                 {
-                    routes.extend(extracted);
+                    Ok(extracted) => routes.extend(extracted),
+                    Err(_) => extraction.record_parse_failure(&file),
                 }
             }
             RouteFramework::FastApi => {
@@ -785,7 +1063,106 @@ fn extract_producer_routes(
         }
     }
 
-    Ok((routes, files_count))
+    Ok((routes, extraction))
+}
+
+// Conserva archivos ilegibles como errores de lectura y sigue renombres detectados por Git.
+fn read_openapi_snapshots(
+    git: &GitRepo,
+    base: &str,
+    head: &str,
+    configured: &Path,
+) -> Result<(OpenApiSnapshot, OpenApiSnapshot)> {
+    let path = configured.to_string_lossy();
+    let path = if cfg!(windows) {
+        path.replace('\\', "/")
+    } else {
+        path.into_owned()
+    };
+    let path = path.trim_start_matches("./");
+    let read = |revision| match read_openapi_snapshot(git, revision, path) {
+        Ok(snapshot) => Ok(Some(snapshot)),
+        Err(_)
+            if git
+                .list_files(revision)?
+                .binary_search_by(|name| name.as_str().cmp(path))
+                .is_err() =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    };
+
+    match (read(base)?, read(head)?) {
+        (Some(before), Some(after)) => Ok((before, after)),
+        (Some(before), None) => {
+            if let Some((_, destination)) = git
+                .renamed_files(base, head)?
+                .into_iter()
+                .find(|(source, _)| source == path)
+            {
+                return Ok((before, read_openapi_snapshot(git, head, &destination)?));
+            }
+            Err(openapi_missing(path, head))
+        }
+        (None, Some(after)) => {
+            if let Some((source, _)) = git
+                .renamed_files(base, head)?
+                .into_iter()
+                .find(|(_, destination)| destination == path)
+            {
+                return Ok((read_openapi_snapshot(git, base, &source)?, after));
+            }
+            Err(openapi_missing(path, base))
+        }
+        (None, None) => Err(openapi_missing(path, &format!("{base} and {head}"))),
+    }
+}
+
+// Conserva diagnósticos de referencias y descuenta solo los archivos que los contienen.
+fn record_openapi_coverage(
+    extraction: &OpenApiExtraction,
+    diagnostics: &mut Vec<ExtractionDiagnostic>,
+    repo: &str,
+    revision: &str,
+    stage: ExtractionStage,
+) -> FileCoverage {
+    let mut failed_files = HashSet::new();
+    for (source, code) in &extraction.diagnostics {
+        failed_files.insert(&source.file);
+        diagnostics.push(ExtractionDiagnostic {
+            repo: repo.to_owned(),
+            revision: revision.to_owned(),
+            file: source.file.clone(),
+            stage,
+            code: *code,
+            line: source.span.as_ref().map(|span| span.line),
+            json_pointer: Some(source.pointer.clone()),
+            remediation: code.remediation().to_owned(),
+        });
+    }
+    let failed = failed_files.len();
+    FileCoverage {
+        discovered: extraction.loaded_files,
+        read: extraction.loaded_files,
+        analyzed: extraction.loaded_files - failed,
+        failed,
+    }
+}
+
+// Lee el contrato y conserva la ruta exacta del archivo en su revisión.
+fn read_openapi_snapshot(git: &GitRepo, revision: &str, path: &str) -> Result<OpenApiSnapshot> {
+    Ok(OpenApiSnapshot {
+        file: path.to_owned(),
+        contents: git.read_file(revision, Path::new(path))?,
+    })
+}
+
+// Propone verificar la ruta o añadir el renombre al índice cuando falta el documento.
+fn openapi_missing(path: &str, revision: &str) -> LaineError {
+    LaineError::ConfigInvalid(format!(
+        "OpenAPI file '{path}' is absent in {revision}. Verify the configured path or stage the renamed file."
+    ))
 }
 
 fn config_directory(config_path: &Path) -> &Path {
@@ -795,12 +1172,24 @@ fn config_directory(config_path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-fn resolve_cache_path(config_dir: &Path, configured: Option<&Path>) -> PathBuf {
-    match configured {
+// Usa el estado del usuario para el caché por defecto y respeta el destino configurado.
+fn resolve_cache_path(config_path: &Path, configured: Option<&Path>) -> Result<PathBuf> {
+    Ok(match configured {
         Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(path) => config_dir.join(path),
-        None => config_dir.join(".laine-cache.db"),
-    }
+        Some(path) => config_directory(config_path).join(path),
+        None => WorkspaceRegistry::default_home_dir()?
+            .join("cache")
+            .join(format!("{}.sqlite3", workspace_identifier(config_path))),
+    })
+}
+
+// Da al TOML un identificador local que sirve para aislar reportes y cachés.
+fn workspace_identifier(config_path: &Path) -> String {
+    stable_fingerprint(
+        normalize_absolute_path(config_path)
+            .as_os_str()
+            .as_encoded_bytes(),
+    )
 }
 
 fn resolve_repo_path(config_dir: &Path, service_path: &Path) -> PathBuf {

@@ -36,7 +36,7 @@ inputs:
 
 outputs:
   exit-code:
-    description: "Exit code returned by laine analyze (0 = compatible/pass, 2 = breaking change, 1 = error)"
+    description: "Exit code returned by laine analyze (0 = policy passed, 2 = policy blocked, 1 = runtime or configuration error, 64 = invalid usage)"
     value: ${{ steps.run-laine.outputs.exit-code }}
   report-path:
     description: "Filesystem path to the generated Laine report"

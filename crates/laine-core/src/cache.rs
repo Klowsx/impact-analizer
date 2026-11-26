@@ -3,14 +3,15 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 use crate::config::{CustomClientConfig, WorkspaceConfig};
 use crate::error::{LaineError, Result};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 6;
+pub const CACHE_SCHEMA_VERSION: u32 = 12;
 const FIRST_SANITIZED_SNAPSHOT_VERSION: u32 = 4;
+const PHYSICAL_SCHEMA_VERSION: u32 = 1;
 
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -22,9 +23,7 @@ pub struct IndexCache {
 }
 
 impl IndexCache {
-    /// Opens (or creates) the SQLite cache database at `path`, ensuring parent directories
-    /// and the `repo_index_cache` table exist.
-    // Abre el caché y retira los snapshots anteriores al saneamiento de evidencias.
+    /// Abre el caché, reconstruye las tablas derivadas antiguas y elimina snapshots caducados.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -35,29 +34,13 @@ impl IndexCache {
             })?;
         }
 
-        let conn = Connection::open(path).map_err(|err| LaineError::Cache(err.to_string()))?;
+        let mut conn = Connection::open(path).map_err(|err| LaineError::Cache(err.to_string()))?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|err| LaineError::Cache(err.to_string()))?;
 
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS repo_index_cache (
-                repo TEXT NOT NULL,
-                commit_sha TEXT NOT NULL,
-                config_hash TEXT NOT NULL,
-                schema_version INTEGER NOT NULL,
-                payload_json TEXT NOT NULL,
-                PRIMARY KEY (repo, commit_sha, config_hash, schema_version)
-            );",
-        )
-        .map_err(|err| LaineError::Cache(err.to_string()))?;
-
         conn.pragma_update(None, "secure_delete", true)
             .map_err(|err| LaineError::Cache(err.to_string()))?;
-        conn.execute(
-            "DELETE FROM repo_index_cache WHERE schema_version < ?1",
-            [FIRST_SANITIZED_SNAPSHOT_VERSION],
-        )
-        .map_err(|err| LaineError::Cache(err.to_string()))?;
+        initialize_schema(&mut conn)?;
 
         Ok(Self { conn })
     }
@@ -112,6 +95,65 @@ impl IndexCache {
     }
 }
 
+// Versiona el esquema físico sin cambiar las demás tablas de una base configurada.
+fn initialize_schema(conn: &mut Connection) -> Result<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|err| LaineError::Cache(err.to_string()))?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS laine_cache_schema (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        version INTEGER NOT NULL
+    );",
+    )
+    .map_err(|err| LaineError::Cache(err.to_string()))?;
+    let version = tx
+        .query_row(
+            "SELECT version FROM laine_cache_schema WHERE id = 1",
+            [],
+            |row| row.get::<_, u32>(0),
+        )
+        .optional()
+        .map_err(|err| LaineError::Cache(err.to_string()))?;
+    if version.is_some_and(|version| version > PHYSICAL_SCHEMA_VERSION) {
+        return Err(LaineError::Cache(
+            "database uses a newer Laine cache schema".into(),
+        ));
+    }
+    let compatible = version == Some(PHYSICAL_SCHEMA_VERSION)
+        && tx.prepare("SELECT repo, commit_sha, config_hash, schema_version, payload_json, created_at FROM repo_index_cache LIMIT 0").is_ok();
+    if !compatible {
+        // Los snapshots son derivados de Git y se pueden reconstruir en la próxima consulta.
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS repo_index_cache;
+            CREATE TABLE repo_index_cache (
+                repo TEXT NOT NULL,
+                commit_sha TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (repo, commit_sha, config_hash, schema_version)
+            );",
+        )
+        .map_err(|err| LaineError::Cache(err.to_string()))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO laine_cache_schema (id, version) VALUES (1, ?1)",
+            [PHYSICAL_SCHEMA_VERSION],
+        )
+        .map_err(|err| LaineError::Cache(err.to_string()))?;
+    }
+    tx.execute(
+        "DELETE FROM repo_index_cache
+        WHERE schema_version < ?1 OR created_at < datetime('now', '-30 days')",
+        [FIRST_SANITIZED_SNAPSHOT_VERSION],
+    )
+    .map_err(|err| LaineError::Cache(err.to_string()))?;
+    tx.commit()
+        .map_err(|err| LaineError::Cache(err.to_string()))?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct ConfigFingerprint<'a> {
     service_base_urls: BTreeMap<&'a str, &'a [String]>,
@@ -119,7 +161,8 @@ struct ConfigFingerprint<'a> {
     env: &'a BTreeMap<String, String>,
 }
 
-/// Computes a deterministic 64-bit FNV-1a hex fingerprint over the extraction-relevant
+/// Calcula la huella de las opciones que pueden cambiar la extracción.
+/// Uses a deterministic 64-bit FNV-1a hex fingerprint over the extraction-relevant
 /// configuration fields (`services.base_urls`, `clients`, and `env`).
 ///
 /// Any change to service base URLs, custom clients, or environment variables produces a new
@@ -137,9 +180,13 @@ pub fn compute_config_hash(config: &WorkspaceConfig) -> String {
     };
 
     let canonical_json = serde_json::to_string(&fingerprint).unwrap_or_default();
+    stable_fingerprint(canonical_json.as_bytes())
+}
 
+// Genera un identificador hexadecimal determinista a partir de bytes.
+pub fn stable_fingerprint(bytes: &[u8]) -> String {
     let mut hash = FNV1A_64_OFFSET_BASIS;
-    for byte in canonical_json.as_bytes() {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(FNV1A_64_PRIME);
     }
@@ -151,6 +198,54 @@ mod tests {
     use super::*;
     use crate::config::{PolicyConfig, ServiceConfig};
     use crate::model::Severity;
+
+    // Reconstruye el esquema antiguo, conserva tablas ajenas y caduca snapshots.
+    #[test]
+    fn rebuilds_legacy_schema_and_purges_expired_snapshots() {
+        let tmp =
+            std::env::temp_dir().join(format!("laine-cache-migration-{}.db", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let original = Connection::open(&tmp).unwrap();
+        original
+            .execute_batch(
+                "CREATE TABLE repo_index_cache (legacy TEXT);
+            INSERT INTO repo_index_cache VALUES ('old snapshot');
+            CREATE TABLE external_data (value TEXT);
+            INSERT INTO external_data VALUES ('keep');",
+            )
+            .unwrap();
+        drop(original);
+
+        let cache = IndexCache::open(&tmp).unwrap();
+        cache
+            .put_repo_snapshot("repo", "old", "config", "{}")
+            .unwrap();
+        cache
+            .put_repo_snapshot("repo", "new", "config", "{}")
+            .unwrap();
+        cache.conn.execute("UPDATE repo_index_cache SET created_at = datetime('now', '-31 days') WHERE commit_sha = 'old'", []).unwrap();
+        drop(cache);
+
+        let cache = IndexCache::open(&tmp).unwrap();
+        assert_eq!(
+            cache.get_repo_snapshot("repo", "old", "config").unwrap(),
+            None
+        );
+        assert_eq!(
+            cache
+                .get_repo_snapshot("repo", "new", "config")
+                .unwrap()
+                .as_deref(),
+            Some("{}")
+        );
+        let external: String = cache
+            .conn
+            .query_row("SELECT value FROM external_data", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(external, "keep");
+        drop(cache);
+        fs::remove_file(&tmp).unwrap();
+    }
 
     fn sample_config() -> WorkspaceConfig {
         let mut env = BTreeMap::new();

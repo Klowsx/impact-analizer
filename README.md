@@ -124,6 +124,10 @@ laine check
 laine check --staged
 ```
 
+Use `laine workspace add <name> <config> --replace` to replace an existing registration. Use `laine init --workspace <name> --force` to replace a managed workspace config.
+
+Consumer scans read `HEAD` by default. Use `--consumer-revision staged` to search the Git index or `--consumer-revision worktree` to search local files. For example, `laine check --staged --consumer-revision staged` uses the index for both producer and consumers, including client code in the producer checkout.
+
 From a consumer-only checkout, `laine check` prints commands for the producers configured in its workspace. For example, run `laine check --workspace corporativo --repo cerebro-web` to check the producer.
 
 You can also configure a workspace manually:
@@ -138,9 +142,15 @@ laine index --config laine.toml
 
 `repo add` resolves its path from your current directory and saves the Git checkout root. It accepts a subdirectory of an existing checkout.
 
+When Git detects a rename of the configured OpenAPI file, `analyze` compares both names and cites the file in each revision. Stage a local rename so Git can detect it.
+
+Source files are read as UTF-8. OpenAPI also accepts a UTF-8 byte order mark. Laine leaves symbolic links unread in commits, the index, and the worktree, and reports skipped candidate files as incomplete coverage.
+
 ---
 
 ## Configuration (`laine.toml`)
+
+The default SQLite cache lives in `~/.laine/cache/`, or under `$LAINE_HOME/cache/` when set. Use `cache_path` to choose an explicit destination. Laine rebuilds incompatible snapshot tables and expires snapshots older than 30 days. `analyze` and `check` continue without persisted snapshots when the cache is unavailable. `index` requires a writable cache.
 
 ```toml
 version = 1

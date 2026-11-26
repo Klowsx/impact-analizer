@@ -2,8 +2,12 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use laine_cli::engine::{AnalyzeRequest, run_analysis};
-use laine_core::model::{Confidence, ContractChange, HttpMethod, Severity};
+use laine_cli::engine::{AnalyzeRequest, run_analysis, run_analysis_with_options};
+use laine_cli::report::{render_json, render_markdown, render_terminal};
+use laine_core::model::{
+    Confidence, ContractChange, ExtractionFailure, ExtractionStage, FileCoverage, HttpMethod,
+    Severity,
+};
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -26,6 +30,186 @@ fn init_repo(dir: &Path) {
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.name", "Laine Test"]);
     git(dir, &["config", "user.email", "test@laine.local"]);
+}
+
+// Verifica que un archivo malformado reste cobertura sin simular una eliminación de rutas.
+#[test]
+fn reports_partial_extraction_without_asserting_route_removal() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp =
+        std::env::temp_dir().join(format!("laine-e2e-partial-{}-{nanos}", std::process::id()));
+    fs::create_dir(&tmp).unwrap();
+    let api = tmp.join("api");
+    let web = tmp.join("web");
+    init_repo(&api);
+    init_repo(&web);
+    fs::write(
+        api.join("app.ts"),
+        "const app = express(); app.get('/users', handler);\n",
+    )
+    .unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "test: add api"]);
+    fs::write(api.join("app.ts"), "const app = {\n").unwrap();
+    fs::write(web.join("good.ts"), "fetch('http://api/users');\n").unwrap();
+    fs::write(web.join("bad.ts"), "const invalid = {\n").unwrap();
+    fs::write(web.join("raw.ts"), [0x65, 0xe9]).unwrap();
+    git(&web, &["add", "."]);
+    git(&web, &["commit", "-m", "test: add consumer sources"]);
+
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+[[services]]
+name = "api"
+path = "./api"
+base_urls = ["http://api"]
+[services.routes]
+framework = "express"
+files = ["./app.ts"]
+[[services]]
+name = "web"
+path = "./web"
+"#,
+    )
+    .unwrap();
+    let request = AnalyzeRequest {
+        config_path,
+        target_repo: "api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "WORKTREE".into(),
+    };
+    let result = run_analysis(&request).unwrap();
+    assert!(result.findings.is_empty());
+    let coverage = result.coverage.as_ref().unwrap();
+    assert!(!coverage.complete);
+    assert_eq!(
+        coverage.producer_base,
+        FileCoverage {
+            discovered: 1,
+            read: 1,
+            analyzed: 1,
+            failed: 0
+        }
+    );
+    assert_eq!(
+        coverage.producer_head,
+        FileCoverage {
+            discovered: 1,
+            read: 1,
+            analyzed: 0,
+            failed: 1
+        }
+    );
+    assert_eq!(
+        coverage.consumers,
+        FileCoverage {
+            discovered: 4,
+            read: 3,
+            analyzed: 2,
+            failed: 2
+        }
+    );
+    assert_eq!(result.diagnostics.len(), 3);
+    assert_eq!(result.diagnostics[0].file, "app.ts");
+    assert_eq!(result.diagnostics[0].stage, ExtractionStage::ProducerHead);
+    assert_eq!(result.diagnostics[0].revision, "WORKTREE");
+    assert_eq!(result.diagnostics[1].file, "bad.ts");
+    assert_eq!(result.diagnostics[2].file, "raw.ts");
+    assert_eq!(
+        result.diagnostics[2].code,
+        ExtractionFailure::FileReadFailed
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .take(2)
+            .all(|item| item.code == ExtractionFailure::FileParseFailed)
+    );
+    assert!(render_terminal(&result, 0).contains("Coverage: INCOMPLETE"));
+    assert!(render_markdown(&result).contains("**Coverage:** INCOMPLETE"));
+    for bypass in [false, true] {
+        assert_eq!(
+            render_json(&result).unwrap(),
+            render_json(&run_analysis_with_options(&request, bypass).unwrap()).unwrap()
+        );
+    }
+
+    // Quitar de verdad el archivo del checkout sí produce un hallazgo del catálogo base.
+    fs::remove_file(api.join("app.ts")).unwrap();
+    let removed = run_analysis(&request).unwrap();
+    assert!(matches!(
+        removed.findings[0].change,
+        ContractChange::EndpointRemoved { .. }
+    ));
+    assert_eq!(removed.coverage.unwrap().producer_head.failed, 0);
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
+// Comprueba que el diff incluye rutas encadenadas y que una declaración dinámica señala su línea.
+#[test]
+fn compares_laravel_resources_and_reports_dynamic_declarations() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-laravel-chain-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let api = tmp.join("api");
+    init_repo(&api);
+    fs::create_dir(api.join("routes")).unwrap();
+    let routes = api.join("routes/api.php");
+    fs::write(
+        &routes,
+        "<?php\nRoute::middleware('auth')->get('/año', Handler::class);\nRoute::apiResource('orders', Order::class);\n",
+    ).unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "test: register resource routes"]);
+    fs::write(&routes, "<?php\n").unwrap();
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+[[services]]
+name = "api"
+path = "./api"
+[services.routes]
+framework = "laravel"
+files = ["routes/api.php"]
+"#,
+    )
+    .unwrap();
+    let request = AnalyzeRequest {
+        config_path,
+        target_repo: "api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "WORKTREE".into(),
+    };
+    let removed = run_analysis(&request).unwrap();
+    assert_eq!(removed.findings.len(), 7);
+    assert!(
+        removed
+            .findings
+            .iter()
+            .any(|finding| finding.change.endpoint().normalized_path == "/año")
+    );
+    assert!(removed.coverage.unwrap().complete);
+
+    fs::write(&routes, "<?php\nRoute::get($path, Handler::class);\n").unwrap();
+    let partial = run_analysis(&request).unwrap();
+    assert!(partial.findings.is_empty());
+    assert!(!partial.coverage.as_ref().unwrap().complete);
+    assert_eq!(partial.diagnostics.len(), 1);
+    let diagnostic = &partial.diagnostics[0];
+    assert_eq!(
+        diagnostic.code,
+        ExtractionFailure::RouteDeclarationUnresolved
+    );
+    assert_eq!(diagnostic.stage, ExtractionStage::ProducerHead);
+    assert_eq!(diagnostic.line, Some(2));
+    assert!(render_markdown(&partial).contains("api/routes/api.php:2"));
+    fs::remove_dir_all(&tmp).unwrap();
 }
 
 // Comprueba que la evidencia y las excepciones conservan la identidad de las rutas de base.
@@ -343,4 +527,74 @@ Route::get('/health', 'HealthController@check');\n",
     );
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+// Prueba que las referencias usan el índice y el disco por separado, y conservan su evidencia.
+#[test]
+fn follows_external_openapi_files_in_the_selected_snapshot() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-external-spec-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let api = tmp.join("api");
+    init_repo(&api);
+    fs::create_dir(api.join("schemas")).unwrap();
+    let path = api.join("schemas/response.yaml");
+    let main = r#"
+openapi: 3.1.0
+paths:
+  /resource:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: './schemas/response.yaml'}
+"#;
+    fs::write(api.join("openapi.yaml"), main).unwrap();
+    fs::write(&path, "type: object\nproperties:\n  name: {type: string}\n").unwrap();
+    git(&api, &["add", "."]);
+    git(
+        &api,
+        &["commit", "-m", "test: add external response schema"],
+    );
+    fs::write(&path, "type: object\nproperties: {}\n").unwrap();
+    git(&api, &["add", "schemas/response.yaml"]);
+    fs::remove_file(&path).unwrap();
+
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[services]]\nname = 'api'\npath = './api'\nopenapi = 'openapi.yaml'\n",
+    )
+    .unwrap();
+    let mut request = AnalyzeRequest {
+        config_path,
+        target_repo: "api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "STAGED".into(),
+    };
+    let staged = run_analysis(&request).unwrap();
+    assert!(staged.coverage.unwrap().complete);
+    assert_eq!(staged.findings.len(), 1);
+    let evidence = &staged.findings[0].producer_evidence;
+    assert_eq!(evidence.file, "schemas/response.yaml");
+    assert_eq!(evidence.line, Some(3));
+    assert_eq!(evidence.json_pointer.as_deref(), Some("/properties/name"));
+    request.head_rev = "WORKTREE".into();
+    let worktree = run_analysis(&request).unwrap();
+    assert!(worktree.findings.is_empty());
+    assert!(!worktree.coverage.unwrap().complete);
+    assert_eq!(worktree.diagnostics.len(), 1);
+    assert_eq!(worktree.diagnostics[0].file, "openapi.yaml");
+    assert_eq!(
+        worktree.diagnostics[0].code,
+        laine_core::model::ExtractionFailure::OpenApiReferenceUnresolved
+    );
+    assert!(
+        worktree.diagnostics[0]
+            .json_pointer
+            .as_deref()
+            .unwrap()
+            .ends_with("/$ref")
+    );
+    fs::remove_dir_all(&tmp).unwrap();
 }

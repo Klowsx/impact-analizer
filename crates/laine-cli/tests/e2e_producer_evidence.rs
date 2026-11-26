@@ -123,3 +123,81 @@ fn cites_base_removals_and_both_type_definitions_in_json() {
     }
     fs::remove_dir_all(&root).unwrap();
 }
+
+// Comprueba renombres detectados por Git y los nombres de consumidores con Unicode y espacios.
+#[test]
+fn follows_renamed_openapi_and_preserves_consumer_file_names() {
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "laine-renamed-contract-{}-{stamp}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let api = root.join("api");
+    let web = root.join("web");
+    for repo in [&api, &web] {
+        fs::create_dir(repo).unwrap();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.name", "Laine Test"]);
+        git(repo, &["config", "user.email", "test@laine.local"]);
+    }
+    let before = "contrato inicial.yaml";
+    let after = "contrato también.yaml";
+    let spec = "openapi: 3.1.0\ninfo:\n  title: Example API\n  version: 1.0.0\npaths:\n  /users:\n    get:\n      responses:\n        '200':\n          content:\n            application/json:\n              schema:\n                properties:\n                  id:\n                    type: string\n                  active:\n                    type: boolean\n";
+    fs::write(api.join(before), spec).unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "test: add contract"]);
+    git(&api, &["mv", before, after]);
+    fs::write(
+        api.join(after),
+        spec.replace("type: string", "type: integer"),
+    )
+    .unwrap();
+    git(&api, &["add", "."]);
+
+    let consumer_file = " pruebañ.ts";
+    fs::write(web.join(consumer_file), "export async function user() { const r = await fetch('http://api/users'); const u = await r.json(); return u.id; }\n").unwrap();
+    git(&web, &["add", "."]);
+    git(&web, &["commit", "-m", "test: add consumer"]);
+
+    let config_path = root.join("laine.toml");
+    let config_from_file = |file: &str| {
+        format!(
+            "version = 1\n[[services]]\nname = 'api'\npath = './api'\nopenapi = '{file}'\nbase_urls = ['http://api']\n[[services]]\nname = 'web'\npath = './web'\n"
+        )
+    };
+    fs::write(&config_path, config_from_file(before)).unwrap();
+    let mut request = AnalyzeRequest {
+        config_path: config_path.clone(),
+        target_repo: "api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "STAGED".into(),
+    };
+
+    // La configuración puede apuntar al nombre anterior o al nuevo en snapshots sucesivos.
+    for (base, head, configured) in [("HEAD", "STAGED", before), ("HEAD^", "HEAD", after)] {
+        request.base_rev = base.into();
+        request.head_rev = head.into();
+        fs::write(&config_path, config_from_file(configured)).unwrap();
+        let result = run_analysis_with_options(&request, true).unwrap();
+        assert_eq!(result.findings.len(), 1);
+        let finding = &result.findings[0];
+        assert!(matches!(
+            finding.change,
+            ContractChange::ResponseFieldTypeChanged { .. }
+        ));
+        assert_eq!(finding.producer_evidence.file, before);
+        assert_eq!(
+            finding.producer_evidence_comparison.as_ref().unwrap().file,
+            after
+        );
+        assert_eq!(finding.consumers[0].evidence.file, consumer_file);
+        if head == "STAGED" {
+            git(&api, &["commit", "-m", "test: rename contract"]);
+        }
+    }
+    fs::remove_dir_all(&root).unwrap();
+}

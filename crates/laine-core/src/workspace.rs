@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
-    WorkspaceConfig, matching_http_url,
+    WorkspaceConfig, matching_http_url, write_config_atomically,
 };
 use crate::error::{LaineError, Result};
 use crate::git::GitRepo;
@@ -80,9 +80,10 @@ impl WorkspaceRegistry {
         Ok(Self::default_home_dir()?.join("workspaces.toml"))
     }
 
-    /// Returns the default managed config path for a named workspace
+    /// Construye la ruta administrada a partir de un nombre válido de workspace.
     /// (`$LAINE_HOME/configs/<name>.toml` or `~/.laine/configs/<name>.toml`).
     pub fn default_config_path(workspace_name: &str) -> Result<PathBuf> {
+        validate_workspace_name(workspace_name)?;
         Ok(Self::default_home_dir()?
             .join("configs")
             .join(format!("{workspace_name}.toml")))
@@ -106,31 +107,59 @@ impl WorkspaceRegistry {
         Ok(reg)
     }
 
+    // Guarda el registro completo mediante un reemplazo atómico.
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent).map_err(|source| LaineError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
         let serialized = toml::to_string_pretty(self)
             .map_err(|err| LaineError::ConfigInvalid(err.to_string()))?;
-        fs::write(path, serialized).map_err(|source| LaineError::Io {
-            path: path.to_path_buf(),
-            source,
-        })
+        write_config_atomically(path, serialized.as_bytes())
     }
 
-    pub fn register(&mut self, name: impl Into<String>, config_path: PathBuf) {
+    // Registra un nombre válido y exige una solicitud explícita para sustituirlo.
+    pub fn register(&mut self, name: &str, config_path: PathBuf, replace: bool) -> Result<()> {
+        validate_workspace_name(name)?;
+        if self.workspaces.contains_key(name) && !replace {
+            return Err(LaineError::ConfigInvalid(format!(
+                "workspace '{name}' already exists. Use workspace add --replace to replace it."
+            )));
+        }
         let normalized = normalize_absolute_path(&config_path);
-        self.workspaces.insert(name.into(), normalized);
+        self.workspaces.insert(name.to_owned(), normalized);
+        Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
         self.workspaces.remove(name).is_some()
     }
+}
+
+// Rechaza nombres que no serían un único componente de archivo en todas las plataformas.
+pub fn validate_workspace_name(name: &str) -> Result<()> {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .to_ascii_uppercase();
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem[3..].chars().count() == 1
+        && stem[3..]
+            .chars()
+            .any(|digit| matches!(digit, '1'..='9' | '¹' | '²' | '³')));
+    if name.trim().is_empty()
+        || name.ends_with([' ', '.'])
+        || reserved
+        || name.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*')
+        })
+    {
+        return Err(LaineError::ConfigInvalid(
+            "workspace name must be a single portable filename component".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Scans immediate subdirectories of `root` for local Git repositories and detects
@@ -1016,13 +1045,20 @@ pub fn normalize_absolute_path(path: &Path) -> PathBuf {
     strip_windows_verbatim_prefix(&resolved)
 }
 
+// Convierte rutas de unidad y UNC de Windows sin perder la raíz del recurso compartido.
 fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
-    let raw = path.to_string_lossy();
-    if let Some(stripped) = raw.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
-    } else {
-        path.to_path_buf()
+    let Some(stripped) = path.to_str().and_then(|raw| raw.strip_prefix(r"\\?\")) else {
+        return path.to_path_buf();
+    };
+    if let Some((prefix, tail)) = stripped.split_once('\\')
+        && prefix.eq_ignore_ascii_case("UNC")
+    {
+        return PathBuf::from(format!(r"\\{tail}"));
     }
+    if stripped.as_bytes().get(1) == Some(&b':') {
+        return PathBuf::from(stripped);
+    }
+    path.to_path_buf()
 }
 
 fn path_starts_with_ci(path: &Path, prefix: &Path) -> bool {
@@ -1134,6 +1170,32 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
     }
 
+    // Verifica que se conserva la raíz UNC y que el nombre es un componente portable.
+    #[test]
+    fn preserves_windows_unc_roots_and_validates_workspace_names() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\config.toml")),
+            PathBuf::from(r"\\server\share\config.toml")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\C:\configs\laine.toml")),
+            PathBuf::from(r"C:\configs\laine.toml")
+        );
+        for name in [
+            "",
+            "..",
+            "../outside",
+            r"parent\child",
+            "C:bad",
+            "NUL.log",
+            "COM1",
+            "ends.",
+        ] {
+            assert!(validate_workspace_name(name).is_err(), "{name}");
+        }
+        assert!(validate_workspace_name("equipo-api.v2").is_ok());
+    }
+
     #[test]
     fn resolves_isolated_workspaces_from_shared_projects_folder() {
         let tmp =
@@ -1209,8 +1271,8 @@ mod tests {
 
         let registry_path = tmp.join("home").join("workspaces.toml");
         let mut reg = WorkspaceRegistry::empty();
-        reg.register("eco-a", cfg_a_path.clone());
-        reg.register("eco-b", cfg_b_path.clone());
+        reg.register("eco-a", cfg_a_path.clone(), false).unwrap();
+        reg.register("eco-b", cfg_b_path.clone(), false).unwrap();
         reg.save_to_path(&registry_path).unwrap();
 
         // Running from a subdirectory inside eco-a-api resolves eco-a + eco-a-api automatically
@@ -1259,8 +1321,8 @@ mod tests {
 
         let registry_path = tmp.join("workspaces.toml");
         let mut reg = WorkspaceRegistry::empty();
-        reg.register("ws1", cfg1.clone());
-        reg.register("ws2", cfg2.clone());
+        reg.register("ws1", cfg1.clone(), false).unwrap();
+        reg.register("ws2", cfg2.clone(), false).unwrap();
         reg.save_to_path(&registry_path).unwrap();
 
         let err = resolve_context_from_cwd(&shared_api, None, None, None, &registry_path)

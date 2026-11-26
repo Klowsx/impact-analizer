@@ -9,15 +9,19 @@ pub mod zod;
 
 pub use cross_file::{
     CrossFileAnalysis, CrossFileFieldRead, analyze_cross_file_dataflow,
-    analyze_cross_file_dataflow_with_limits,
+    analyze_cross_file_dataflow_with_imports, analyze_cross_file_dataflow_with_limits,
+    collect_imported_axios_clients,
 };
 pub use express::{extract_express_routes, extract_express_snapshot};
 pub use extractor::{
     ExtractContext, ExtractedFieldRead, ExtractedHttpCall, ExtractedUnresolvedCall, FileExtraction,
-    HttpClientKind, extract_file, extract_file_with_context,
+    HttpClientKind, extract_file, extract_file_with_context, extract_file_with_imported_axios,
 };
 pub use module_resolver::ModuleResolver;
-pub use types::{TypeContractDef, TypeFieldDef, extract_type_definitions, resolve_type_fields};
+pub use types::{
+    TypeContractDef, TypeContractModule, TypeContractRegistry, TypeFieldDef,
+    extract_type_definitions, resolve_type_fields,
+};
 pub use url::{
     ServiceEndpointMatch, is_absolute_http_url, normalize_relative_path,
     resolve_url_against_services,

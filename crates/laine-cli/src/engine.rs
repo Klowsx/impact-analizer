@@ -25,9 +25,9 @@ use laine_py::{
     PyExtractContext, extract_fastapi_snapshot, extract_flask_routes, extract_python_file,
 };
 use laine_ts::{
-    ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow_with_limits,
-    extract_express_snapshot, extract_file_with_context, extract_type_definitions,
-    extract_zod_schemas, resolve_type_fields,
+    ExtractContext, ModuleResolver, TypeContractModule, TypeContractRegistry,
+    analyze_cross_file_dataflow_with_imports, collect_imported_axios_clients,
+    extract_express_snapshot, extract_file_with_imported_axios,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -655,47 +655,36 @@ fn load_consumer_inputs(git: &GitRepo, rev: &str) -> Result<ConsumerInputs> {
     })
 }
 
-// Extrae hechos estructurados de los archivos del snapshot que ya se leyeron.
+// Extracts consumer facts from the files in a repository snapshot.
 fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> CachedConsumerRepo {
     let mut extraction = FileExtraction::from_reads(&inputs.candidates, &inputs.sources);
     let file_contents: Vec<(String, String)> = inputs.sources.into_iter().collect();
+    let mut ts_files: Vec<_> = file_contents
+        .iter()
+        .filter(|(file, _)| is_analyzable_ts_or_js(file))
+        .cloned()
+        .collect();
+    let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
+    let resolve_import =
+        |importer: &str, specifier: &str| resolver.resolve_import(importer, specifier);
+    let ts_context = ExtractContext {
+        services: &config.services,
+        clients: &config.clients,
+        env: &config.env,
+    };
+    let axios_imports = collect_imported_axios_clients(&ts_files, ts_context, &resolve_import);
 
-    // Pass 1 (parallel): build repo-wide TypeScript interface/type & Zod schema registry for
-    // generic calls (`fetch<ReserveResponse>`), return-type annotations (`: Promise<UserDTO>`),
-    // and Zod validators (`UserSchema.parse(data)` / `type User = z.infer<typeof UserSchema>`).
-    let per_file_types: Vec<_> = file_contents
+    // Pass 1: index response contract declarations and module bindings in parallel.
+    let per_file_types: Vec<_> = ts_files
         .par_iter()
-        .map(|(file_path, source)| {
-            if is_analyzable_ts_or_js(file_path) {
-                let ts_defs = extract_type_definitions(file_path, source);
-                let zod_defs = extract_zod_schemas(file_path, source);
-                let failed = ts_defs.is_err() || zod_defs.is_err();
-                (
-                    ts_defs.unwrap_or_default(),
-                    zod_defs.unwrap_or_default(),
-                    failed,
-                )
-            } else {
-                (Vec::new(), Vec::new(), false)
-            }
-        })
+        .map(|(file, source)| TypeContractModule::extract(file, source))
         .collect();
 
-    let mut type_registry: BTreeMap<String, TypeContractDef> = BTreeMap::new();
-    for ((file, _), (ts_defs, _, failed)) in file_contents.iter().zip(&per_file_types) {
-        if *failed {
-            extraction.record_parse_failure(file);
-        }
-        for def in ts_defs {
-            type_registry
-                .entry(def.name.clone())
-                .or_insert_with(|| def.clone());
-        }
-    }
-    for (_, zod_defs, _) in per_file_types {
-        for def in zod_defs {
-            // Zod definitions take precedence over placeholder `z.infer` aliases from `types.rs`.
-            type_registry.insert(def.name.clone(), def);
+    let mut type_registry = TypeContractRegistry::default();
+    for ((file, _), module) in ts_files.iter().zip(per_file_types) {
+        match module {
+            Ok(module) => type_registry.insert(file.clone(), module),
+            Err(_) => extraction.record_parse_failure(file),
         }
     }
 
@@ -757,14 +746,11 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
                 return Some((consumes, field_reads, unresolved));
             }
 
-            let Ok(extracted) = extract_file_with_context(
+            let Ok(extracted) = extract_file_with_imported_axios(
                 file_path,
                 source,
-                ExtractContext {
-                    services: &config.services,
-                    clients: &config.clients,
-                    env: &config.env,
-                },
+                ts_context,
+                axios_imports.get(file_path),
             ) else {
                 return None;
             };
@@ -780,8 +766,12 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
                 });
 
                 if let Some(ref response_type) = call.response_type {
-                    for (type_file, field_def) in resolve_type_fields(response_type, &type_registry)
-                    {
+                    for (type_file, field_def) in type_registry.resolve_fields(
+                        file_path,
+                        response_type,
+                        call.response_type_is_schema,
+                        &resolver,
+                    ) {
                         field_reads.push(CachedFieldReadEdge {
                             file: type_file,
                             target_service: call.service.clone(),
@@ -843,21 +833,13 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
 
     // Pass 3: Summary-based cross-file interprocedural dataflow across TS/JS/Vue modules
     // (`services/` -> `hooks`/`composables`/`stores` -> `components/`, JSX props, `useQuery`, etc.).
-    let ts_files: Vec<(String, String)> = file_contents
-        .iter()
-        .filter(|(p, _)| is_analyzable_ts_or_js(p) && !extraction.failures.contains_key(p))
-        .cloned()
-        .collect();
+    ts_files.retain(|(file, _)| !extraction.failures.contains_key(file));
     if !ts_files.is_empty() {
-        let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
-        let cross = analyze_cross_file_dataflow_with_limits(
+        let cross = analyze_cross_file_dataflow_with_imports(
             &ts_files,
-            ExtractContext {
-                services: &config.services,
-                clients: &config.clients,
-                env: &config.env,
-            },
-            &|importer, specifier| resolver.resolve_import(importer, specifier),
+            ts_context,
+            &resolve_import,
+            &axios_imports,
         );
         for file in cross.limited_files {
             extraction.record_incomplete(&file, ExtractionFailure::DataflowLimitReached);

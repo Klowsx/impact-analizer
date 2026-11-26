@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use laine_cli::engine::{AnalyzeRequest, run_analysis};
+use laine_cli::engine::{AnalyzeRequest, run_analysis, run_analysis_with_options};
 use laine_core::model::{Confidence, ContractChange};
 
 fn git(dir: &Path, args: &[&str]) {
@@ -26,6 +26,174 @@ fn init_repo(dir: &Path) {
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.name", "Laine Test"]);
     git(dir, &["config", "user.email", "test@laine.local"]);
+}
+
+/// Exercises the generic and runtime schema evidence paths with colliding declarations.
+#[test]
+fn resolves_response_contracts_from_the_consumers_module() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-scoped-types-{}", std::process::id()));
+    let api = tmp.join("producer");
+    let frontend = tmp.join("frontend");
+    init_repo(&api);
+    init_repo(&frontend);
+
+    let spec = r#"openapi: 3.0.3
+paths:
+  /alias:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+"#;
+    let inferred_route = spec
+        .split_once("paths:\n")
+        .unwrap()
+        .1
+        .replace("/alias:", "/inferred:");
+    fs::write(
+        api.join("openapi.yaml"),
+        format!(
+            "{spec}                properties:\n{}{inferred_route}                properties:\n                  correctSchema: {{ type: string }}\n",
+            [
+                "wrongDto",
+                "correctDto",
+                "parentField",
+                "wrongSchema",
+                "correctSchema",
+                "privateField",
+            ]
+            .iter()
+            .map(|field| format!("                  {field}: {{ type: string }}\n"))
+            .collect::<String>()
+        ),
+    )
+    .unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "v1"]);
+    fs::write(api.join("openapi.yaml"), format!("{spec}{inferred_route}")).unwrap();
+    git(&api, &["commit", "-am", "remove all fields"]);
+
+    for (file, source) in [
+        (
+            "client.ts",
+            "import axios from 'axios';\nexport const api = axios.create({ baseURL: 'http://producer' });\n",
+        ),
+        ("a.ts", "export interface DTO { wrongDto: string }\n"),
+        (
+            "parent.ts",
+            "export default interface Parent { parentField: string }\n",
+        ),
+        (
+            "b.ts",
+            "import type Model from './parent';\nexport interface DTO extends Model { correctDto: string }\ninterface Private { privateField: string }\n",
+        ),
+        ("types.ts", "export type { DTO as Exported } from './b';\n"),
+        (
+            "dto.ts",
+            "import type * as Contracts from './types';\nimport { api } from './client';\ntype Result = Contracts.Exported;\napi.get<Result>('/alias');\n",
+        ),
+        (
+            "missing.ts",
+            "import type { DTO as Missing } from './missing-module';\nimport type { Private } from './b';\nimport { api } from './client';\napi.get<Missing | Private | DTO>('/alias');\n",
+        ),
+        (
+            "schema-a.ts",
+            "import { z } from 'zod';\nexport const Schema = z.object({ correctSchema: z.string() });\nexport type Schema = z.infer<typeof Schema>;\n",
+        ),
+        (
+            "schema-z.ts",
+            "import { z } from 'zod';\nexport const Schema = z.object({ wrongSchema: z.string() });\n",
+        ),
+        (
+            "schema-exports.ts",
+            "export { Schema as default } from './schema-a';\n",
+        ),
+        (
+            "validate.ts",
+            "import Validator from './schema-exports';\nimport { api } from './client';\nconst result = await api.get('/alias');\nValidator.parse(result.data);\n",
+        ),
+        (
+            "inferred.ts",
+            "import type { Schema as Result } from './schema-a';\nimport { api } from './client';\napi.get<Result>('/inferred');\n",
+        ),
+    ] {
+        fs::write(frontend.join(file), source).unwrap();
+    }
+    git(&frontend, &["add", "."]);
+    git(
+        &frontend,
+        &["commit", "-m", "add scoped response contracts"],
+    );
+
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+[[services]]
+name = "producer"
+path = "./producer"
+openapi = "openapi.yaml"
+base_urls = ["http://producer"]
+[[services]]
+name = "frontend"
+path = "./frontend"
+"#,
+    )
+    .unwrap();
+    let report = run_analysis_with_options(
+        &AnalyzeRequest {
+            config_path,
+            target_repo: "producer".into(),
+            base_rev: "HEAD~1".into(),
+            head_rev: "HEAD".into(),
+        },
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(report.findings.len(), 7);
+    for finding in &report.findings {
+        let ContractChange::ResponseFieldRemoved {
+            field_path,
+            endpoint,
+            ..
+        } = &finding.change
+        else {
+            panic!("unexpected change: {:?}", finding.change);
+        };
+        let (definition, caller) = match field_path.as_str() {
+            "correctDto" => ("b.ts", "dto.ts:4"),
+            "parentField" => ("parent.ts", "dto.ts:4"),
+            "correctSchema" if endpoint.normalized_path == "/inferred" => {
+                ("schema-a.ts", "inferred.ts:3")
+            }
+            "correctSchema" => ("schema-a.ts", "validate.ts:3"),
+            "wrongDto" | "wrongSchema" | "privateField" => {
+                assert!(
+                    finding.consumers.is_empty(),
+                    "unexpected evidence for {field_path}"
+                );
+                continue;
+            }
+            _ => panic!("unexpected field: {field_path}"),
+        };
+        assert_eq!(finding.consumers.len(), 1, "{field_path}");
+        let consumer = &finding.consumers[0];
+        assert_eq!(consumer.confidence, Confidence::Likely);
+        assert_eq!(consumer.evidence.file, definition);
+        assert!(
+            consumer
+                .dependency_path
+                .iter()
+                .any(|step| step.ends_with(caller))
+        );
+    }
+    assert!(report.unresolved_calls.is_empty());
+
+    let _ = fs::remove_dir_all(&tmp);
 }
 
 #[test]

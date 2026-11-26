@@ -28,6 +28,114 @@ fn init_repo(dir: &Path) {
     git(dir, &["config", "user.email", "test@laine.local"]);
 }
 
+/// Verifies that imported Axios calls contribute consumption and unresolved-call evidence.
+#[test]
+fn tracks_exported_axios_instances_even_when_responses_are_discarded() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-axios-imports-{}", std::process::id()));
+    let api = tmp.join("producer");
+    let frontend = tmp.join("frontend");
+    init_repo(&api);
+    init_repo(&frontend);
+
+    let original = "openapi: 3.0.3\npaths:\n  /alias:\n    get:\n      responses: {}\n";
+    fs::write(api.join("openapi.yaml"), original).unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "v1"]);
+    fs::write(api.join("openapi.yaml"), "openapi: 3.0.3\npaths: {}\n").unwrap();
+    git(&api, &["commit", "-am", "remove the endpoint"]);
+
+    for (file, source) in [
+        (
+            "client.ts",
+            "import axios from 'axios';\nconst base = 'http://producer';\nexport const api = axios.create({ baseURL: base });\n",
+        ),
+        (
+            "default-client.ts",
+            "import axios from 'axios';\nconst client = axios.create({ baseURL: 'http://producer' });\nexport default client;\n",
+        ),
+        ("index.ts", "export { api as forwarded } from './client';\n"),
+        (
+            "named.ts",
+            "import { api as named } from './client';\nnamed.get('/alias');\n",
+        ),
+        (
+            "default.ts",
+            "import api from './default-client';\nawait api.get('/alias');\n",
+        ),
+        (
+            "barrel.ts",
+            "import { forwarded as api } from './index';\napi.get('/alias');\n",
+        ),
+        (
+            "dynamic-client.ts",
+            "import axios from 'axios';\nexport default axios.create({ baseURL: process.env.API });\n",
+        ),
+        (
+            "dynamic.ts",
+            "import api from './dynamic-client';\napi.get('/alias');\n",
+        ),
+        (
+            "unrelated.ts",
+            "import { api } from './client';\nfunction read(api: Map<string, string>) { api.get('/alias'); }\n",
+        ),
+    ] {
+        fs::write(frontend.join(file), source).unwrap();
+    }
+    git(&frontend, &["add", "."]);
+    git(&frontend, &["commit", "-m", "add Axios consumers"]);
+
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+[[services]]
+name = "producer"
+path = "./producer"
+openapi = "openapi.yaml"
+base_urls = ["http://producer"]
+[[services]]
+name = "frontend"
+path = "./frontend"
+"#,
+    )
+    .unwrap();
+    let report = run_analysis_with_options(
+        &AnalyzeRequest {
+            config_path,
+            target_repo: "producer".into(),
+            base_rev: "HEAD~1".into(),
+            head_rev: "HEAD".into(),
+        },
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(report.findings.len(), 1);
+    let finding = &report.findings[0];
+    assert!(matches!(
+        finding.change,
+        ContractChange::EndpointRemoved { .. }
+    ));
+    let mut files: Vec<_> = finding
+        .consumers
+        .iter()
+        .map(|hit| {
+            assert_eq!(hit.confidence, Confidence::Confirmed);
+            assert_eq!(hit.evidence.line, 2);
+            hit.evidence.file.as_str()
+        })
+        .collect();
+    files.sort_unstable();
+    assert_eq!(files, ["barrel.ts", "default.ts", "named.ts"]);
+    assert_eq!(report.unresolved_calls.len(), 1);
+    let unresolved = &report.unresolved_calls[0];
+    assert_eq!(unresolved.evidence.file, "dynamic.ts");
+    assert_eq!(unresolved.evidence.line, 2);
+    assert!(unresolved.reason.contains("base URL"));
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn tracks_untyped_js_multi_file_chain_jsx_props_and_vue_nuxt_aliases_end_to_end() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-crossfile-{}", std::process::id()));

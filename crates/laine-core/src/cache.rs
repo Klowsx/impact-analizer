@@ -9,7 +9,7 @@ use serde::Serialize;
 use crate::config::{CustomClientConfig, WorkspaceConfig};
 use crate::error::{LaineError, Result};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 13;
+pub const CACHE_SCHEMA_VERSION: u32 = 15;
 const FIRST_SANITIZED_SNAPSHOT_VERSION: u32 = 4;
 const PHYSICAL_SCHEMA_VERSION: u32 = 1;
 

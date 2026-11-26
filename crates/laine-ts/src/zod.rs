@@ -4,21 +4,21 @@ use std::path::Path;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrowFunctionBody, BindingPattern, CallExpression, Expression, ObjectExpression,
-    ObjectPropertyKind, PropertyKey, Statement, TSType, TSTypeAliasDeclaration, TSTypeName,
-    VariableDeclarator,
+    ObjectPropertyKind, Program, PropertyKey, Statement, TSType, TSTypeAliasDeclaration,
+    TSTypeName, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
 
-use crate::types::{TypeContractDef, TypeFieldDef};
+use crate::types::{TypeContractDef, TypeFieldDef, ts_type_name};
 use crate::vue::extract_vue_scripts;
 
 /// Extracts Zod runtime object schemas (`z.object({...})`, chained `.extend(...)` / `.merge(...)` /
 /// `.pick(...)` / `.omit(...)` / modifiers) and inferred type aliases
 /// (`type User = z.infer<typeof UserSchema>`, `z.output<...>`, `z.input<...>`)
 /// from a `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs`, or `.vue` file.
-// Busca esquemas Zod sin perder el modo JSX de un bloque Vue.
+// Parses Zod schemas using each script block's source language.
 pub fn extract_zod_schemas(
     file_path: &str,
     source: &str,
@@ -50,6 +50,15 @@ pub fn extract_zod_schemas(
 /// `Schema.array().parse(...)`, `Schema.partial().safeParse(...)`, or `z.array(Schema).parse(...)`)
 /// and returns the referenced schema identifier name.
 pub fn extract_zod_parse_schema_name(call: &CallExpression<'_>) -> Option<String> {
+    let reference = extract_zod_parse_schema_reference(call)?;
+    Some(match reference.rsplit_once('.') {
+        Some((_, name)) => name.to_string(),
+        None => reference,
+    })
+}
+
+/// Retains the validator's qualifier so extraction can resolve its module binding.
+pub(crate) fn extract_zod_parse_schema_reference(call: &CallExpression<'_>) -> Option<String> {
     let Expression::StaticMemberExpression(member) = unwrap_expr(&call.callee) else {
         return None;
     };
@@ -64,23 +73,17 @@ pub fn extract_zod_parse_schema_name(call: &CallExpression<'_>) -> Option<String
     extract_parse_target_schema_name(&member.object)
 }
 
+/// Returns the validator's local spelling, including a namespace qualifier when present.
 fn extract_parse_target_schema_name(expr: &Expression<'_>) -> Option<String> {
     match unwrap_expr(expr) {
         Expression::Identifier(ident) => {
             let name = ident.name.as_str();
-            if is_non_zod_parse_builtin(name) {
-                None
-            } else {
-                Some(name.to_string())
-            }
+            (!is_non_zod_parse_builtin(name)).then(|| name.to_string())
         }
         Expression::StaticMemberExpression(member) => {
             let name = member.property.name.as_str();
-            if is_non_zod_parse_builtin(name) {
-                None
-            } else {
-                Some(name.to_string())
-            }
+            let namespace = extract_parse_target_schema_name(&member.object)?;
+            (!is_non_zod_parse_builtin(name)).then(|| format!("{namespace}.{name}"))
         }
         Expression::CallExpression(inner_call) => {
             let Expression::StaticMemberExpression(inner_member) = unwrap_expr(&inner_call.callee)
@@ -111,6 +114,7 @@ fn extract_parse_target_schema_name(expr: &Expression<'_>) -> Option<String> {
     }
 }
 
+/// Parses a script for the standalone schema extractor.
 fn extract_zod_from_block(
     file_path: &str,
     source: &str,
@@ -128,6 +132,26 @@ fn extract_zod_from_block(
             .collect());
     }
 
+    Ok(
+        collect_zod_definitions(file_path, source, &parsed.program, local_schemas)
+            .into_iter()
+            .filter_map(|(mut def, inferred)| {
+                if inferred {
+                    def.extends.retain(|parent| parent != &def.name);
+                }
+                (!inferred || !def.extends.is_empty()).then_some(def)
+            })
+            .collect(),
+    )
+}
+
+/// Collects Zod definitions and marks aliases whose dependencies are schema values.
+pub(crate) fn collect_zod_definitions(
+    file_path: &str,
+    source: &str,
+    program: &Program<'_>,
+    local_schemas: &mut BTreeMap<String, TypeContractDef>,
+) -> Vec<(TypeContractDef, bool)> {
     let mut collector = ZodCollector {
         file_path,
         source,
@@ -135,8 +159,8 @@ fn extract_zod_from_block(
         local_schemas,
         defs: Vec::new(),
     };
-    collector.visit_program(&parsed.program);
-    Ok(collector.defs)
+    collector.visit_program(program);
+    collector.defs
 }
 
 struct LineIndex {
@@ -194,7 +218,7 @@ struct ZodCollector<'s> {
     source: &'s str,
     line_index: LineIndex,
     local_schemas: &'s mut BTreeMap<String, TypeContractDef>,
-    defs: Vec<TypeContractDef>,
+    defs: Vec<(TypeContractDef, bool)>,
 }
 
 impl ZodCollector<'_> {
@@ -789,6 +813,7 @@ impl ZodCollector<'_> {
 }
 
 impl<'a> Visit<'a> for ZodCollector<'_> {
+    /// Registers a schema value and the fields found in its initializer.
     fn visit_variable_declarator(&mut self, decl: &VariableDeclarator<'a>) {
         if let BindingPattern::BindingIdentifier(ident) = &decl.id
             && let Some(init) = &decl.init
@@ -805,12 +830,13 @@ impl<'a> Visit<'a> for ZodCollector<'_> {
                 fields: evaluated.fields,
             };
             self.local_schemas.insert(name, contract.clone());
-            self.defs.push(contract);
+            self.defs.push((contract, false));
         }
 
         walk::walk_variable_declarator(self, decl);
     }
 
+    /// Records inferred types as aliases of the schema values that define them.
     fn visit_ts_type_alias_declaration(&mut self, decl: &TSTypeAliasDeclaration<'a>) {
         let name = decl.id.name.to_string();
         let line = self.line_index.line_number(decl.span.start);
@@ -819,18 +845,17 @@ impl<'a> Visit<'a> for ZodCollector<'_> {
         let mut seen = HashSet::new();
         collect_zod_inferred_refs(&decl.type_annotation, &mut extends, &mut seen);
 
-        // Avoid emitting a self-referential empty alias when value & type share the same name
-        // (e.g. `export const User = z.object({...}); export type User = z.infer<typeof User>;`).
-        extends.retain(|schema_name| schema_name != &name);
-
         if !extends.is_empty() {
-            self.defs.push(TypeContractDef {
-                name,
-                file: self.file_path.to_string(),
-                line,
-                extends,
-                fields: Vec::new(),
-            });
+            self.defs.push((
+                TypeContractDef {
+                    name,
+                    file: self.file_path.to_string(),
+                    line,
+                    extends,
+                    fields: Vec::new(),
+                },
+                true,
+            ));
         }
 
         walk::walk_ts_type_alias_declaration(self, decl);
@@ -895,13 +920,10 @@ fn is_zod_infer_type_name(name: &TSTypeName<'_>) -> bool {
         )
 }
 
+/// Preserves the namespace of an imported schema referenced by `typeof`.
 fn extract_typeof_schema_name(ts_type: &TSType<'_>) -> Option<String> {
     match ts_type {
-        TSType::TSTypeQuery(query) => match query.expr_name.as_ts_type_name()? {
-            TSTypeName::IdentifierReference(id) => Some(id.name.to_string()),
-            TSTypeName::QualifiedName(qn) => Some(qn.right.name.to_string()),
-            TSTypeName::ThisExpression(_) => None,
-        },
+        TSType::TSTypeQuery(query) => ts_type_name(query.expr_name.as_ts_type_name()?),
         TSType::TSParenthesizedType(paren) => extract_typeof_schema_name(&paren.type_annotation),
         _ => None,
     }

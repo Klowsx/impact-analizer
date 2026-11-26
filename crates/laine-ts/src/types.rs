@@ -3,14 +3,19 @@ use std::path::Path;
 
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    PropertyKey, TSInterfaceDeclaration, TSSignature, TSType, TSTypeAliasDeclaration, TSTypeName,
+    Program, PropertyKey, TSInterfaceDeclaration, TSSignature, TSType, TSTypeAliasDeclaration,
+    TSTypeName, TSTypeQuery, TSTypeReference,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
 use oxc_span::{SourceType, Span};
 use serde::{Deserialize, Serialize};
 
+use crate::module_resolver::{
+    ImportedSymbol, ModuleResolver, ModuleSymbols, resolve_imported_symbol,
+};
 use crate::vue::extract_vue_scripts;
+use crate::zod::collect_zod_definitions;
 
 /// A field declared inside a TypeScript `interface` or `type` contract definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +33,196 @@ pub struct TypeContractDef {
     pub line: usize,
     pub extends: Vec<String>,
     pub fields: Vec<TypeFieldDef>,
+}
+
+/// Local type declarations and schema values collected from one module.
+#[derive(Default)]
+pub struct TypeContractModule {
+    symbols: ModuleSymbols,
+    types: BTreeMap<String, TypeContractDef>,
+    inferred_schemas: BTreeMap<String, Vec<String>>,
+    schemas: BTreeMap<String, TypeContractDef>,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum ReferenceKind {
+    Type,
+    Schema,
+}
+
+impl TypeContractModule {
+    /// Parses each script once and keeps type aliases and schema values in separate namespaces.
+    pub fn extract(file: &str, source: &str) -> Result<Self, Vec<String>> {
+        let mut module = Self::default();
+        let mut local_schemas = BTreeMap::new();
+        let mut collect_block = |code, source_type| -> Result<(), Vec<String>> {
+            let allocator = Allocator::default();
+            let program = parse_program(&allocator, code, source_type)?;
+            module.symbols.collect(&program, true);
+            for def in collect_type_definitions(file, code, &program) {
+                module.types.entry(def.name.clone()).or_insert(def);
+            }
+            for (def, inferred) in collect_zod_definitions(file, code, &program, &mut local_schemas)
+            {
+                if inferred {
+                    module.inferred_schemas.insert(def.name, def.extends);
+                } else {
+                    module.schemas.insert(def.name.clone(), def);
+                }
+            }
+            Ok(())
+        };
+        if file.to_ascii_lowercase().ends_with(".vue") {
+            let blocks = extract_vue_scripts(source);
+            for block in &blocks {
+                collect_block(&block.code, block.lang.source_type())?;
+            }
+        } else {
+            let source_type =
+                SourceType::from_path(Path::new(file)).unwrap_or_else(|_| SourceType::ts());
+            collect_block(source, source_type)?;
+        }
+        Ok(module)
+    }
+}
+
+/// A snapshot index keyed by declaring module and symbol.
+#[derive(Default)]
+pub struct TypeContractRegistry {
+    modules: BTreeMap<String, TypeContractModule>,
+}
+
+impl TypeContractRegistry {
+    /// Registers a module's local declarations and import/export bindings.
+    pub fn insert(&mut self, file: String, module: TypeContractModule) {
+        self.modules.insert(file, module);
+    }
+
+    /// Resolves a response contract from its use site, following each dependency in its own module.
+    pub fn resolve_fields(
+        &self,
+        file: &str,
+        expression: &str,
+        is_schema: bool,
+        resolver: &ModuleResolver,
+    ) -> Vec<(String, TypeFieldDef)> {
+        let references = if is_schema {
+            vec![(expression.to_string(), ReferenceKind::Schema)]
+        } else {
+            collect_response_references(expression)
+        };
+        let mut pending: Vec<_> = references
+            .into_iter()
+            .map(|(name, kind)| (file.to_string(), name, kind))
+            .collect();
+        let mut visited = HashSet::new();
+        let mut fields = Vec::new();
+        while let Some((scope, name, kind)) = pending.pop() {
+            let Some((module, symbol)) = self.resolve_symbol(&scope, &name, resolver) else {
+                continue;
+            };
+            if !visited.insert((module.clone(), symbol.clone(), kind)) {
+                continue;
+            }
+            let Some(contracts) = self.modules.get(&module) else {
+                continue;
+            };
+            if kind == ReferenceKind::Type
+                && let Some(parents) = contracts.inferred_schemas.get(&symbol)
+            {
+                pending.extend(
+                    parents
+                        .iter()
+                        .map(|parent| (module.clone(), parent.clone(), ReferenceKind::Schema)),
+                );
+            }
+            let definition = match kind {
+                ReferenceKind::Type => contracts.types.get(&symbol),
+                ReferenceKind::Schema => contracts.schemas.get(&symbol),
+            };
+            if let Some(definition) = definition {
+                fields.extend(
+                    definition
+                        .fields
+                        .iter()
+                        .map(|field| (module.clone(), field.clone())),
+                );
+                pending.extend(
+                    definition
+                        .extends
+                        .iter()
+                        .map(|parent| (module.clone(), parent.clone(), kind)),
+                );
+            }
+        }
+        sort_type_fields(&mut fields);
+        fields
+    }
+
+    /// Looks up the binding in the current module and resolves imports through the snapshot.
+    fn resolve_symbol(
+        &self,
+        file: &str,
+        name: &str,
+        resolver: &ModuleResolver,
+    ) -> Option<(String, String)> {
+        let bindings = &self.modules.get(file)?.symbols;
+        let resolve = |import| {
+            resolve_imported_symbol(
+                file,
+                import,
+                &|path| self.modules.get(path).map(|module| &module.symbols),
+                &|source, specifier| resolver.resolve_import(source, specifier),
+            )
+        };
+        if let Some((namespace, exported)) = name.split_once('.') {
+            let specifier = bindings.namespace_imports.get(namespace)?;
+            resolve(&ImportedSymbol {
+                specifier: specifier.clone(),
+                name: exported.into(),
+            })
+        } else if let Some(import) = bindings.imports.get(name) {
+            resolve(import)
+        } else {
+            Some((file.into(), name.into()))
+        }
+    }
+}
+
+/// Gets type and schema references from a response annotation without treating properties as types.
+fn collect_response_references(expression: &str) -> Vec<(String, ReferenceKind)> {
+    if let Some((first, rest)) = expression.as_bytes().split_first()
+        && is_ident_start(*first)
+        && rest.iter().copied().all(is_ident_continue)
+    {
+        return vec![(expression.into(), ReferenceKind::Type)];
+    }
+    let allocator = Allocator::default();
+    let source = format!("type ResponseContract = {expression};");
+    let Ok(program) = parse_program(&allocator, &source, SourceType::ts()) else {
+        return Vec::new();
+    };
+    #[derive(Default)]
+    struct References(Vec<(String, ReferenceKind)>);
+    impl<'a> Visit<'a> for References {
+        /// Collects a named type and visits generic arguments for additional dependencies.
+        fn visit_ts_type_reference(&mut self, reference: &TSTypeReference<'a>) {
+            if let Some(name) = ts_type_name(&reference.type_name) {
+                self.0.push((name, ReferenceKind::Type));
+            }
+            walk::walk_ts_type_reference(self, reference);
+        }
+
+        /// Records a schema value referenced by an inferred response type.
+        fn visit_ts_type_query(&mut self, query: &TSTypeQuery<'a>) {
+            if let Some(name) = query.expr_name.as_ts_type_name().and_then(ts_type_name) {
+                self.0.push((name, ReferenceKind::Schema));
+            }
+        }
+    }
+    let mut references = References::default();
+    references.visit_program(&program);
+    references.0
 }
 
 /// Extracts TypeScript `interface` and object/intersection/union `type` alias definitions
@@ -73,6 +268,12 @@ pub fn resolve_type_fields(
         collect_resolved_fields(ident, registry, &mut visited, &mut resolved);
     }
 
+    sort_type_fields(&mut resolved);
+    resolved
+}
+
+/// Orders declaration evidence consistently and collapses duplicate dependency paths.
+fn sort_type_fields(resolved: &mut Vec<(String, TypeFieldDef)>) {
     resolved.sort_by(|(file_a, field_a), (file_b, field_b)| {
         file_a
             .cmp(file_b)
@@ -81,7 +282,6 @@ pub fn resolve_type_fields(
             .then_with(|| field_a.snippet.cmp(&field_b.snippet))
     });
     resolved.dedup();
-    resolved
 }
 
 fn collect_resolved_fields(
@@ -136,13 +336,24 @@ fn is_ident_continue(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
+/// Parses a script block and collects its TypeScript declarations.
 fn extract_types_from_block(
     file_path: &str,
     source: &str,
     source_type: SourceType,
 ) -> Result<Vec<TypeContractDef>, Vec<String>> {
     let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, source_type).parse();
+    let program = parse_program(&allocator, source, source_type)?;
+    Ok(collect_type_definitions(file_path, source, &program))
+}
+
+/// Parses one script in its original language and returns its diagnostics on failure.
+fn parse_program<'a>(
+    allocator: &'a Allocator,
+    source: &'a str,
+    source_type: SourceType,
+) -> Result<Program<'a>, Vec<String>> {
+    let parsed = Parser::new(allocator, source, source_type).parse();
 
     if !parsed.diagnostics.is_empty() {
         return Err(parsed
@@ -152,14 +363,23 @@ fn extract_types_from_block(
             .collect());
     }
 
+    Ok(parsed.program)
+}
+
+/// Collects TypeScript contracts and their declaration locations.
+fn collect_type_definitions(
+    file_path: &str,
+    source: &str,
+    program: &Program<'_>,
+) -> Vec<TypeContractDef> {
     let mut collector = TypeCollector {
         file_path,
         source,
         line_index: LineIndex::new(source),
         defs: Vec::new(),
     };
-    collector.visit_program(&parsed.program);
-    Ok(collector.defs)
+    collector.visit_program(program);
+    collector.defs
 }
 
 struct LineIndex {
@@ -278,6 +498,7 @@ impl<'s> TypeCollector<'s> {
         }
     }
 
+    /// Collects fields and scoped references from a type alias.
     fn collect_alias_body(
         &self,
         ts_type: &TSType<'_>,
@@ -338,7 +559,7 @@ impl<'s> TypeCollector<'s> {
             }
             TSType::TSTypeReference(type_ref) => {
                 if let Some(name) = ts_type_name(&type_ref.type_name) {
-                    if is_transparent_utility_wrapper(name) {
+                    if is_transparent_utility_wrapper(&name) {
                         if let Some(args) = &type_ref.type_arguments
                             && let Some(first_arg) = args.params.first()
                         {
@@ -351,9 +572,9 @@ impl<'s> TypeCollector<'s> {
                                 is_object_like,
                             );
                         }
-                    } else if !is_ignored_builtin_type(name) {
-                        if seen_extends.insert(name.to_string()) {
-                            extends.push(name.to_string());
+                    } else if !is_ignored_builtin_type(&name) {
+                        if seen_extends.insert(name.clone()) {
+                            extends.push(name);
                         }
                         if let Some(args) = &type_ref.type_arguments {
                             for param in &args.params {
@@ -376,6 +597,7 @@ impl<'s> TypeCollector<'s> {
 }
 
 impl<'a> Visit<'a> for TypeCollector<'_> {
+    /// Captures interface fields and the qualified names of their parents.
     fn visit_ts_interface_declaration(&mut self, decl: &TSInterfaceDeclaration<'a>) {
         let name = decl.id.name.to_string();
         let line = self.line_index.line_number(decl.span.start);
@@ -384,7 +606,7 @@ impl<'a> Visit<'a> for TypeCollector<'_> {
         let mut seen_extends = HashSet::new();
         for heritage in &decl.extends {
             if let Some(parent_name) = ts_type_name(&heritage.type_name) {
-                if is_transparent_utility_wrapper(parent_name) {
+                if is_transparent_utility_wrapper(&parent_name) {
                     if let Some(args) = &heritage.type_arguments
                         && let Some(first_arg) = args.params.first()
                     {
@@ -400,10 +622,10 @@ impl<'a> Visit<'a> for TypeCollector<'_> {
                             &mut dummy_obj,
                         );
                     }
-                } else if !is_ignored_builtin_type(parent_name)
-                    && seen_extends.insert(parent_name.to_string())
+                } else if !is_ignored_builtin_type(&parent_name)
+                    && seen_extends.insert(parent_name.clone())
                 {
-                    extends.push(parent_name.to_string());
+                    extends.push(parent_name);
                 }
             }
         }
@@ -456,10 +678,13 @@ impl<'a> Visit<'a> for TypeCollector<'_> {
     }
 }
 
-fn ts_type_name<'a>(name: &'a TSTypeName<'a>) -> Option<&'a str> {
+/// Keeps qualified references intact so the module registry can identify namespace imports.
+pub(crate) fn ts_type_name(name: &TSTypeName<'_>) -> Option<String> {
     match name {
-        TSTypeName::IdentifierReference(id) => Some(id.name.as_str()),
-        TSTypeName::QualifiedName(qn) => Some(qn.right.name.as_str()),
+        TSTypeName::IdentifierReference(id) => Some(id.name.to_string()),
+        TSTypeName::QualifiedName(qn) => {
+            Some(format!("{}.{}", ts_type_name(&qn.left)?, qn.right.name))
+        }
         TSTypeName::ThisExpression(_) => None,
     }
 }

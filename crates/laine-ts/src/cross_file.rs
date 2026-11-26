@@ -20,6 +20,7 @@ use oxc_span::{GetSpan, SourceType, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::extractor::{ExtractContext, options_http_method};
+use crate::module_resolver::{self, ImportedSymbol, ModuleSymbols};
 use crate::url::{
     ServiceEndpointMatch, is_absolute_http_url, normalize_relative_path,
     resolve_url_against_services,
@@ -75,6 +76,17 @@ pub fn analyze_cross_file_dataflow_with_limits(
     ctx: ExtractContext<'_>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
 ) -> CrossFileAnalysis {
+    let axios_imports = collect_imported_axios_clients(files, ctx, resolve_import);
+    analyze_cross_file_dataflow_with_imports(files, ctx, resolve_import, &axios_imports)
+}
+
+/// Runs the dataflow passes using the same imported clients as local HTTP extraction.
+pub fn analyze_cross_file_dataflow_with_imports(
+    files: &[(String, String)],
+    ctx: ExtractContext<'_>,
+    resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+    axios_imports: &BTreeMap<String, FileAxiosImports>,
+) -> CrossFileAnalysis {
     // Canonical deterministic ordering regardless of caller input order.
     let mut file_map: BTreeMap<&str, &str> = BTreeMap::new();
     for (path, source) in files {
@@ -84,7 +96,7 @@ pub fn analyze_cross_file_dataflow_with_limits(
     // Pass 1: Extract per-file module summaries.
     let mut summaries: BTreeMap<String, ModuleSummary> = BTreeMap::new();
     for (&file_path, &source) in &file_map {
-        let summary = extract_module_summary(file_path, source, ctx);
+        let summary = extract_module_summary(file_path, source, ctx, axios_imports.get(file_path));
         summaries.insert(file_path.to_string(), summary);
     }
 
@@ -195,12 +207,33 @@ struct ParamFieldRead {
 
 #[derive(Debug, Clone, Default)]
 struct ModuleSummary {
+    axios_imports: FileAxiosImports,
     imports: BTreeMap<String, ImportBinding>,
     reexports: BTreeMap<String, ReExportTarget>,
     star_reexports: Vec<String>,
     internal_returns: BTreeMap<String, Vec<ExportReturnSummary>>,
     export_returns: BTreeMap<String, Vec<ExportReturnSummary>>,
     export_param_reads: BTreeMap<String, Vec<ParamFieldRead>>,
+}
+
+/// Imported Axios instances available in a source file, including instances with dynamic base URLs.
+#[derive(Debug, Clone, Default)]
+pub struct FileAxiosImports(BTreeMap<ImportedSymbol, Option<String>>);
+
+impl FileAxiosImports {
+    /// Maps the resolved instance to each local import spelling in this script block.
+    pub(crate) fn bindings(&self, program: &Program<'_>) -> BTreeMap<String, Option<String>> {
+        if self.0.is_empty() {
+            return BTreeMap::new();
+        }
+        let mut symbols = ModuleSymbols::default();
+        symbols.collect(program, false);
+        symbols
+            .imports
+            .into_iter()
+            .filter_map(|(local, import)| Some((local, self.0.get(&import)?.clone())))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -358,8 +391,109 @@ fn parse_program<'a>(
 // Pass 1: Per-File ModuleSummary Extraction
 // ---------------------------------------------------------------------------
 
-fn extract_module_summary(file_path: &str, source: &str, ctx: ExtractContext<'_>) -> ModuleSummary {
-    let mut summary = ModuleSummary::default();
+/// Collects Axios instances and resolves imports through named, default, and barrel exports.
+pub fn collect_imported_axios_clients(
+    files: &[(String, String)],
+    ctx: ExtractContext<'_>,
+    resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+) -> BTreeMap<String, FileAxiosImports> {
+    let mut modules = BTreeMap::new();
+    let mut instances = BTreeMap::new();
+    for (file, source) in files {
+        let mut symbols = ModuleSymbols::default();
+        for block in extract_parse_blocks(file, source) {
+            let allocator = Allocator::default();
+            let Some(program) = parse_program(&allocator, &block.code, block.source_type) else {
+                continue;
+            };
+            symbols.collect(&program, false);
+            collect_axios_instances(file, &program, ctx, &mut instances);
+        }
+        modules.insert(file.clone(), symbols);
+    }
+
+    modules
+        .iter()
+        .filter_map(|(file, symbols)| {
+            let imports: BTreeMap<_, _> = symbols
+                .imports
+                .values()
+                .filter_map(|import| {
+                    let origin = module_resolver::resolve_imported_symbol(
+                        file,
+                        import,
+                        &|path| modules.get(path),
+                        resolve_import,
+                    )?;
+                    Some((import.clone(), instances.get(&origin)?.clone()))
+                })
+                .collect();
+            (!imports.is_empty()).then(|| (file.clone(), FileAxiosImports(imports)))
+        })
+        .collect()
+}
+
+/// Records top-level Axios constructors and evaluates their base URL in the declaring module.
+fn collect_axios_instances(
+    file: &str,
+    program: &Program<'_>,
+    ctx: ExtractContext<'_>,
+    instances: &mut BTreeMap<(String, String), Option<String>>,
+) {
+    let mut env = BTreeMap::new();
+    for stmt in &program.body {
+        let vars = match stmt {
+            Statement::VariableDeclaration(vars) => vars,
+            Statement::ExportDeclaration(decl) => {
+                let Declaration::VariableDeclaration(vars) = &decl.declaration else {
+                    continue;
+                };
+                vars
+            }
+            Statement::ExportDefaultDeclaration(decl) => {
+                if let Some(Expression::CallExpression(call)) =
+                    decl.declaration.as_expression().map(unwrap_expr)
+                    && is_axios_create(call)
+                {
+                    instances.insert(
+                        (file.into(), "default".into()),
+                        detect_axios_create_base_url(call, ctx, &env),
+                    );
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        for var in &vars.declarations {
+            let (BindingPattern::BindingIdentifier(id), Some(init)) = (&var.id, &var.init) else {
+                continue;
+            };
+            match unwrap_expr(init) {
+                Expression::CallExpression(call) if is_axios_create(call) => {
+                    let base_url = detect_axios_create_base_url(call, ctx, &env);
+                    instances.insert((file.into(), id.name.to_string()), base_url);
+                }
+                expr => {
+                    if let Some(value) = eval_static_url_expr(expr, ctx, &env) {
+                        env.insert(id.name.to_string(), ModuleEnvVal::StringLiteral(value));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Builds a summary with imported instances available to local functions and hooks.
+fn extract_module_summary(
+    file_path: &str,
+    source: &str,
+    ctx: ExtractContext<'_>,
+    axios_imports: Option<&FileAxiosImports>,
+) -> ModuleSummary {
+    let mut summary = ModuleSummary {
+        axios_imports: axios_imports.cloned().unwrap_or_default(),
+        ..Default::default()
+    };
     let blocks = extract_parse_blocks(file_path, source);
 
     for block in blocks {
@@ -374,6 +508,7 @@ fn extract_module_summary(file_path: &str, source: &str, ctx: ExtractContext<'_>
     summary
 }
 
+/// Collects each script's bindings and summarizes its callable exports.
 fn extract_block_summary(
     program: &Program<'_>,
     source: &str,
@@ -381,7 +516,19 @@ fn extract_block_summary(
     ctx: ExtractContext<'_>,
     summary: &mut ModuleSummary,
 ) {
-    let mut module_env: BTreeMap<String, ModuleEnvVal> = BTreeMap::new();
+    let mut module_env: BTreeMap<String, ModuleEnvVal> = summary
+        .axios_imports
+        .bindings(program)
+        .into_iter()
+        .filter_map(|(name, base_url)| {
+            Some((
+                name,
+                ModuleEnvVal::HttpClientInstance {
+                    base_url: base_url?,
+                },
+            ))
+        })
+        .collect();
     let mut local_callables: BTreeSet<String> = BTreeSet::new();
 
     // Step 1a: Collect imports, re-exports, CommonJS requires, top-level constants/clients, and local callable names.
@@ -3572,6 +3719,7 @@ impl ConsumerBinding {
     }
 }
 
+/// Tracks response reads in each script block and in Vue templates.
 fn collect_consumer_reads(
     file_path: &str,
     source: &str,
@@ -3599,6 +3747,11 @@ fn collect_consumer_reads(
             resolve_import,
             out,
         );
+        for (name, base_url) in summary.axios_imports.bindings(&program) {
+            if let Some(base_url) = base_url {
+                visitor.bind_var(name, ConsumerBinding::HttpClientInstance { base_url });
+            }
+        }
         visitor.visit_program(&program);
 
         if block.is_vue_setup {
@@ -5033,18 +5186,22 @@ fn eval_template_url_with_lookup(
     Some(out)
 }
 
+/// Identifies an Axios constructor independently of whether its arguments are static.
+fn is_axios_create(call: &CallExpression<'_>) -> bool {
+    let Expression::StaticMemberExpression(member) = unwrap_expr(&call.callee) else {
+        return false;
+    };
+    matches!(unwrap_expr(&member.object), Expression::Identifier(obj) if obj.name == "axios")
+        && member.property.name == "create"
+}
+
+/// Evaluates a static base URL from a recognized Axios constructor.
 fn detect_axios_create_with_lookup(
     call: &CallExpression<'_>,
     ctx: ExtractContext<'_>,
     lookup_str: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let Expression::StaticMemberExpression(member) = unwrap_expr(&call.callee) else {
-        return None;
-    };
-    let Expression::Identifier(obj) = unwrap_expr(&member.object) else {
-        return None;
-    };
-    if obj.name != "axios" || member.property.name != "create" {
+    if !is_axios_create(call) {
         return None;
     }
     let Argument::ObjectExpression(opts) = call.arguments.first()? else {

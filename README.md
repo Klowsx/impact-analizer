@@ -188,7 +188,9 @@ Laine ships an official composite GitHub Action (`action.yml`) that runs impact 
 
 This example writes `laine.toml` beside both checkouts, so the service paths are relative to the workflow workspace. Set the consumer repository, the producer's OpenAPI path, and the base URL used by consumers for your project.
 
-For reports shared in CI, pass `--no-snippets` to `laine analyze` or `laine check` to omit evidence descriptions and suppress detailed errors. The GitHub Action enables it automatically. With `laine-version: source`, it builds Laine if the preinstalled binary lacks the flag. A pinned release must support the flag. File locations and dependency paths remain available.
+For reports shared in CI, pass `--no-snippets` to `laine analyze` or `laine check` to omit evidence descriptions and suppress detailed errors. The GitHub Action enables it automatically. With `laine-version: source`, it builds Laine if the preinstalled binary lacks the flag. A pinned release must support the flag. The Action checks its archive against the matching `.sha256` file before extraction. File locations and dependency paths remain available.
+
+Posting a PR comment requires `pull-requests: write`. Laine still applies its analysis result when a comment cannot be published.
 
 ```yaml
 name: Cross-Repo Impact Check

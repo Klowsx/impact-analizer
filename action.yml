@@ -36,7 +36,7 @@ inputs:
 
 outputs:
   exit-code:
-    description: "Exit code returned by laine analyze (0 = compatible/pass, 2 = breaking change, 1 = error)"
+    description: "Exit code returned by laine analyze (0 = policy passed, 2 = policy blocked, 1 = runtime or configuration error, 64 = invalid usage)"
     value: ${{ steps.run-laine.outputs.exit-code }}
   report-path:
     description: "Filesystem path to the generated Laine report"
@@ -56,20 +56,31 @@ runs:
       run: |
         set -euo pipefail
 
+        BINARY_NAME="laine"
+        if [ "${RUNNER_OS}" = "Windows" ]; then
+          BINARY_NAME="laine.exe"
+        fi
+
         if [ "${LAINE_VERSION}" = "source" ]; then
-          if command -v laine >/dev/null 2>&1; then
-            echo "Using pre-installed laine: $(command -v laine)"
+          # Usa un binario preinstalado solo si soporta reportes sin descripciones.
+          if existing="$(command -v laine)" &&
+             help_output="$("${existing}" analyze --help 2>/dev/null)" &&
+             [[ "${help_output}" == *"--no-snippets"* ]]; then
+            echo "Using pre-installed laine: ${existing}"
+            echo "binary-path=${existing}" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
           if ! command -v cargo >/dev/null 2>&1; then
-            echo "::error::laine is not installed and cargo was not found on PATH. Either install Rust or specify a release tag in laine-version (e.g. v0.1.0)."
+            echo "::error::No compatible laine binary or cargo was found on PATH. Install Rust or specify a release that supports --no-snippets."
             exit 1
           fi
 
           echo "Building laine from source at ${ACTION_PATH}..."
-          cargo build --release --manifest-path "${ACTION_PATH}/Cargo.toml" -p laine-cli --bin laine
+          cargo build --locked --release --manifest-path "${ACTION_PATH}/Cargo.toml" \
+            --target-dir "${ACTION_PATH}/target" -p laine-cli --bin laine
           echo "${ACTION_PATH}/target/release" >> "${GITHUB_PATH}"
+          echo "binary-path=${ACTION_PATH}/target/release/${BINARY_NAME}" >> "${GITHUB_OUTPUT}"
           exit 0
         fi
 
@@ -94,13 +105,48 @@ runs:
 
         ASSET="laine-${LAINE_VERSION}-${TARGET}.${EXT}"
         BASE_URL="https://github.com/Klowsx/impact-analizer/releases/download/${LAINE_VERSION}"
-        BIN_DIR="${RUNNER_TEMP}/laine-bin"
-        ARCHIVE_PATH="${RUNNER_TEMP}/${ASSET}"
+        DOWNLOAD_DIR="$(mktemp -d "${RUNNER_TEMP}/laine-release.XXXXXX")"
+        BIN_DIR="${DOWNLOAD_DIR}/bin"
+        ARCHIVE_PATH="${DOWNLOAD_DIR}/${ASSET}"
+        CHECKSUM_PATH="${ARCHIVE_PATH}.sha256"
 
-        mkdir -p "${BIN_DIR}"
+        # Descarga el archivo de suma exacto de esta versión y comprueba su formato.
+        if ! curl -fsSL --retry 3 "${BASE_URL}/${ASSET}.sha256" -o "${CHECKSUM_PATH}"; then
+          echo "::error::Unable to download the SHA-256 checksum for ${ASSET}."
+          exit 1
+        fi
+        if ! IFS= read -r checksum_line < "${CHECKSUM_PATH}"; then
+          echo "::error::Invalid SHA-256 checksum file for ${ASSET}."
+          exit 1
+        fi
+        checksum_line="${checksum_line%$'\r'}"
+        expected_hash="${checksum_line%% *}"
+        if [[ ! "${expected_hash}" =~ ^[0-9A-Fa-f]{64}$ || "${checksum_line}" != "${expected_hash}  ${ASSET}" ]] ||
+           ! { cmp -s "${CHECKSUM_PATH}" <(printf '%s\n' "${checksum_line}") ||
+               cmp -s "${CHECKSUM_PATH}" <(printf '%s\r\n' "${checksum_line}"); }; then
+          echo "::error::Invalid SHA-256 checksum file for ${ASSET}."
+          exit 1
+        fi
+
         echo "Downloading ${BASE_URL}/${ASSET}..."
         curl -fsSL --retry 3 "${BASE_URL}/${ASSET}" -o "${ARCHIVE_PATH}"
 
+        # Verifica los bytes del archivo antes de instalar cualquier contenido.
+        if command -v sha256sum >/dev/null 2>&1; then
+          actual_hash="$(sha256sum -b < "${ARCHIVE_PATH}")"
+        elif command -v shasum >/dev/null 2>&1; then
+          actual_hash="$(shasum -a 256 -b < "${ARCHIVE_PATH}")"
+        else
+          echo "::error::A SHA-256 tool (sha256sum or shasum) is required to install Laine."
+          exit 1
+        fi
+        expected_hash="$(printf '%s' "${expected_hash}" | LC_ALL=C tr 'A-F' 'a-f')"
+        if [[ "${actual_hash%% *}" != "${expected_hash}" ]]; then
+          echo "::error::SHA-256 mismatch for ${ASSET}."
+          exit 1
+        fi
+
+        mkdir -p "${BIN_DIR}"
         if [ "${EXT}" = "tar.gz" ]; then
           tar -xzf "${ARCHIVE_PATH}" -C "${BIN_DIR}"
           chmod +x "${BIN_DIR}/laine"
@@ -109,11 +155,13 @@ runs:
         fi
 
         echo "${BIN_DIR}" >> "${GITHUB_PATH}"
+        echo "binary-path=${BIN_DIR}/${BINARY_NAME}" >> "${GITHUB_OUTPUT}"
 
     - name: Run Laine impact analysis
       id: run-laine
       shell: bash
       env:
+        LAINE_BIN: ${{ steps.install-laine.outputs.binary-path }}
         LAINE_CONFIG: ${{ inputs.config }}
         LAINE_REPO: ${{ inputs.repo }}
         LAINE_BASE: ${{ inputs.base }}
@@ -122,14 +170,21 @@ runs:
       run: |
         set -uo pipefail
 
+        # Verifica que el binario pueda ocultar descripciones antes de publicar el reporte.
+        if ! help_output="$("${LAINE_BIN}" analyze --help 2>/dev/null)" || [[ "${help_output}" != *"--no-snippets"* ]]; then
+          echo "::error::This Action requires a Laine binary that supports --no-snippets. Use a compatible release or build it from source."
+          exit 1
+        fi
+
         REPORT_PATH="${RUNNER_TEMP}/laine-report.md"
         set +e
-        laine analyze \
+        "${LAINE_BIN}" analyze \
           --config "${LAINE_CONFIG}" \
           --repo "${LAINE_REPO}" \
           --base "${LAINE_BASE}" \
           --head "${LAINE_HEAD}" \
-          --format "${LAINE_FORMAT}" > "${REPORT_PATH}"
+          --format "${LAINE_FORMAT}" \
+          --no-snippets > "${REPORT_PATH}"
         EXIT_CODE=$?
         set -e
 
@@ -139,6 +194,7 @@ runs:
 
     - name: Post or update Pull Request comment
       if: ${{ inputs.comment-pr == 'true' && github.event_name == 'pull_request' }}
+      continue-on-error: true
       uses: actions/github-script@v7
       env:
         REPORT_PATH: ${{ steps.run-laine.outputs.report-path }}
@@ -176,34 +232,47 @@ runs:
           const { owner, repo } = context.repo;
           const issueNumber = context.issue.number;
 
-          const comments = await github.paginate(github.rest.issues.listComments, {
-            owner,
-            repo,
-            issue_number: issueNumber,
-            per_page: 100,
-          });
-
-          const existing = comments.find(
-            (comment) => comment.body && comment.body.includes(marker)
-          );
-
-          if (existing) {
-            await github.rest.issues.updateComment({
-              owner,
-              repo,
-              comment_id: existing.id,
-              body,
-            });
-          } else {
-            await github.rest.issues.createComment({
+          try {
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner,
               repo,
               issue_number: issueNumber,
-              body,
+              per_page: 100,
             });
+
+            // Actualiza únicamente el comentario del bot cuya primera línea es el marcador exacto.
+            const existing = comments.find(
+              (comment) =>
+                comment.user?.login === "github-actions[bot]" &&
+                comment.user?.type === "Bot" &&
+                comment.body?.split(/\r?\n/, 1)[0] === marker
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body,
+              });
+            }
+          } catch (error) {
+            if (error.status === 403 || error.status === 404) {
+              core.warning(`Could not publish the Laine report comment (HTTP ${error.status}). Check pull-requests permissions and access to the pull request.`);
+            } else {
+              throw error;
+            }
           }
 
     - name: Propagate Laine exit code
+      if: ${{ !cancelled() && steps.run-laine.outputs.exit-code != '' }}
       shell: bash
       env:
         LAINE_EXIT_CODE: ${{ steps.run-laine.outputs.exit-code }}

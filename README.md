@@ -105,6 +105,8 @@ laine analyze \
 
 ### Initialize Your Own Workspace
 
+In CI or when stdin or stderr is redirected, pass `--select` or `--all` to `init --scan` and `workspace edit`.
+
 ```bash
 # Auto-discover Git repos in the current folder (or pass a directory) and interactively pick the ones for this ecosystem.
 # Saves config cleanly under ~/.laine/configs/<workspace>.toml and auto-detects .env URLs & custom HTTP wrappers.
@@ -116,11 +118,17 @@ laine workspace add corporativo ./laine.corporativo.toml
 laine workspace edit corporativo
 laine workspace list
 
-# Run zero-flag impact checks from inside any registered repository (defaults to HEAD -> WORKTREE)
+# Run zero-flag impact checks from inside a registered producer (defaults to HEAD -> WORKTREE)
 cd ./projects/cerebro-web
 laine check
 laine check --staged
 ```
+
+Use `laine workspace add <name> <config> --replace` to replace an existing registration. Use `laine init --workspace <name> --force` to replace a managed workspace config.
+
+Consumer scans read `HEAD` by default. Use `--consumer-revision staged` to search the Git index or `--consumer-revision worktree` to search local files. For example, `laine check --staged --consumer-revision staged` uses the index for both producer and consumers, including client code in the producer checkout.
+
+From a consumer-only checkout, `laine check` prints commands for the producers configured in its workspace. For example, run `laine check --workspace corporativo --repo cerebro-web` to check the producer.
 
 You can also configure a workspace manually:
 
@@ -132,9 +140,17 @@ laine repo add ./laravel-api --framework laravel --base-url https://api.internal
 laine index --config laine.toml
 ```
 
+`repo add` resolves its path from your current directory and saves the Git checkout root. It accepts a subdirectory of an existing checkout.
+
+When Git detects a rename of the configured OpenAPI file, `analyze` compares both names and cites the file in each revision. Stage a local rename so Git can detect it.
+
+Source files are read as UTF-8. OpenAPI also accepts a UTF-8 byte order mark. Laine leaves symbolic links unread in commits, the index, and the worktree, and reports skipped candidate files as incomplete coverage.
+
 ---
 
 ## Configuration (`laine.toml`)
+
+The default SQLite cache lives in `~/.laine/cache/`, or under `$LAINE_HOME/cache/` when set. Use `cache_path` to choose an explicit destination. Laine rebuilds incompatible snapshot tables and expires snapshots older than 30 days. `analyze` and `check` continue without persisted snapshots when the cache is unavailable. `index` requires a writable cache.
 
 ```toml
 version = 1
@@ -185,6 +201,10 @@ path_prefix = "/api"
 Laine ships an official composite GitHub Action (`action.yml`) that runs impact analysis on Pull Requests, posts or updates a single sticky comment (`<!-- laine-impact-report -->`), and fails the check with exit code `2` when breaking changes violate `[policy]`.
 
 This example writes `laine.toml` beside both checkouts, so the service paths are relative to the workflow workspace. Set the consumer repository, the producer's OpenAPI path, and the base URL used by consumers for your project.
+
+For reports shared in CI, pass `--no-snippets` to `laine analyze` or `laine check` to omit evidence descriptions and suppress detailed errors. The GitHub Action enables it automatically. With `laine-version: source`, it builds Laine if the preinstalled binary lacks the flag. A pinned release must support the flag. The Action checks its archive against the matching `.sha256` file before extraction. File locations and dependency paths remain available.
+
+Posting a PR comment requires `pull-requests: write`. Laine still applies its analysis result when a comment cannot be published.
 
 ```yaml
 name: Cross-Repo Impact Check

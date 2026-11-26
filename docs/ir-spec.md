@@ -69,12 +69,24 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 | `target_repo` | `string` | Yes | — | Name of the producer repository whose diff was analyzed. |
 | `base_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Base commit before the change. |
 | `head_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Head commit after the change. |
+| `policy` | `object` | For CLI analysis | Omitted by reports produced without workspace policy | The policy decision for the reported findings and unresolved calls. |
+| `exit_code` | `integer` | For CLI analysis | `0` or `2`, matching the process | The effective exit code of a completed analysis. |
+| `workspace` | `object` | For CLI analysis | `repo_roots` is present only with `--include-repo-roots` | Local workspace identifier and optional checkout map. |
+| `consumer_revisions` | `object` | For CLI analysis | Map from service name to commit SHA, `STAGED`, or `WORKTREE` | Snapshots searched for client code, including the producer checkout. |
+| `coverage` | `object` | For CLI analysis | Omitted by reports produced without workspace extraction | `complete` and the counts for `producer_base`, `producer_head`, and `consumers`. |
+| `diagnostics` | `array` | No | Omitted when empty | Source extraction failures ordered by repository, revision, and file. |
 | `stats` | [`AnalysisStats`](#32-analysisstats) | Yes | — | Deterministic structural counts for the run. |
 | `findings` | `Array<`[`ImpactFinding`](#35-impactfinding)`>` | Yes | May be empty `[]` | Detected breaking contract changes and their direct/indirect consumers. |
 | `unresolved_calls` | `Array<`[`UnresolvedCall`](#38-unresolvedcall)`>` | Yes | Sorted by `(repo, file, line, reason)` | Dynamic or unresolvable consumer HTTP calls (`UNKNOWN`). |
 | `discrepancies` | `Array<`[`ContractDiscrepancy`](#39-contractdiscrepancy)`>` | No | Omitted when empty (`skip_serializing_if`) | Mismatches between OpenAPI spec and extracted backend code routes. |
 
 > **Note on volatile metrics:** Wall-clock timings (such as `elapsed_ms`) are intentionally excluded from `AnalysisReport` JSON and rendered only in terminal output so repeated runs on identical commits remain byte-for-byte identical.
+
+`policy` contains `should_fail`, `exit_code`, `blocking_findings`, `blocking_unresolved_calls`, and `reason`. `exit_code` is `0` when policy passes or `2` when it blocks, matching the CLI process. A report can include findings below the configured threshold or be blocked by unresolved calls with zero findings.
+
+Coverage counts discovered, read, analyzed, and failed source files. When a known read or parse error leaves coverage incomplete, diagnostics include `repo`, `revision`, `file`, `stage`, `code`, and `remediation`. Route removals require complete route extraction on both sides. OpenAPI changes can still be reported if both OpenAPI snapshots were analyzed. The policy decision applies to the evidence collected. `dataflow_limit_reached` identifies files with cross-file TypeScript summaries that would require additional propagation rounds. Laravel declarations that cannot be determined statically report `route_declaration_unresolved` and the source `line` when available. OpenAPI references are read from the same revision as the main specification. An unresolved reference or cycle includes its `file`, `line` when available, and `json_pointer`. Operations with unresolved schemas are skipped for the schema diff. Fields declared in only some `oneOf` or `anyOf` alternatives are conditional.
+
+`workspace.id` is a stable identifier for the resolved configuration path on the local machine. Evidence paths are relative to their repositories. Add `--include-repo-roots` to a JSON analysis to map those repository names to absolute local checkouts.
 
 ### 3.2 `AnalysisStats`
 
@@ -130,9 +142,12 @@ Ordered from lowest to highest:
 | `change` | [`ContractChange`](#36-contractchange) | Yes | Internally tagged by `"kind"` | Structured description of the breaking producer change. |
 | `severity` | [`Severity`](#severity-uppercase) | Yes | — | Blast-radius classification. |
 | `confidence` | [`Confidence`](#confidence-uppercase) | Yes | — | Certainty level of the producer change (`"CONFIRMED"`). |
-| `producer_evidence` | [`Evidence`](#34-endpointid--evidence) | Yes | — | Exact location in the producer contract or route file. |
+| `producer_evidence` | `ProducerEvidence` | Yes | — | Source in base for removals and response type changes. Source in head for request changes. |
+| `producer_evidence_comparison` | `ProducerEvidence` | No | Present for type changes | Source for the other revision of the type change. |
 | `consumers` | `Array<`[`AffectedConsumer`](#37-affectedconsumer--indirectconsumer)`>` | Yes | Sorted deterministically | Direct consumer sites affected by this change. |
 | `indirect_consumers` | `Array<`[`IndirectConsumer`](#37-affectedconsumer--indirectconsumer)`>` | No | Omitted when empty (`skip_serializing_if`) | Transitive downstream repositories discovered via cycle-safe BFS. |
+
+`ProducerEvidence` includes `repo`, `revision`, `file` and `description`. OpenAPI evidence includes a `json_pointer` to the declaration, which may be inside a referenced component. When the source has a verified location, `line` is one-based and `span` records its start and exclusive end with one-based lines and columns. Code routes provide a line when the extractor supplies it. `snippet` is reserved for literal source and is empty when omitted.
 
 ### 3.6 `ContractChange`
 
@@ -143,6 +158,9 @@ Internally tagged enum (`#[serde(tag = "kind", rename_all = "snake_case")]`). Ba
 | `"endpoint_removed"` | `endpoint: EndpointId` | Base spec / route file | All consumers with `Consumes` edge to `endpoint`. |
 | `"response_field_removed"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string`, `previous_type: string` | Base spec | Consumers with `ReadsField` edge matching `field_path` (or nested child). |
 | `"response_field_type_changed"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string`, `previous_type: string`, `new_type: string` | Base spec | Consumers with `ReadsField` edge matching `field_path` (or nested child). |
+| `"response_field_made_optional"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string` | Head spec with base comparison | Consumers with matching field reads. |
+| `"body_type_changed"` | `endpoint: EndpointId`, `status_code?: string`, `previous_type: string`, `new_type: string` | Base spec for a response, head spec for a request | Callers of the endpoint with `POSSIBLE` confidence. `status_code` is present for responses. |
+| `"request_parameter_type_changed"` | `endpoint: EndpointId`, `location: string`, `name: string`, `previous_type: string`, `new_type: string` | Head spec with base comparison | Callers of the endpoint with `POSSIBLE` confidence. |
 | `"request_field_added_required"` | `endpoint: EndpointId`, `field_path: string`, `field_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |
 | `"request_field_type_changed"` | `endpoint: EndpointId`, `field_path: string`, `previous_type: string`, `new_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |
 | `"required_parameter_added"` | `endpoint: EndpointId`, `location: string`, `name: string`, `param_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |
@@ -235,10 +253,12 @@ Laine strictly separates **how sure we are** (`Confidence`) from **how severe th
       "confidence": "CONFIRMED",
       "producer_evidence": {
         "repo": "customer-service",
-        "revision": "9f8e7d6c5b4a3210fedcba0987654321fedcba09",
+        "revision": "1a2b3c4d5e6f78901234567890abcdef12345678",
         "file": "openapi.yaml",
         "line": 24,
-        "snippet": "field `fullName`"
+        "json_pointer": "/components/schemas/Customer/properties/fullName",
+        "description": "Response field fullName (string)",
+        "snippet": ""
       },
       "consumers": [
         {
@@ -290,7 +310,8 @@ Laine strictly separates **how sure we are** (`Confidence`) from **how severe th
         "revision": "9f8e7d6c5b4a3210fedcba0987654321fedcba09",
         "file": "openapi.yaml",
         "line": 42,
-        "snippet": "required header parameter `X-Tenant-Id` (string)"
+        "description": "Required header parameter X-Tenant-Id (string)",
+        "snippet": ""
       },
       "consumers": [
         {
@@ -349,6 +370,9 @@ Laine strictly separates **how sure we are** (`Confidence`) from **how severe th
 | `0` | **Compatible / Pass** | No breaking changes were detected, or all findings fell below the configured `[policy]` blocking thresholds. |
 | `2` | **Breaking Change / Policy Failure** | One or more findings triggered the active `[policy]` blocking rules (default: `fail_on = "low"`, meaning any breaking contract finding fails the check). |
 | `1` | **Configuration or Runtime Error** | Invalid `laine.toml`, missing service or Git revision, malformed OpenAPI spec, unreadable repository, or I/O error. |
+| `64` | **Invalid Command Usage** | An analysis flag is invalid or a required argument is missing. |
+
+In JSON mode, `analyze` and `check` write an error document on stdout for exit codes `1` and `64`. It has `schema_version`, `status: "error"`, `exit_code`, and `diagnostics`. Each diagnostic has a stable `code` and `remediation` plus a human-readable `message`. A completed analysis has the report fields above and an exit code of `0` or `2`.
 
 Policy behavior is controlled via the optional `[policy]` table in `laine.toml`:
 - `fail_on` (`"low"` | `"medium"` | `"high"` | `"critical"`, default `"low"`): Minimum finding `Severity` that triggers exit code `2`.
@@ -359,7 +383,7 @@ Policy behavior is controlled via the optional `[policy]` table in `laine.toml`:
 
 ## 7. Determinism Guarantees
 
-Laine enforces strict reproducibility for identical Git commits, `laine.toml`, and binary version:
+Laine enforces strict reproducibility for identical Git snapshots, workspace, `laine.toml` options, and binary version:
 
 1. **Ordered Collections:** OpenAPI endpoints (`BTreeMap<EndpointId, EndpointContract>`), response/request schemas, parameters, code route maps, indirect consumer maps, and deduplicated consumer hits (`BTreeMap`) eliminate `HashMap` iteration randomness.
 2. **Explicit Stable Sorting:** `consumers_of_endpoint`, `transitive_dependent_paths`, and `unresolved_calls` are explicitly sorted by `(repo, file, line, ...)` prior to report assembly.

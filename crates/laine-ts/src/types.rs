@@ -32,6 +32,7 @@ pub struct TypeContractDef {
 
 /// Extracts TypeScript `interface` and object/intersection/union `type` alias definitions
 /// from a `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, or `.vue` file.
+// Extrae tipos con el parser adecuado para cada bloque de script.
 pub fn extract_type_definitions(
     file_path: &str,
     source: &str,
@@ -40,11 +41,7 @@ pub fn extract_type_definitions(
         let blocks = extract_vue_scripts(source);
         let mut defs = Vec::new();
         for block in blocks {
-            let source_type = if block.is_ts {
-                SourceType::ts()
-            } else {
-                SourceType::mjs()
-            };
+            let source_type = block.lang.source_type();
             defs.extend(extract_types_from_block(
                 file_path,
                 &block.code,

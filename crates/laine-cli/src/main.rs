@@ -2,26 +2,29 @@ mod selector;
 
 use std::collections::HashSet;
 use std::env;
-use std::fs;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use laine_cli::engine::{AnalyzeRequest, index_workspace, run_analysis_with_options};
-use laine_cli::report::{render_json, render_markdown, render_terminal};
+use laine_cli::engine::{
+    AnalyzeRequest, ConsumerRevision, index_workspace, run_analysis_with_consumer_revision,
+};
+use laine_cli::report::{omit_snippets, render_json, render_markdown, render_terminal};
 use laine_core::config::{
     PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig,
+    lock_config_update, write_config_atomically,
 };
+use laine_core::error::LaineError;
 use laine_core::fixtures::create_demo_workspace;
-use laine_core::git::STAGED_REV;
-use laine_core::policy::evaluate_policy;
+use laine_core::git::{GitRepo, STAGED_REV};
 use laine_core::workspace::{
     DiscoveredRepo, WorkspaceRegistry, build_workspace_config, infer_workspace_scan_dir,
     inspect_repo_path, merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
-    scan_directory,
+    scan_directory, validate_workspace_name,
 };
-use selector::select_repositories;
+use selector::{ensure_selection_terminal, select_repositories};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -105,6 +108,15 @@ enum Commands {
         /// Bypass the SQLite incremental extraction cache
         #[arg(long)]
         no_cache: bool,
+        /// Suppress evidence snippets and detailed errors in publishable reports
+        #[arg(long)]
+        no_snippets: bool,
+        /// Include the local checkout roots in the JSON report
+        #[arg(long)]
+        include_repo_roots: bool,
+        /// Revision of consumer checkouts, including client code in the producer repo
+        #[arg(long, value_enum, ignore_case = true, default_value_t = ConsumerRevision::Head)]
+        consumer_revision: ConsumerRevision,
     },
     /// Analyze cross-repository impact between two Git revisions
     Analyze {
@@ -126,6 +138,15 @@ enum Commands {
         /// Bypass the SQLite incremental extraction cache
         #[arg(long)]
         no_cache: bool,
+        /// Suppress evidence snippets and detailed errors in publishable reports
+        #[arg(long)]
+        no_snippets: bool,
+        /// Include the local checkout roots in the JSON report
+        #[arg(long)]
+        include_repo_roots: bool,
+        /// Revision of consumer checkouts, including client code in the producer repo
+        #[arg(long, value_enum, ignore_case = true, default_value_t = ConsumerRevision::Head)]
+        consumer_revision: ConsumerRevision,
     },
 }
 
@@ -139,6 +160,9 @@ enum WorkspaceAction {
         name: String,
         /// Path to the workspace's laine.toml file
         config: PathBuf,
+        /// Replace an existing registration with the same name
+        #[arg(long)]
+        replace: bool,
     },
     /// Interactively add or remove repositories in an existing workspace
     Edit {
@@ -214,6 +238,17 @@ enum OutputFormat {
     Markdown,
 }
 
+#[derive(Clone, Copy)]
+struct AnalysisOutput {
+    format: OutputFormat,
+    no_cache: bool,
+    no_snippets: bool,
+    include_repo_roots: bool,
+    consumer_revision: ConsumerRevision,
+}
+
+const USAGE_EXIT_CODE: u8 = 64;
+
 const STARTER_CONFIG: &str = r#"# Laine cross-repository impact analyzer configuration
 version = 1
 
@@ -234,8 +269,12 @@ version = 1
 # target_service = "customer-service"
 "#;
 
+// Interpreta los argumentos y ejecuta el comando seleccionado.
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(exit) => return exit,
+    };
 
     match cli.command {
         Commands::Init {
@@ -304,18 +343,35 @@ fn main() -> ExitCode {
             staged,
             format,
             no_cache,
+            no_snippets,
+            include_repo_roots,
+            consumer_revision,
         } => {
+            let output = AnalysisOutput {
+                format,
+                no_cache,
+                no_snippets,
+                include_repo_roots,
+                consumer_revision,
+            };
             let cwd = match env::current_dir() {
                 Ok(dir) => dir,
                 Err(err) => {
-                    eprintln!("Failed to determine current directory: {err}");
+                    print_analysis_error(
+                        "Check",
+                        &LaineError::Io {
+                            path: PathBuf::from("."),
+                            source: err,
+                        },
+                        output,
+                    );
                     return ExitCode::FAILURE;
                 }
             };
             let registry_path = match WorkspaceRegistry::default_path() {
                 Ok(p) => p,
                 Err(err) => {
-                    eprintln!("Workspace registry error: {err}");
+                    print_analysis_error("Check", &err, output);
                     return ExitCode::FAILURE;
                 }
             };
@@ -328,19 +384,20 @@ fn main() -> ExitCode {
             ) {
                 Ok(ctx) => ctx,
                 Err(err) => {
-                    eprintln!("Check error: {err}");
+                    print_analysis_error("Check", &err, output);
                     return ExitCode::FAILURE;
                 }
             };
 
             let effective_head = if staged { STAGED_REV.to_string() } else { head };
             execute_analysis(
-                resolved.config_path,
-                resolved.repo_name,
-                base,
-                effective_head,
-                format,
-                no_cache,
+                AnalyzeRequest {
+                    config_path: resolved.config_path,
+                    target_repo: resolved.repo_name,
+                    base_rev: base,
+                    head_rev: effective_head,
+                },
+                output,
             )
         }
         Commands::Analyze {
@@ -350,10 +407,67 @@ fn main() -> ExitCode {
             head,
             format,
             no_cache,
-        } => execute_analysis(config, repo, base, head, format, no_cache),
+            no_snippets,
+            include_repo_roots,
+            consumer_revision,
+        } => execute_analysis(
+            AnalyzeRequest {
+                config_path: config,
+                target_repo: repo,
+                base_rev: base,
+                head_rev: head,
+            },
+            AnalysisOutput {
+                format,
+                no_cache,
+                no_snippets,
+                include_repo_roots,
+                consumer_revision,
+            },
+        ),
     }
 }
 
+// Conserva la ayuda normal de Clap y distingue el uso inválido del bloqueo de política.
+fn parse_cli() -> Result<Cli, ExitCode> {
+    let args = env::args_os().collect::<Vec<_>>();
+    match Cli::try_parse_from(&args) {
+        Ok(cli) => Ok(cli),
+        Err(error) => {
+            let analysis = args
+                .get(1)
+                .is_some_and(|command| command == "analyze" || command == "check");
+            if !analysis || !error.use_stderr() {
+                let _ = error.print();
+                return Err(ExitCode::from(error.exit_code() as u8));
+            }
+
+            let mut args = args.iter().skip(2).take_while(|arg| *arg != "--");
+            let mut json = false;
+            while let Some(arg) = args.next() {
+                if arg == "--format=json"
+                    || (arg == "--format" && args.next().is_some_and(|value| value == "json"))
+                {
+                    json = true;
+                    break;
+                }
+            }
+            if json {
+                print_json_error(
+                    USAGE_EXIT_CODE,
+                    "invalid_arguments",
+                    "check_command_help",
+                    "Invalid analysis arguments. Run the command with --help.",
+                );
+            } else {
+                let _ = error.print();
+            }
+            Err(ExitCode::from(USAGE_EXIT_CODE))
+        }
+    }
+}
+
+/// Inicializa la configuración y valida el terminal antes de escanear si pide selección.
 fn handle_init(
     path: Option<PathBuf>,
     force: bool,
@@ -362,6 +476,12 @@ fn handle_init(
     all: bool,
     workspace: Option<String>,
 ) -> ExitCode {
+    if let Some(name) = workspace.as_deref()
+        && let Err(err) = validate_workspace_name(name)
+    {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
     let dest = match path {
         Some(explicit) => explicit,
         None => match workspace.as_deref() {
@@ -385,6 +505,14 @@ fn handle_init(
     }
 
     if let Some(scan_dir) = scan {
+        if !all
+            && select.is_empty()
+            && let Err(message) = ensure_selection_terminal()
+        {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+
         let discovered = match scan_directory(&scan_dir) {
             Ok(repos) => repos,
             Err(err) => {
@@ -432,8 +560,10 @@ fn handle_init(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let cfg = build_workspace_config(&selected, config_dir, false);
-        if let Err(err) = cfg.save_to_path(&dest) {
-            eprintln!("Failed to save {}: {err}", dest.display());
+        if let Err(err) =
+            persist_initialized_workspace(&dest, workspace.as_deref(), force, Some(&cfg))
+        {
+            eprintln!("{err}");
             return ExitCode::FAILURE;
         }
 
@@ -462,24 +592,22 @@ fn handle_init(
         if !cfg.env.is_empty() {
             println!("Auto-detected {} API URL env var(s).", cfg.env.len());
         }
-    } else if let Err(err) = fs::write(&dest, STARTER_CONFIG) {
-        eprintln!("Failed to write {}: {err}", dest.display());
+    } else if let Err(err) = persist_initialized_workspace(&dest, workspace.as_deref(), force, None)
+    {
+        eprintln!("{err}");
         return ExitCode::FAILURE;
     } else {
         println!("Initialized {}", dest.display());
     }
 
     if let Some(ws_name) = workspace {
-        if let Err(msg) = register_workspace(&ws_name, &dest) {
-            eprintln!("{msg}");
-            return ExitCode::FAILURE;
-        }
         println!("Registered workspace '{ws_name}' -> {}", dest.display());
     }
 
     ExitCode::SUCCESS
 }
 
+// Lee el registro y serializa los cambios de nombres entre procesos.
 fn handle_workspace(action: WorkspaceAction) -> ExitCode {
     let registry_path = match WorkspaceRegistry::default_path() {
         Ok(p) => p,
@@ -509,7 +637,11 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        WorkspaceAction::Add { name, config } => {
+        WorkspaceAction::Add {
+            name,
+            config,
+            replace,
+        } => {
             if !config.is_file() {
                 eprintln!("Config file does not exist: {}", config.display());
                 return ExitCode::FAILURE;
@@ -518,7 +650,7 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
                 eprintln!("Invalid Laine config {}: {err}", config.display());
                 return ExitCode::FAILURE;
             }
-            match register_workspace(&name, &config) {
+            match register_workspace(&registry_path, &name, &config, replace) {
                 Ok(()) => {
                     println!("Registered workspace '{name}' -> {}", config.display());
                     ExitCode::SUCCESS
@@ -536,6 +668,9 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
             all,
         } => handle_workspace_edit(&name, scan, select, all, &registry_path),
         WorkspaceAction::Remove { name } => {
+            let Ok(_lock) = lock_cli_update(&registry_path) else {
+                return ExitCode::FAILURE;
+            };
             let mut reg = match WorkspaceRegistry::load_from_path(&registry_path) {
                 Ok(r) => r,
                 Err(err) => {
@@ -557,6 +692,7 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
     }
 }
 
+/// Actualiza los repositorios de un workspace con una selección explícita o interactiva.
 fn handle_workspace_edit(
     name: &str,
     scan: Option<PathBuf>,
@@ -564,6 +700,14 @@ fn handle_workspace_edit(
     all: bool,
     registry_path: &Path,
 ) -> ExitCode {
+    if !all
+        && select.is_empty()
+        && let Err(message) = ensure_selection_terminal()
+    {
+        eprintln!("{message}");
+        return ExitCode::FAILURE;
+    }
+
     let reg = match WorkspaceRegistry::load_from_path(registry_path) {
         Ok(r) => r,
         Err(err) => {
@@ -573,6 +717,9 @@ fn handle_workspace_edit(
     };
     let Some(cfg_path) = reg.workspaces.get(name) else {
         eprintln!("Workspace '{name}' is not registered.");
+        return ExitCode::FAILURE;
+    };
+    let Ok(_lock) = lock_cli_update(cfg_path) else {
         return ExitCode::FAILURE;
     };
     let existing = match WorkspaceConfig::load_from_path(cfg_path) {
@@ -685,6 +832,8 @@ fn handle_workspace_edit(
     ExitCode::SUCCESS
 }
 
+// Valida la raíz Git antes de dar de alta un servicio y guarda su referencia desde el TOML.
+// Actualiza los repositorios manteniendo el bloqueo hasta guardar el TOML.
 fn handle_repo(action: RepoAction) -> ExitCode {
     match action {
         RepoAction::Add {
@@ -696,6 +845,13 @@ fn handle_repo(action: RepoAction) -> ExitCode {
             base_urls,
             framework,
         } => {
+            let repo = match GitRepo::discover(&path) {
+                Ok(repo) => repo,
+                Err(err) => {
+                    eprintln!("Cannot add Git repository at {}: {err}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
             let target_cfg_path = match resolve_repo_command_config(config, workspace.as_deref()) {
                 Ok(p) => p,
                 Err(msg) => {
@@ -704,8 +860,12 @@ fn handle_repo(action: RepoAction) -> ExitCode {
                 }
             };
 
+            let Ok(_lock) = lock_cli_update(&target_cfg_path) else {
+                return ExitCode::FAILURE;
+            };
             let service_name = name.unwrap_or_else(|| {
-                path.file_name()
+                repo.root()
+                    .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "service".to_string())
             });
@@ -751,7 +911,7 @@ fn handle_repo(action: RepoAction) -> ExitCode {
 
             cfg.services.push(ServiceConfig {
                 name: service_name.clone(),
-                path,
+                path: repo_path_for_config(repo.root(), &target_cfg_path),
                 openapi,
                 routes,
                 base_urls,
@@ -784,6 +944,9 @@ fn handle_repo(action: RepoAction) -> ExitCode {
                 }
             };
 
+            let Ok(_lock) = lock_cli_update(&target_cfg_path) else {
+                return ExitCode::FAILURE;
+            };
             let mut cfg = match WorkspaceConfig::load_from_path(&target_cfg_path) {
                 Ok(c) => c,
                 Err(err) => {
@@ -820,6 +983,21 @@ fn handle_repo(action: RepoAction) -> ExitCode {
     }
 }
 
+// Usa una ruta relativa si el checkout está dentro del directorio del TOML.
+fn repo_path_for_config(root: &Path, config: &Path) -> PathBuf {
+    let config_dir = normalize_absolute_path(
+        config
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new(".")),
+    );
+    match root.strip_prefix(config_dir) {
+        Ok(path) if path.as_os_str().is_empty() => PathBuf::from("."),
+        Ok(path) => path.to_path_buf(),
+        Err(_) => root.to_path_buf(),
+    }
+}
+
 fn resolve_repo_command_config(
     config: PathBuf,
     workspace: Option<&str>,
@@ -838,14 +1016,77 @@ fn resolve_repo_command_config(
     }
 }
 
-fn register_workspace(name: &str, config_path: &Path) -> Result<(), String> {
-    let registry_path =
-        WorkspaceRegistry::default_path().map_err(|e| format!("Workspace registry error: {e}"))?;
-    let mut reg = WorkspaceRegistry::load_from_path(&registry_path)
-        .map_err(|e| format!("Failed to load workspace registry: {e}"))?;
-    reg.register(name, config_path.to_path_buf());
-    reg.save_to_path(&registry_path)
-        .map_err(|e| format!("Failed to save workspace registry: {e}"))
+// Conserva el bloqueo mientras se lee, modifica y reemplaza el registro.
+fn register_workspace(
+    registry_path: &Path,
+    name: &str,
+    config_path: &Path,
+    replace: bool,
+) -> Result<(), String> {
+    ensure_distinct_config(registry_path, config_path)?;
+    let _lock = lock_config_update(registry_path).map_err(|err| err.to_string())?;
+    let mut reg = WorkspaceRegistry::load_from_path(registry_path)
+        .map_err(|err| format!("Failed to load workspace registry: {err}"))?;
+    reg.register(name, config_path.to_path_buf(), replace)
+        .map_err(|err| err.to_string())?;
+    reg.save_to_path(registry_path)
+        .map_err(|err| format!("Failed to save workspace registry: {err}"))
+}
+
+// Valida el alta bajo bloqueo y guarda el archivo antes de publicar su entrada en el registro.
+fn persist_initialized_workspace(
+    dest: &Path,
+    workspace: Option<&str>,
+    force: bool,
+    config: Option<&WorkspaceConfig>,
+) -> Result<(), String> {
+    let registration = if let Some(name) = workspace {
+        let path = WorkspaceRegistry::default_path().map_err(|err| err.to_string())?;
+        ensure_distinct_config(&path, dest)?;
+        let lock = lock_config_update(&path).map_err(|err| err.to_string())?;
+        let mut registry =
+            WorkspaceRegistry::load_from_path(&path).map_err(|err| err.to_string())?;
+        registry
+            .register(name, dest.to_path_buf(), force)
+            .map_err(|err| err.to_string())?;
+        Some((path, registry, lock))
+    } else {
+        None
+    };
+
+    let _lock = lock_config_update(dest).map_err(|err| err.to_string())?;
+    if dest.exists() && !force {
+        return Err(format!(
+            "Config file {} already exists (use --force to overwrite)",
+            dest.display()
+        ));
+    }
+    if let Some(config) = config {
+        config.save_to_path(dest)
+    } else {
+        write_config_atomically(dest, STARTER_CONFIG.as_bytes())
+    }
+    .map_err(|err| format!("Failed to save {}: {err}", dest.display()))?;
+
+    if let Some((path, registry, _registry_lock)) = registration {
+        registry
+            .save_to_path(&path)
+            .map_err(|err| err.to_string())?;
+    }
+    Ok(())
+}
+
+// Evita que la configuración apunte al registro y que se intente bloquear la misma ruta dos veces.
+fn ensure_distinct_config(registry: &Path, config: &Path) -> Result<(), String> {
+    if normalize_absolute_path(registry) == normalize_absolute_path(config) {
+        return Err("Workspace config and workspace registry must use different files.".into());
+    }
+    Ok(())
+}
+
+// Muestra el fallo de bloqueo antes de salir de un comando que modifica un TOML.
+fn lock_cli_update(path: &Path) -> Result<File, ()> {
+    lock_config_update(path).map_err(|err| eprintln!("Failed to lock {}: {err}", path.display()))
 }
 
 fn filter_selected_repos(
@@ -876,42 +1117,35 @@ fn filter_selected_repos(
     Ok(selected)
 }
 
-fn execute_analysis(
-    config: PathBuf,
-    repo: String,
-    base: String,
-    head: String,
-    format: OutputFormat,
-    no_cache: bool,
-) -> ExitCode {
+// Imprime el resultado del análisis o un error estructurado para el formato solicitado.
+fn execute_analysis(req: AnalyzeRequest, output: AnalysisOutput) -> ExitCode {
     let started = Instant::now();
-    let workspace_cfg = match WorkspaceConfig::load_from_path(&config) {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            eprintln!("Analysis error: {err}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let req = AnalyzeRequest {
-        config_path: config,
-        target_repo: repo,
-        base_rev: base,
-        head_rev: head,
-    };
-
-    match run_analysis_with_options(&req, no_cache) {
-        Ok(report) => {
+    match run_analysis_with_consumer_revision(
+        &req,
+        output.no_cache,
+        output.include_repo_roots && matches!(output.format, OutputFormat::Json),
+        output.consumer_revision,
+    ) {
+        Ok(mut report) => {
+            if output.no_snippets {
+                omit_snippets(&mut report);
+            }
             let elapsed_ms = started.elapsed().as_millis();
-            let policy_eval = evaluate_policy(&report, &workspace_cfg.policy);
+            let exit_code = report.exit_code.unwrap_or(1);
 
-            match format {
+            match output.format {
                 OutputFormat::Terminal => {
                     print!("{}", render_terminal(&report, elapsed_ms));
                 }
                 OutputFormat::Json => match render_json(&report) {
                     Ok(json) => println!("{json}"),
-                    Err(err) => {
-                        eprintln!("Failed to serialize JSON report: {err}");
+                    Err(_) => {
+                        print_json_error(
+                            1,
+                            "report_serialization_failed",
+                            "verify_laine_installation",
+                            "Analysis succeeded but JSON could not be generated.",
+                        );
                         return ExitCode::FAILURE;
                     }
                 },
@@ -920,15 +1154,67 @@ fn execute_analysis(
                 }
             }
 
-            if policy_eval.should_fail {
-                ExitCode::from(2)
-            } else {
-                ExitCode::SUCCESS
-            }
+            ExitCode::from(exit_code)
         }
         Err(err) => {
-            eprintln!("Analysis error: {err}");
+            print_analysis_error("Analysis", &err, output);
             ExitCode::FAILURE
         }
     }
+}
+
+// Traduce los errores de análisis a un código y una acción estables sin filtrar texto de entrada.
+fn print_analysis_error(command: &str, error: &LaineError, output: AnalysisOutput) {
+    if matches!(output.format, OutputFormat::Json) {
+        let (code, remediation, message) = match error {
+            LaineError::Io { .. } => (
+                "input_io_error",
+                "check_input_paths",
+                "An analysis input could not be read. Verify the configuration path and file access.",
+            ),
+            LaineError::ConfigParse(_) => (
+                "invalid_config_syntax",
+                "repair_workspace_toml",
+                "The workspace TOML could not be parsed.",
+            ),
+            LaineError::ConfigInvalid(_) => (
+                "invalid_workspace_config",
+                "check_workspace_selection",
+                "Verify the workspace configuration and choose a configured producer with --repo.",
+            ),
+            LaineError::Git { .. } => (
+                "git_snapshot_error",
+                "check_git_revisions",
+                "Verify that the repositories and Git revisions are available locally.",
+            ),
+            LaineError::OpenApiParse(_) => (
+                "invalid_openapi_document",
+                "repair_openapi_document",
+                "The producer OpenAPI document could not be analyzed.",
+            ),
+            LaineError::Cache(_) => (
+                "cache_error",
+                "retry_without_cache",
+                "Retry the analysis with --no-cache or check the cache directory.",
+            ),
+        };
+        print_json_error(1, code, remediation, message);
+    } else if output.no_snippets {
+        eprintln!("{command} failed. Run locally without --no-snippets for details.");
+    } else {
+        eprintln!("{command} error: {error}");
+    }
+}
+
+// Emite un solo documento JSON en stdout para errores de uso o análisis.
+fn print_json_error(exit_code: u8, code: &str, remediation: &str, message: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": 1,
+            "status": "error",
+            "exit_code": exit_code,
+            "diagnostics": [{ "code": code, "remediation": remediation, "message": message }],
+        })
+    );
 }

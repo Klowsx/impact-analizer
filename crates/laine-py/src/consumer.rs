@@ -1,6 +1,10 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use laine_core::config::{CustomClientConfig, ServiceConfig};
+use laine_core::config::{
+    CustomClientConfig, ServiceConfig, ServiceEndpointMatch, is_absolute_http_url,
+    normalize_relative_path, resolve_http_service_url,
+};
 use laine_core::model::HttpMethod;
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +14,8 @@ use crate::routes::{
     split_top_level_comma, strip_python_comments_and_docstrings, try_skip_string_literal,
     unescape_python_string,
 };
+
+const UNMAPPED_ENV: &str = "unmapped environment variable (configure under `[env]` in laine.toml)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -98,6 +104,7 @@ enum UrlEval {
 
 #[derive(Debug, Clone)]
 enum VarBinding {
+    HttpImport(String),
     StringLiteral(String),
     DynamicString(String),
     HttpClientInstance {
@@ -140,12 +147,6 @@ enum CallTarget {
         method: HttpMethod,
         url_arg_index: usize,
     },
-}
-
-#[derive(Debug, Clone)]
-struct ServiceEndpointMatch {
-    service: String,
-    normalized_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -273,6 +274,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Procesa sentencias con el ámbito activo para que los aliases no se filtren a otros ámbitos.
     fn process_statement(&mut self, stmt: &LogicalStmt) {
         let trimmed = stmt.text.trim();
         if trimmed.is_empty() {
@@ -282,8 +284,6 @@ impl<'a> PyFileExtractor<'a> {
         // Ignore decorators in consumer extraction (scope pop still applies at decorator indent).
         self.pop_scopes_for_indent(stmt.indent);
         if trimmed.starts_with('@')
-            || trimmed.starts_with("import ")
-            || trimmed.starts_with("from ")
             || trimmed == "pass"
             || trimmed == "break"
             || trimmed == "continue"
@@ -293,6 +293,9 @@ impl<'a> PyFileExtractor<'a> {
 
         // 1. `def` / `async def` / `class` header -> push new function/class scope.
         if let Some(header) = parse_def_or_class_header(trimmed) {
+            if let Some(name) = header.name {
+                self.bind_var(name, VarBinding::Unknown);
+            }
             self.push_scope(stmt.indent);
             for param in header.params {
                 self.bind_var(&param, VarBinding::Unknown);
@@ -343,9 +346,10 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Guarda imports y analiza el resto de las sentencias del ámbito actual.
     fn process_simple_stmt(&mut self, stmt: &LogicalStmt, text: &str, base_offset: usize) {
         let trimmed = text.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || self.record_import(trimmed) {
             return;
         }
         let ws = text.len() - text.trim_start().len();
@@ -426,6 +430,60 @@ impl<'a> PyFileExtractor<'a> {
 
         // Plain expression statement
         self.eval_expr_binding(stmt, trimmed, offset);
+    }
+
+    // Registra módulos y símbolos HTTP importados y permite que otros imports oculten el nombre.
+    fn record_import(&mut self, text: &str) -> bool {
+        let (module, items) = if let Some(start) = strip_keyword_prefix(text, "import") {
+            (None, &text[start..])
+        } else if let Some(start) = strip_keyword_prefix(text, "from") {
+            let rest = text[start..].trim_start();
+            let Some((module, clause)) = rest.split_once(char::is_whitespace) else {
+                return true;
+            };
+            let clause = clause.trim_start();
+            let Some(start) = strip_keyword_prefix(clause, "import") else {
+                return true;
+            };
+            (Some(module), &clause[start..])
+        } else {
+            return false;
+        };
+
+        for item in items
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .split(',')
+        {
+            let mut words = item.split_whitespace();
+            let Some(name) = words.next() else {
+                continue;
+            };
+            let alias = if words.next() == Some("as") {
+                words.next()
+            } else {
+                None
+            };
+            let root = name.split('.').next().unwrap_or(name);
+            let binding = match module {
+                Some(module @ ("requests" | "httpx")) => Some(format!("{module}.{name}")),
+                None if matches!(root, "requests" | "httpx")
+                    && (alias.is_none() || name == root) =>
+                {
+                    Some(root.to_owned())
+                }
+                _ => None,
+            };
+            let local_name = alias.unwrap_or(if module.is_some() { name } else { root });
+            if is_simple_ident(local_name) {
+                self.bind_var(
+                    local_name,
+                    binding.map_or(VarBinding::Unknown, VarBinding::HttpImport),
+                );
+            }
+        }
+        true
     }
 
     /// Evaluates a Python expression, recording any HTTP calls, unresolved calls, and field reads,
@@ -530,6 +588,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Sigue llamadas y accesos encadenados sin incluir claves de texto en los diagnósticos.
     fn eval_postfix_chain(
         &mut self,
         stmt: &LogicalStmt,
@@ -707,9 +766,7 @@ impl<'a> PyFileExtractor<'a> {
                         if let Some(key) = parse_python_string_literal(&raw_index) {
                             current_binding = match self.ctx.env.get(&key) {
                                 Some(val) => Some(VarBinding::StringLiteral(val.clone())),
-                                None => Some(VarBinding::DynamicString(format!(
-                                    "unmapped environment variable `{key}` (configure under `[env]` in laine.toml)"
-                                ))),
+                                None => Some(VarBinding::DynamicString(UNMAPPED_ENV.into())),
                             };
                         } else {
                             current_binding = Some(VarBinding::DynamicString(
@@ -759,8 +816,9 @@ impl<'a> PyFileExtractor<'a> {
         current_binding
     }
 
+    // Construye el cliente a partir del nombre importado del constructor.
     fn try_parse_client_ctor(&self, callee: Option<&str>, args: &[CallArg]) -> Option<VarBinding> {
-        match callee? {
+        match self.resolve_http_callee(callee?)?.as_ref() {
             "httpx.Client" | "httpx.AsyncClient" => {
                 let base_url = args
                     .iter()
@@ -779,6 +837,22 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Expande el alias de un import solo si su nombre sigue vinculado en el ámbito actual.
+    fn resolve_http_callee<'b>(&'b self, callee: &'b str) -> Option<Cow<'b, str>> {
+        let (root, tail) = callee
+            .split_once('.')
+            .map_or((callee, None), |(root, tail)| (root, Some(tail)));
+        match self.lookup_var(root) {
+            Some(VarBinding::HttpImport(symbol)) => Some(match tail {
+                Some(tail) => Cow::Owned(format!("{symbol}.{tail}")),
+                None => Cow::Borrowed(symbol),
+            }),
+            Some(_) => None,
+            None => Some(Cow::Borrowed(callee)),
+        }
+    }
+
+    // Clasifica llamadas al módulo, funciones importadas e instancias de cliente.
     fn classify_http_call(
         &self,
         callee: Option<&str>,
@@ -822,6 +896,9 @@ impl<'a> PyFileExtractor<'a> {
                 }
             }
         }
+
+        let canonical_callee = callee.and_then(|callee| self.resolve_http_callee(callee));
+        let callee = canonical_callee.as_deref();
 
         // 2. Built-in `requests.<method>` / `requests.request`
         if let Some(callee_str) = callee
@@ -887,6 +964,7 @@ impl<'a> PyFileExtractor<'a> {
         None
     }
 
+    // Extrae llamadas HTTP y conserva el diagnóstico si la URL apunta a varios servicios.
     fn process_http_call(
         &mut self,
         stmt: &LogicalStmt,
@@ -951,16 +1029,16 @@ impl<'a> PyFileExtractor<'a> {
             UrlEval::Resolved(url_str) => {
                 let matched_result: Result<Option<ServiceEndpointMatch>, String> = match &target {
                     CallTarget::Requests { .. } | CallTarget::Httpx { .. } => {
-                        Ok(resolve_url_against_services(&url_str, self.ctx.services))
+                        resolve_http_service_url(&url_str, self.ctx.services)
                     }
                     CallTarget::ClientInstance { base_url, .. } => {
                         if is_absolute_http_url(&url_str) {
-                            Ok(resolve_url_against_services(&url_str, self.ctx.services))
+                            resolve_http_service_url(&url_str, self.ctx.services)
                         } else {
                             match base_url {
                                 Some(UrlEval::Resolved(base)) => {
                                     let combined = join_base_and_relative(base, &url_str);
-                                    Ok(resolve_url_against_services(&combined, self.ctx.services))
+                                    resolve_http_service_url(&combined, self.ctx.services)
                                 }
                                 Some(UrlEval::Dynamic(reason)) => Err(reason.clone()),
                                 None => Err("relative URL on HTTP client without static base_url"
@@ -974,7 +1052,7 @@ impl<'a> PyFileExtractor<'a> {
                         ..
                     } => {
                         if is_absolute_http_url(&url_str) {
-                            Ok(resolve_url_against_services(&url_str, self.ctx.services))
+                            resolve_http_service_url(&url_str, self.ctx.services)
                         } else {
                             Ok(Some(ServiceEndpointMatch {
                                 service: target_service.clone(),
@@ -1033,6 +1111,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Resuelve las URL estáticas y describe las dinámicas sin copiar su expresión.
     fn eval_url_expr(&self, raw_expr: &str) -> UrlEval {
         let (expr, _) = unwrap_await_and_parens(raw_expr, 0);
         if expr.is_empty() {
@@ -1088,9 +1167,7 @@ impl<'a> PyFileExtractor<'a> {
             };
         }
 
-        UrlEval::Dynamic(format!(
-            "dynamic URL expression `{expr}` cannot be resolved statically"
-        ))
+        UrlEval::Dynamic("dynamic URL expression cannot be resolved statically".into())
     }
 
     fn eval_fstring_url(&self, fstr: &str) -> UrlEval {
@@ -1204,6 +1281,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
+    // Resuelve el acceso a variables de entorno sin publicar argumentos literales.
     fn try_eval_env_expr(&self, expr: &str) -> Option<UrlEval> {
         let trimmed = expr.trim();
 
@@ -1231,9 +1309,7 @@ impl<'a> PyFileExtractor<'a> {
                 if let Some(key) = parse_python_string_literal(key_raw) {
                     return Some(match self.ctx.env.get(&key) {
                         Some(val) => UrlEval::Resolved(val.clone()),
-                        None => UrlEval::Dynamic(format!(
-                            "unmapped environment variable `{key}` (configure under `[env]` in laine.toml)"
-                        )),
+                        None => UrlEval::Dynamic(UNMAPPED_ENV.into()),
                     });
                 }
                 return Some(UrlEval::Dynamic(
@@ -1245,6 +1321,7 @@ impl<'a> PyFileExtractor<'a> {
         None
     }
 
+    // Usa el valor configurado o por defecto y omite la clave literal en caso de fallo.
     fn eval_env_call_args(&self, args: &[CallArg]) -> UrlEval {
         let key_arg = args
             .iter()
@@ -1273,9 +1350,7 @@ impl<'a> PyFileExtractor<'a> {
             return UrlEval::Resolved(val);
         }
 
-        UrlEval::Dynamic(format!(
-            "unmapped environment variable `{key}` (configure under `[env]` in laine.toml)"
-        ))
+        UrlEval::Dynamic(UNMAPPED_ENV.into())
     }
 }
 
@@ -1393,10 +1468,20 @@ fn measure_indent(prefix: &str) -> usize {
 }
 
 struct ScopeHeader<'a> {
+    name: Option<&'a str>,
     params: Vec<String>,
     inline_body: Option<(&'a str, usize)>,
 }
 
+// Identifica el nombre de una definición sin tomar su firma ni su cuerpo.
+fn scope_header_name(rest: &str) -> Option<&str> {
+    rest.trim_start()
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '(' | ':'))
+        .next()
+        .filter(|name| is_simple_ident(name))
+}
+
+// Extrae el nombre que se vincula en el ámbito exterior y los parámetros del nuevo ámbito.
 fn parse_def_or_class_header(trimmed: &str) -> Option<ScopeHeader<'_>> {
     if let Some(rest_rel) =
         strip_keyword_prefix(trimmed, "async def").or_else(|| strip_keyword_prefix(trimmed, "def"))
@@ -1413,6 +1498,7 @@ fn parse_def_or_class_header(trimmed: &str) -> Option<ScopeHeader<'_>> {
         };
         let inline_body = inline_body.map(|(b, rel)| (b, rest_rel + rel));
         return Some(ScopeHeader {
+            name: scope_header_name(rest),
             params,
             inline_body,
         });
@@ -1423,6 +1509,7 @@ fn parse_def_or_class_header(trimmed: &str) -> Option<ScopeHeader<'_>> {
         let (_, inline_body) = split_header_colon(rest);
         let inline_body = inline_body.map(|(b, rel)| (b, rest_rel + rel));
         return Some(ScopeHeader {
+            name: scope_header_name(rest),
             params: Vec::new(),
             inline_body,
         });
@@ -2013,98 +2100,6 @@ fn join_base_and_relative(base: &str, rel: &str) -> String {
     }
 }
 
-fn is_absolute_http_url(url: &str) -> bool {
-    let trimmed = url.trim();
-    trimmed.starts_with("http://") || trimmed.starts_with("https://")
-}
-
-fn resolve_url_against_services(
-    raw_url: &str,
-    services: &[ServiceConfig],
-) -> Option<ServiceEndpointMatch> {
-    let without_fragment = raw_url.split('#').next().unwrap_or(raw_url);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment)
-        .trim();
-
-    let mut best_match: Option<(usize, ServiceEndpointMatch)> = None;
-
-    for service in services {
-        for base_url in &service.base_urls {
-            let trimmed_base = base_url.trim().trim_end_matches('/');
-            if trimmed_base.is_empty() {
-                continue;
-            }
-            if let Some(rest) = strip_base_prefix(without_query, trimmed_base) {
-                let normalized_path = normalize_consumer_path(rest);
-                let score = trimmed_base.len();
-                let should_replace = best_match
-                    .as_ref()
-                    .is_none_or(|(best_len, _)| score > *best_len);
-                if should_replace {
-                    best_match = Some((
-                        score,
-                        ServiceEndpointMatch {
-                            service: service.name.clone(),
-                            normalized_path,
-                        },
-                    ));
-                }
-            }
-        }
-    }
-
-    best_match.map(|(_, matched)| matched)
-}
-
-fn strip_base_prefix<'a>(url: &'a str, base: &str) -> Option<&'a str> {
-    let rest = url.strip_prefix(base)?;
-    if rest.is_empty() || rest.starts_with('/') {
-        Some(rest)
-    } else {
-        None
-    }
-}
-
-fn normalize_consumer_path(raw_path: &str) -> String {
-    let segments: Vec<&str> = raw_path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-
-    if segments.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", segments.join("/"))
-    }
-}
-
-fn normalize_relative_path(raw_path: &str, path_prefix: Option<&str>) -> String {
-    let without_fragment = raw_path.split('#').next().unwrap_or(raw_path);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment)
-        .trim();
-
-    let combined = match path_prefix {
-        Some(prefix) if !prefix.trim().is_empty() => {
-            let p = prefix.trim().trim_end_matches('/');
-            let r = without_query.trim_start_matches('/');
-            if r.is_empty() {
-                p.to_string()
-            } else {
-                format!("{p}/{r}")
-            }
-        }
-        _ => without_query.to_string(),
-    };
-
-    normalize_consumer_path(&combined)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -2122,6 +2117,68 @@ mod tests {
                 "https://api.internal".into(),
             ],
         }]
+    }
+
+    // Verifica aliases de módulo, métodos y constructores con ocultamiento de nombres.
+    #[test]
+    fn resolves_http_import_aliases_in_their_scope() {
+        let py = r#"import requests as rq, httpx as hx
+from requests import get as get_url
+from httpx import (
+    AsyncClient as Client,
+    post as send,
+)
+
+rq.get('http://customer-service/module')
+hx.request('PATCH', 'http://customer-service/request')
+get_url('http://customer-service/function')
+send('http://customer-service/post')
+
+async def use_client():
+    async with Client(base_url='http://customer-service') as client:
+        await client.get('/instance')
+    import requests as local
+    local.get('http://customer-service/local')
+
+def shadow(rq):
+    rq.get('http://customer-service/ignored')
+    get_url('http://customer-service/outer')
+    import other as get_url
+    get_url('http://customer-service/also-ignored')
+
+local.get('http://customer-service/outside-scope')
+def rq():
+    return None
+rq.get('http://customer-service/shadowed-definition')
+"#;
+        let services = sample_services();
+        let output = extract_python_file(
+            "app.py",
+            py,
+            PyExtractContext {
+                services: &services,
+                clients: &[],
+                env: &BTreeMap::new(),
+            },
+        );
+        let hits = output
+            .calls
+            .iter()
+            .map(|call| (call.normalized_path.as_str(), call.method))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hits,
+            [
+                ("/module", HttpMethod::Get),
+                ("/request", HttpMethod::Patch),
+                ("/function", HttpMethod::Get),
+                ("/post", HttpMethod::Post),
+                ("/instance", HttpMethod::Get),
+                ("/local", HttpMethod::Get),
+                ("/outer", HttpMethod::Get),
+            ]
+        );
+        assert!(output.unresolved_calls.is_empty());
     }
 
     #[test]
@@ -2245,6 +2302,7 @@ async def load_async(order_id: str):
     }
 
     #[test]
+    // Verifica las variables ausentes sin publicar sus claves literales.
     fn resolves_os_getenv_and_os_environ_and_reports_missing_env_as_unresolved() {
         let py = r#"import os
 import requests
@@ -2289,13 +2347,9 @@ def missing_env_calls():
 
         assert_eq!(extracted.unresolved_calls.len(), 2);
         assert_eq!(extracted.unresolved_calls[0].line, 12);
-        assert!(extracted.unresolved_calls[0].reason.contains("MISSING_URL"));
+        assert_eq!(extracted.unresolved_calls[0].reason, UNMAPPED_ENV);
         assert_eq!(extracted.unresolved_calls[1].line, 13);
-        assert!(
-            extracted.unresolved_calls[1]
-                .reason
-                .contains("ALSO_MISSING")
-        );
+        assert_eq!(extracted.unresolved_calls[1].reason, UNMAPPED_ENV);
     }
 
     #[test]
@@ -2401,6 +2455,7 @@ def dynamic_calls(url: str):
     }
 
     #[test]
+    // Verifica los campos y el diagnóstico saneado de una URL base sin configurar.
     fn tracks_nested_fields_raise_for_status_concatenation_and_unmapped_httpx_base_url() {
         let py = r#"import os
 import requests
@@ -2475,10 +2530,6 @@ def broken_httpx():
             PyHttpClientKind::Httpx
         );
         assert_eq!(extracted.unresolved_calls[0].line, 26);
-        assert!(
-            extracted.unresolved_calls[0]
-                .reason
-                .contains("UNMAPPED_BASE")
-        );
+        assert_eq!(extracted.unresolved_calls[0].reason, UNMAPPED_ENV);
     }
 }

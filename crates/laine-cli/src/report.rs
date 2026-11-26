@@ -1,7 +1,30 @@
 use std::fmt::Write;
 
-use laine_core::model::{AnalysisReport, Confidence, ContractChange, EndpointId, Severity};
+use laine_core::model::{
+    AnalysisCoverage, AnalysisReport, Confidence, ContractChange, ExtractionDiagnostic,
+    ProducerEvidence, Severity,
+};
 
+// Quita las descripciones de evidencia conservando sus ubicaciones y el contrato JSON.
+pub fn omit_snippets(report: &mut AnalysisReport) {
+    for finding in &mut report.findings {
+        finding.producer_evidence.snippet.clear();
+        finding.producer_evidence.description.clear();
+        if let Some(comparison) = finding.producer_evidence_comparison.as_mut() {
+            comparison.snippet.clear();
+            comparison.description.clear();
+        }
+        for consumer in &mut finding.consumers {
+            consumer.evidence.snippet.clear();
+        }
+    }
+    for call in &mut report.unresolved_calls {
+        call.evidence.snippet.clear();
+    }
+}
+
+// Muestra evidencia, cobertura y decisión de política del análisis.
+// Presenta hallazgos y cobertura con las mismas descripciones que el informe Markdown.
 pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
     let mut out = String::new();
 
@@ -29,8 +52,16 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
     );
     let _ = writeln!(out);
 
+    if let Some(coverage) = &report.coverage {
+        let _ = writeln!(out, "Coverage: {}", describe_coverage(coverage));
+        for diagnostic in &report.diagnostics {
+            let _ = writeln!(out, "  - {}", describe_extraction_diagnostic(diagnostic));
+        }
+        let _ = writeln!(out);
+    }
+
     if report.findings.is_empty() {
-        let _ = writeln!(out, "No breaking contract changes detected.");
+        let _ = writeln!(out, "{}", empty_findings_message(report));
     } else {
         for finding in &report.findings {
             let _ = writeln!(
@@ -38,111 +69,29 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
                 "BREAKING CHANGE [{:?} | {:?}] ({})",
                 finding.confidence, finding.severity, finding.id
             );
-            match &finding.change {
-                ContractChange::EndpointRemoved { endpoint } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(out, "  Change:   Removed endpoint");
-                }
-                ContractChange::ResponseFieldRemoved {
-                    endpoint,
-                    status_code,
-                    field_path,
-                    previous_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Removed response field `{field_path}` ({previous_type}, HTTP {status_code})"
-                    );
-                }
-                ContractChange::ResponseFieldTypeChanged {
-                    endpoint,
-                    status_code,
-                    field_path,
-                    previous_type,
-                    new_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Changed response field `{field_path}` type: {previous_type} -> {new_type} (HTTP {status_code})"
-                    );
-                }
-                ContractChange::RequestFieldAddedRequired {
-                    endpoint,
-                    field_path,
-                    field_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Added required request field `{field_path}` ({field_type})"
-                    );
-                }
-                ContractChange::RequestFieldTypeChanged {
-                    endpoint,
-                    field_path,
-                    previous_type,
-                    new_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Changed request field `{field_path}` type: {previous_type} -> {new_type}"
-                    );
-                }
-                ContractChange::RequiredParameterAdded {
-                    endpoint,
-                    location,
-                    name,
-                    param_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Added required {location} parameter `{name}` ({param_type})"
-                    );
-                }
-            }
+            let endpoint = finding.change.endpoint();
+            let _ = writeln!(
+                out,
+                "  Endpoint: {} {}",
+                endpoint.method.as_str(),
+                endpoint.normalized_path
+            );
+            let _ = writeln!(out, "  Change:   {}", describe_change(&finding.change));
 
             let _ = writeln!(
                 out,
-                "  Source:   {}/{}:{} (commit {})",
-                finding.producer_evidence.repo,
-                finding.producer_evidence.file,
-                finding.producer_evidence.line,
+                "  Source:   {} (revision {})",
+                producer_location(&finding.producer_evidence),
                 short_sha(&finding.producer_evidence.revision)
             );
+            if let Some(comparison) = &finding.producer_evidence_comparison {
+                let _ = writeln!(
+                    out,
+                    "  Compared: {} (revision {})",
+                    producer_location(comparison),
+                    short_sha(&comparison.revision)
+                );
+            }
             let _ = writeln!(out);
 
             if finding.consumers.is_empty() {
@@ -165,7 +114,9 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
                         consumer.evidence.line,
                         short_sha(&consumer.evidence.revision)
                     );
-                    let _ = writeln!(out, "       Code: {}", consumer.evidence.snippet);
+                    if !consumer.evidence.snippet.is_empty() {
+                        let _ = writeln!(out, "       Evidence: {}", consumer.evidence.snippet);
+                    }
                     let _ = writeln!(
                         out,
                         "       Path: {}",
@@ -229,17 +180,7 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
         let _ = writeln!(out);
     }
 
-    let direct_consumers: usize = report.findings.iter().map(|f| f.consumers.len()).sum();
-    if report.findings.is_empty() {
-        let _ = writeln!(out, "RESULT: COMPATIBLE (exit code 0)");
-    } else {
-        let _ = writeln!(
-            out,
-            "RESULT: INCOMPATIBLE CHANGE ({} breaking change(s), {} confirmed consumer reference(s), exit code 2)",
-            report.findings.len(),
-            direct_consumers
-        );
-    }
+    let _ = writeln!(out, "RESULT: {}", describe_policy(report));
 
     out
 }
@@ -249,6 +190,7 @@ pub fn render_json(report: &AnalysisReport) -> Result<String, serde_json::Error>
 }
 
 /// Renders a GitHub-flavored Markdown report designed for pull request comments.
+// Genera un reporte Markdown con la política, la cobertura y los hallazgos.
 pub fn render_markdown(report: &AnalysisReport) -> String {
     let mut out = String::new();
 
@@ -264,15 +206,11 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
     let _ = writeln!(out, "## Laine Impact Analysis");
     let _ = writeln!(out);
 
-    let status_badge = if report.findings.is_empty() {
-        "COMPATIBLE"
-    } else {
-        "BREAKING CHANGES DETECTED"
-    };
     let _ = writeln!(
         out,
-        "**Status:** `{status_badge}` | **Target:** `{}` (`{base_short}` -> `{head_short}`)",
-        report.target_repo
+        "**Policy:** {} | **Target:** `{}` (`{base_short}` -> `{head_short}`)",
+        describe_policy(report),
+        report.target_repo,
     );
     let _ = writeln!(
         out,
@@ -292,8 +230,20 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
     );
     let _ = writeln!(out);
 
+    if let Some(coverage) = &report.coverage {
+        let _ = writeln!(out, "**Coverage:** {}", describe_coverage(coverage));
+        for diagnostic in &report.diagnostics {
+            let _ = writeln!(
+                out,
+                "- `{}`",
+                escape_inline_code(&describe_extraction_diagnostic(diagnostic))
+            );
+        }
+        let _ = writeln!(out);
+    }
+
     if report.findings.is_empty() {
-        let _ = writeln!(out, "No breaking contract changes detected.");
+        let _ = writeln!(out, "{}", empty_findings_message(report));
         let _ = writeln!(out);
     } else {
         let _ = writeln!(
@@ -303,7 +253,7 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
         let _ = writeln!(out, "| --- | --- | --- | --- | --- | --- |");
 
         for finding in &report.findings {
-            let endpoint = change_endpoint(&finding.change);
+            let endpoint = finding.change.endpoint();
             let endpoint_str = format!(
                 "`{} {}`",
                 endpoint.method.as_str(),
@@ -334,7 +284,7 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
         let _ = writeln!(out);
 
         for finding in &report.findings {
-            let endpoint = change_endpoint(&finding.change);
+            let endpoint = finding.change.endpoint();
             let change_desc = describe_change(&finding.change);
             let _ = writeln!(out, "<details>");
             let _ = writeln!(
@@ -350,12 +300,18 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
             let _ = writeln!(out);
             let _ = writeln!(
                 out,
-                "- **Producer:** `{}/{}:{}` (commit `{}`)",
-                finding.producer_evidence.repo,
-                finding.producer_evidence.file,
-                finding.producer_evidence.line,
+                "- **Producer:** `{}` (revision `{}`)",
+                escape_inline_code(&producer_location(&finding.producer_evidence)),
                 short_sha(&finding.producer_evidence.revision)
             );
+            if let Some(comparison) = &finding.producer_evidence_comparison {
+                let _ = writeln!(
+                    out,
+                    "- **Compared:** `{}` (revision `{}`)",
+                    escape_inline_code(&producer_location(comparison)),
+                    short_sha(&comparison.revision)
+                );
+            }
 
             if finding.consumers.is_empty() {
                 let _ = writeln!(out, "- **Affected consumers:** 0 detected");
@@ -376,11 +332,13 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
                         consumer.evidence.line,
                         short_sha(&consumer.evidence.revision)
                     );
-                    let _ = writeln!(
-                        out,
-                        "    - Code: `{}`",
-                        escape_inline_code(&consumer.evidence.snippet)
-                    );
+                    if !consumer.evidence.snippet.is_empty() {
+                        let _ = writeln!(
+                            out,
+                            "    - Evidence: `{}`",
+                            escape_inline_code(&consumer.evidence.snippet)
+                        );
+                    }
                     let _ = writeln!(
                         out,
                         "    - Path: `{}`",
@@ -441,15 +399,15 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
         );
         let _ = writeln!(out);
         for call in &report.unresolved_calls {
-            let _ = writeln!(
+            let _ = write!(
                 out,
-                "- `{}/{}:{}` — {} (`{}`)",
-                call.evidence.repo,
-                call.evidence.file,
-                call.evidence.line,
-                call.reason,
-                escape_inline_code(&call.evidence.snippet)
+                "- `{}/{}:{}` — {}",
+                call.evidence.repo, call.evidence.file, call.evidence.line, call.reason,
             );
+            if !call.evidence.snippet.is_empty() {
+                let _ = write!(out, " (`{}`)", escape_inline_code(&call.evidence.snippet));
+            }
+            let _ = writeln!(out);
         }
         let _ = writeln!(out);
     }
@@ -457,17 +415,89 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
     out
 }
 
-fn change_endpoint(change: &ContractChange) -> &EndpointId {
-    match change {
-        ContractChange::EndpointRemoved { endpoint }
-        | ContractChange::ResponseFieldRemoved { endpoint, .. }
-        | ContractChange::ResponseFieldTypeChanged { endpoint, .. }
-        | ContractChange::RequestFieldAddedRequired { endpoint, .. }
-        | ContractChange::RequestFieldTypeChanged { endpoint, .. }
-        | ContractChange::RequiredParameterAdded { endpoint, .. } => endpoint,
+// Resume la decisión evaluada y conserva un estado explícito para informes antiguos.
+fn describe_policy(report: &AnalysisReport) -> String {
+    let Some(policy) = &report.policy else {
+        return "POLICY NOT EVALUATED".into();
+    };
+    let status = if policy.should_fail {
+        "POLICY BLOCKED"
+    } else {
+        "POLICY PASSED"
+    };
+    format!(
+        "{status} (exit code {}) — {}",
+        policy.exit_code, policy.reason
+    )
+}
+
+// Formatea solo las coordenadas verificadas y conserva el pointer cuando está disponible.
+fn producer_location(evidence: &ProducerEvidence) -> String {
+    let mut location = format!("{}/{}", evidence.repo, evidence.file);
+    if let Some(line) = evidence.line {
+        let _ = write!(location, ":{line}");
+        if let Some(span) = &evidence.span {
+            let _ = write!(location, ":{}", span.column);
+        }
+    }
+    if let Some(pointer) = &evidence.json_pointer {
+        let _ = write!(location, " ({pointer})");
+    }
+    location
+}
+
+// Resume el resultado de la extracción de cada grupo de archivos.
+fn describe_coverage(coverage: &AnalysisCoverage) -> String {
+    let state = if coverage.complete {
+        "COMPLETE"
+    } else {
+        "INCOMPLETE"
+    };
+    let mut summary = state.to_string();
+    for (label, counts) in [
+        ("producer base", coverage.producer_base),
+        ("producer head", coverage.producer_head),
+        ("consumers", coverage.consumers),
+    ] {
+        let _ = write!(
+            summary,
+            " | {label}: {}/{} analyzed, {} read, {} failed",
+            counts.analyzed, counts.discovered, counts.read, counts.failed
+        );
+    }
+    summary
+}
+
+// Evita que un resultado parcial sin hallazgos se interprete como cobertura completa.
+fn empty_findings_message(report: &AnalysisReport) -> &'static str {
+    if report
+        .coverage
+        .as_ref()
+        .is_some_and(|coverage| !coverage.complete)
+    {
+        "No breaking contract changes confirmed in the analyzed files."
+    } else {
+        "No breaking contract changes detected."
     }
 }
 
+// Identifica el archivo y el snapshot que fallaron sin imprimir el texto de entrada.
+// Incluye la línea cuando el extractor tiene la posición de una declaración incompleta.
+fn describe_extraction_diagnostic(diagnostic: &ExtractionDiagnostic) -> String {
+    let line = diagnostic
+        .line
+        .map_or_else(String::new, |line| format!(":{line}"));
+    format!(
+        "{}: {}/{}{} ({})",
+        diagnostic.code.message(),
+        diagnostic.repo,
+        diagnostic.file,
+        line,
+        short_sha(&diagnostic.revision)
+    )
+}
+
+// Describe cada cambio con el mismo formato para terminal y Markdown.
 fn describe_change(change: &ContractChange) -> String {
     match change {
         ContractChange::EndpointRemoved { .. } => "Removed endpoint".to_string(),
@@ -488,6 +518,29 @@ fn describe_change(change: &ContractChange) -> String {
         } => format!(
             "Changed response field `{field_path}` type: {previous_type} -> {new_type} (HTTP {status_code})"
         ),
+        ContractChange::ResponseFieldMadeOptional {
+            status_code,
+            field_path,
+            ..
+        } => format!("Response field `{field_path}` became optional (HTTP {status_code})"),
+        ContractChange::BodyTypeChanged {
+            status_code,
+            previous_type,
+            new_type,
+            ..
+        } => match status_code {
+            Some(status) => {
+                format!("Changed response body type: {previous_type} -> {new_type} (HTTP {status})")
+            }
+            None => format!("Changed request body type: {previous_type} -> {new_type}"),
+        },
+        ContractChange::RequestParameterTypeChanged {
+            location,
+            name,
+            previous_type,
+            new_type,
+            ..
+        } => format!("Changed {location} parameter `{name}` type: {previous_type} -> {new_type}"),
         ContractChange::RequestFieldAddedRequired {
             field_path,
             field_type,
@@ -556,12 +609,13 @@ mod tests {
             method: HttpMethod::Post,
             normalized_path: "/customers".into(),
         };
-        let evidence = Evidence {
+        let evidence = ProducerEvidence {
             repo: "customer-service".into(),
             revision: "abcdef123456".into(),
             file: "openapi.yaml".into(),
-            line: 12,
+            line: Some(12),
             snippet: "taxId".into(),
+            ..ProducerEvidence::default()
         };
 
         let report = AnalysisReport {
@@ -569,6 +623,12 @@ mod tests {
             target_repo: "customer-service".into(),
             base_rev: "1111111aaa".into(),
             head_rev: "2222222bbb".into(),
+            policy: None,
+            exit_code: None,
+            workspace: None,
+            consumer_revisions: Default::default(),
+            coverage: None,
+            diagnostics: Vec::new(),
             stats: AnalysisStats::default(),
             findings: vec![
                 ImpactFinding {
@@ -581,6 +641,7 @@ mod tests {
                     severity: Severity::High,
                     confidence: Confidence::Confirmed,
                     producer_evidence: evidence.clone(),
+                    producer_evidence_comparison: None,
                     consumers: Vec::new(),
                     indirect_consumers: Vec::new(),
                 },
@@ -595,6 +656,7 @@ mod tests {
                     severity: Severity::High,
                     confidence: Confidence::Confirmed,
                     producer_evidence: evidence.clone(),
+                    producer_evidence_comparison: None,
                     consumers: Vec::new(),
                     indirect_consumers: Vec::new(),
                 },
@@ -609,6 +671,7 @@ mod tests {
                     severity: Severity::Medium,
                     confidence: Confidence::Confirmed,
                     producer_evidence: evidence,
+                    producer_evidence_comparison: None,
                     consumers: Vec::new(),
                     indirect_consumers: Vec::new(),
                 },
@@ -641,6 +704,12 @@ mod tests {
             target_repo: "customer-service".into(),
             base_rev: "1111111aaaa".into(),
             head_rev: "2222222bbbb".into(),
+            policy: None,
+            exit_code: None,
+            workspace: None,
+            consumer_revisions: Default::default(),
+            coverage: None,
+            diagnostics: Vec::new(),
             stats: AnalysisStats {
                 repositories: 3,
                 files_analyzed: 12,
@@ -657,13 +726,15 @@ mod tests {
                 },
                 severity: Severity::High,
                 confidence: Confidence::Confirmed,
-                producer_evidence: Evidence {
+                producer_evidence: ProducerEvidence {
                     repo: "customer-service".into(),
                     revision: "2222222bbbb".into(),
                     file: "openapi.yaml".into(),
-                    line: 14,
+                    line: Some(14),
                     snippet: "field `fullName`".into(),
+                    ..ProducerEvidence::default()
                 },
+                producer_evidence_comparison: None,
                 consumers: vec![AffectedConsumer {
                     repo: "billing-service".into(),
                     evidence: Evidence {
@@ -720,22 +791,33 @@ mod tests {
         assert!(md.contains("billing-service/src/legacy.ts:22"));
     }
 
+    // Verifica el reporte compatible con una política evaluada.
     #[test]
     fn renders_markdown_for_compatible_report() {
-        let report = AnalysisReport {
+        let mut report = AnalysisReport {
             schema_version: 1,
             target_repo: "customer-service".into(),
             base_rev: "1111111".into(),
             head_rev: "2222222".into(),
+            policy: None,
+            exit_code: None,
+            workspace: None,
+            consumer_revisions: Default::default(),
+            coverage: None,
+            diagnostics: Vec::new(),
             stats: AnalysisStats::default(),
             findings: Vec::new(),
             unresolved_calls: Vec::new(),
             discrepancies: Vec::new(),
         };
+        report.policy = Some(laine_core::policy::evaluate_policy(
+            &report,
+            &Default::default(),
+        ));
 
         let md = render_markdown(&report);
         assert!(md.contains("## Laine Impact Analysis"));
-        assert!(md.contains("COMPATIBLE"));
+        assert!(md.contains("POLICY PASSED (exit code 0)"));
         assert!(md.contains("No breaking contract changes detected."));
         assert!(!md.contains("<details>"));
     }
@@ -747,6 +829,12 @@ mod tests {
             target_repo: "cerebro-web".into(),
             base_rev: "abcdef1234567890".into(),
             head_rev: "WORKTREE".into(),
+            policy: None,
+            exit_code: None,
+            workspace: None,
+            consumer_revisions: Default::default(),
+            coverage: None,
+            diagnostics: Vec::new(),
             stats: AnalysisStats::default(),
             findings: Vec::new(),
             unresolved_calls: Vec::new(),

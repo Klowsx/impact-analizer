@@ -1,29 +1,30 @@
+use serde::{Deserialize, Serialize};
+
 use crate::config::PolicyConfig;
-use crate::graph::routes_match;
-use crate::model::{AnalysisReport, ContractChange, EndpointId, HttpMethod};
+use crate::graph::route_covers;
+use crate::model::{AnalysisReport, EndpointId, HttpMethod};
 use crate::openapi::canonical_route_key;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyEvaluation {
     pub should_fail: bool,
+    pub exit_code: u8,
     pub blocking_findings: usize,
+    pub blocking_unresolved_calls: usize,
     pub reason: String,
 }
 
-/// Removes any finding whose endpoint matches an entry in `policy.ignore_endpoints`.
+/// Quita los hallazgos cuando un patrón de `policy.ignore_endpoints` cubre toda la operación.
 ///
-/// Entries may be:
-/// - Exact or wildcard paths matched against canonical route keys via `routes_match`
-///   (e.g. `"/health"`, `"/internal/*"`, `"/customers/:id"`).
-/// - Recursive prefix globs ending in `/**` (e.g. `"/internal/**"`).
-/// - Optional HTTP method prefix followed by whitespace (e.g. `"GET /health"`).
+/// Admite rutas literales, parámetros y comodines de segmento, prefijos recursivos con `/**`
+/// y un método HTTP opcional delante de la ruta.
 pub fn filter_ignored_findings(report: &mut AnalysisReport, policy: &PolicyConfig) {
     if policy.ignore_endpoints.is_empty() {
         return;
     }
 
     report.findings.retain(|finding| {
-        let endpoint = change_endpoint(&finding.change);
+        let endpoint = finding.change.endpoint();
         !policy
             .ignore_endpoints
             .iter()
@@ -31,7 +32,7 @@ pub fn filter_ignored_findings(report: &mut AnalysisReport, policy: &PolicyConfi
     });
 }
 
-/// Evaluates whether an `AnalysisReport` violates `policy` and should fail the CLI / CI check.
+/// Evalúa los hallazgos y las llamadas no resueltas para decidir el código de salida.
 ///
 /// Fails when:
 /// - Any finding has `finding.severity >= policy.fail_on`, OR
@@ -66,22 +67,18 @@ pub fn evaluate_policy(report: &AnalysisReport, policy: &PolicyConfig) -> Policy
 
     PolicyEvaluation {
         should_fail,
+        exit_code: if should_fail { 2 } else { 0 },
         blocking_findings,
+        blocking_unresolved_calls: if unresolved_blocks {
+            unresolved_count
+        } else {
+            0
+        },
         reason,
     }
 }
 
-fn change_endpoint(change: &ContractChange) -> &EndpointId {
-    match change {
-        ContractChange::EndpointRemoved { endpoint }
-        | ContractChange::ResponseFieldRemoved { endpoint, .. }
-        | ContractChange::ResponseFieldTypeChanged { endpoint, .. }
-        | ContractChange::RequestFieldAddedRequired { endpoint, .. }
-        | ContractChange::RequestFieldTypeChanged { endpoint, .. }
-        | ContractChange::RequiredParameterAdded { endpoint, .. } => endpoint,
-    }
-}
-
+// Aplica el método y el patrón configurado sin expandir un literal por la ruta del contrato.
 fn endpoint_matches_ignore_pattern(endpoint: &EndpointId, raw_pattern: &str) -> bool {
     let trimmed = raw_pattern.trim();
     if trimmed.is_empty() {
@@ -107,26 +104,21 @@ fn endpoint_matches_ignore_pattern(endpoint: &EndpointId, raw_pattern: &str) -> 
 
     let endpoint_canonical = canonical_route_key(&endpoint.normalized_path);
 
-    if let Some(prefix_raw) = path_pattern.strip_suffix("/**") {
-        let prefix_canonical = canonical_route_key(prefix_raw);
-        if prefix_canonical == "/" {
-            return true;
-        }
-        return endpoint_canonical == prefix_canonical
-            || endpoint_canonical.starts_with(&format!("{prefix_canonical}/"));
-    }
-
-    let pattern_canonical = canonical_route_key(path_pattern);
-    routes_match(&endpoint_canonical, &pattern_canonical)
+    let prefix = path_pattern.strip_suffix("/**");
+    let pattern_canonical = canonical_route_key(prefix.unwrap_or(path_pattern));
+    route_covers(&pattern_canonical, &endpoint_canonical, prefix.is_some())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::ContractChange;
     use crate::model::{
-        AnalysisStats, Confidence, Evidence, ImpactFinding, Severity, UnresolvedCall,
+        AnalysisStats, Confidence, Evidence, ImpactFinding, ProducerEvidence, Severity,
+        UnresolvedCall,
     };
 
+    // Crea un hallazgo con evidencia de una operación de prueba.
     fn mk_finding(id: &str, method: HttpMethod, path: &str, severity: Severity) -> ImpactFinding {
         ImpactFinding {
             id: id.into(),
@@ -139,13 +131,15 @@ mod tests {
             },
             severity,
             confidence: Confidence::Confirmed,
-            producer_evidence: Evidence {
+            producer_evidence: ProducerEvidence {
                 repo: "customer-service".into(),
                 revision: "abc1234".into(),
                 file: "openapi.yaml".into(),
-                line: 10,
+                line: Some(10),
                 snippet: format!("{} {path}", method.as_str()),
+                ..ProducerEvidence::default()
             },
+            producer_evidence_comparison: None,
             consumers: Vec::new(),
             indirect_consumers: Vec::new(),
         }
@@ -158,6 +152,12 @@ mod tests {
         AnalysisReport {
             schema_version: 1,
             target_repo: "customer-service".into(),
+            policy: None,
+            coverage: None,
+            diagnostics: Vec::new(),
+            exit_code: None,
+            workspace: None,
+            consumer_revisions: Default::default(),
             base_rev: "base".into(),
             head_rev: "head".into(),
             stats: AnalysisStats::default(),
@@ -214,6 +214,68 @@ mod tests {
         filter_ignored_findings(&mut report, &policy);
         let remaining_ids: Vec<&str> = report.findings.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(remaining_ids, vec!["LAINE-005"]);
+    }
+
+    // Comprueba que una excepción literal oculta únicamente la operación literal.
+    #[test]
+    fn leaves_template_findings_visible_when_only_a_literal_is_ignored() {
+        let mut report = mk_report(
+            vec![
+                mk_finding("literal", HttpMethod::Get, "/users/me", Severity::High),
+                mk_finding("template", HttpMethod::Get, "/users/{id}", Severity::High),
+                mk_finding(
+                    "other-method",
+                    HttpMethod::Post,
+                    "/users/me",
+                    Severity::High,
+                ),
+            ],
+            Vec::new(),
+        );
+        let policy = PolicyConfig {
+            ignore_endpoints: vec!["GET /users/me".into()],
+            ..PolicyConfig::default()
+        };
+
+        filter_ignored_findings(&mut report, &policy);
+        let remaining_ids: Vec<_> = report
+            .findings
+            .iter()
+            .map(|finding| finding.id.as_str())
+            .collect();
+        assert_eq!(remaining_ids, ["template", "other-method"]);
+    }
+
+    // Comprueba la cobertura de las excepciones con comodines explícitos y parámetros opcionales.
+    #[test]
+    fn matches_explicit_globs_only_when_they_cover_the_operation() {
+        for (pattern, path, expected) in [
+            ("/users/me/**", "/users/{id}/details", false),
+            ("/users/*", "/users/{id}", true),
+            ("/users/{account}", "/users/:id", true),
+            ("/users/*", "/users/me", true),
+            ("/users/*", "/users/{id?}", false),
+            ("/users", "/users/{id?}", false),
+            ("/users/*?", "/users/{id?}", true),
+            ("/users/**", "/users/{id?}", true),
+            ("/users/*/**", "/users/{id?}", false),
+            ("/users/*/**", "/users/me/details", true),
+            ("/internal/**", "/internal", true),
+            ("/internal/**", "/internality/foo", false),
+            ("/**", "/", true),
+            ("/x/*?/*/y", "/x/*/*?/y", true),
+        ] {
+            let endpoint = EndpointId {
+                service: "api".into(),
+                method: HttpMethod::Get,
+                normalized_path: path.into(),
+            };
+            assert_eq!(
+                endpoint_matches_ignore_pattern(&endpoint, pattern),
+                expected,
+                "{pattern} against {path}"
+            );
+        }
     }
 
     #[test]

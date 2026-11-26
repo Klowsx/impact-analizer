@@ -1,6 +1,50 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use laine_core::config::WorkspaceConfig;
+
+/// Verifica que el selector rechaza la entrada no interactiva aunque la tubería siga abierta.
+fn assert_selector_rejects_open_stdin(command: &mut Command) {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("laine should start");
+    let _open_stdin = child.stdin.take().expect("laine stdin should be piped");
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    // Si el proceso intenta leer de la tubería, lo detenemos y recogemos su salida.
+    while child
+        .try_wait()
+        .expect("laine status should be readable")
+        .is_none()
+    {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let output = child.wait_with_output().expect("laine should stop");
+            panic!(
+                "laine did not exit with stdin open:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("laine output should be readable");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(output.stdout.is_empty(), "selector must not print a prompt");
+    assert!(stderr.contains("interactive terminal"), "stderr:\n{stderr}");
+    assert!(stderr.contains("--select"), "stderr:\n{stderr}");
+    assert!(stderr.contains("--all"), "stderr:\n{stderr}");
+}
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Command::new("git")
@@ -25,6 +69,7 @@ fn init_repo(dir: &Path) {
     git(dir, &["config", "user.email", "test@laine.local"]);
 }
 
+// Comprueba los checks desde un productor y las opciones cuando el cwd es un consumidor.
 #[test]
 fn init_scan_registers_isolated_workspaces_and_laine_check_runs_zero_flag_from_repo_cwd() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-workspaces-{}", std::process::id()));
@@ -173,6 +218,28 @@ fn init_scan_registers_isolated_workspaces_and_laine_check_runs_zero_flag_from_r
         "eco-b repos must not leak into eco-a check, got:\n{check_stdout}"
     );
 
+    let consumer_check = Command::new(bin)
+        .current_dir(&portal_a)
+        .env("LAINE_HOME", &laine_home)
+        .arg("check")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&consumer_check.stderr);
+    assert_eq!(consumer_check.status.code(), Some(1));
+    assert!(stderr.contains("laine check --config"), "{stderr}");
+    assert!(stderr.contains("--repo \"laravel-a\""), "{stderr}");
+    assert!(!stderr.contains("laravel-b"), "{stderr}");
+
+    let producer_override = Command::new(bin)
+        .current_dir(&portal_a)
+        .env("LAINE_HOME", &laine_home)
+        .args(["check", "--config"])
+        .arg(&cfg_a)
+        .args(["--repo", "laravel-a"])
+        .output()
+        .unwrap();
+    assert_eq!(producer_override.status.code(), Some(2));
+
     // 5. `laine check --staged` should pass (exit 0) because the deletion is unstaged
     let staged_out = Command::new(bin)
         .current_dir(&laravel_a)
@@ -190,6 +257,7 @@ fn init_scan_registers_isolated_workspaces_and_laine_check_runs_zero_flag_from_r
     let _ = fs::remove_dir_all(&tmp);
 }
 
+/// Verifica el error sin terminal y la inicialización explícita con autodetección.
 #[test]
 fn init_scan_defaults_to_cwd_saves_in_laine_home_configs_and_autodetects_custom_client() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-scan-ux-{}", std::process::id()));
@@ -228,6 +296,15 @@ fn init_scan_defaults_to_cwd_saves_in_laine_home_configs_and_autodetects_custom_
 
     let bin = env!("CARGO_BIN_EXE_laine");
 
+    let expected_cfg = laine_home.join("configs").join("corp.toml");
+    assert_selector_rejects_open_stdin(
+        Command::new(bin)
+            .current_dir(&projects)
+            .env("LAINE_HOME", &laine_home)
+            .args(["init", "--scan", "--workspace", "corp"]),
+    );
+    assert!(!expected_cfg.exists(), "init should not write a config");
+
     // 1. Run `laine init --scan --all --workspace corp` from inside `Projects/`
     //    WITHOUT passing a path after `--scan` and WITHOUT passing `--path`!
     let init_out = Command::new(bin)
@@ -244,7 +321,6 @@ fn init_scan_defaults_to_cwd_saves_in_laine_home_configs_and_autodetects_custom_
     );
 
     // Config must be stored cleanly inside `$LAINE_HOME/configs/corp.toml`, NOT in `Projects/`
-    let expected_cfg = laine_home.join("configs").join("corp.toml");
     assert!(
         expected_cfg.is_file(),
         "expected config at {}",
@@ -280,6 +356,7 @@ fn init_scan_defaults_to_cwd_saves_in_laine_home_configs_and_autodetects_custom_
     let _ = fs::remove_dir_all(&tmp);
 }
 
+/// Verifica el error sin terminal y los cambios de repositorio pedidos con flags explícitos.
 #[test]
 fn workspace_edit_and_repo_add_remove_update_registered_workspace() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-ws-edit-{}", std::process::id()));
@@ -338,6 +415,15 @@ fn workspace_edit_and_repo_add_remove_update_registered_workspace() {
         .expect("init should run");
     assert!(init.status.success());
 
+    let config = laine_home.join("configs").join("corp.toml");
+    let original = fs::read(&config).unwrap();
+    assert_selector_rejects_open_stdin(Command::new(bin).env("LAINE_HOME", &laine_home).args([
+        "workspace",
+        "edit",
+        "corp",
+    ]));
+    assert_eq!(fs::read(&config).unwrap(), original);
+
     // 2. Edit workspace to swap portal-v1 -> portal-v2
     let edit = Command::new(bin)
         .env("LAINE_HOME", &laine_home)
@@ -372,16 +458,42 @@ fn workspace_edit_and_repo_add_remove_update_registered_workspace() {
         "expected portal-v2 hit after workspace edit, got:\n{check_stdout}"
     );
 
-    // 4. Test `laine repo add` and `laine repo remove` with `--workspace corp`
-    let add_out = Command::new(bin)
+    // Rechaza una ruta inexistente sin modificar la configuración del workspace.
+    let config_path = laine_home.join("configs/corp.toml");
+    let before = fs::read(&config_path).unwrap();
+    let missing = Command::new(bin)
+        .current_dir(&projects)
         .env("LAINE_HOME", &laine_home)
-        .args(["repo", "add", v1.to_str().unwrap(), "--workspace", "corp"])
+        .args(["repo", "add", "./nonexistent", "--workspace", "corp"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    assert_eq!(fs::read(&config_path).unwrap(), before);
+
+    // Guarda la raíz real del checkout aunque la entrada sea una subcarpeta relativa.
+    fs::create_dir_all(v1.join("app/services")).unwrap();
+    let add_out = Command::new(bin)
+        .current_dir(&projects)
+        .env("LAINE_HOME", &laine_home)
+        .args([
+            "repo",
+            "add",
+            "./portal-v1/app/services",
+            "--workspace",
+            "corp",
+        ])
         .output()
         .expect("repo add --workspace should run");
     assert!(
         add_out.status.success(),
         "repo add --workspace failed: {}",
         String::from_utf8_lossy(&add_out.stderr)
+    );
+    let cfg = WorkspaceConfig::load_from_path(&config_path).unwrap();
+    let saved = &cfg.find_service("portal-v1").unwrap().path;
+    assert_eq!(
+        fs::canonicalize(saved).unwrap(),
+        fs::canonicalize(&v1).unwrap()
     );
 
     let rm_out = Command::new(bin)
@@ -396,4 +508,79 @@ fn workspace_edit_and_repo_add_remove_update_registered_workspace() {
     );
 
     let _ = fs::remove_dir_all(&tmp);
+}
+
+// Comprueba que los procesos concurrentes conservan todas las altas y que reemplazar exige una opción.
+#[test]
+fn serializes_workspace_updates_and_requires_explicit_replacement() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-lock-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let state = tmp.join("state");
+    let config = tmp.join("laine.toml");
+    let replacement = tmp.join("replacement.toml");
+    let left = tmp.join("left");
+    let right = tmp.join("right");
+    init_repo(&left);
+    init_repo(&right);
+    let cli = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_laine"));
+        cmd.env("LAINE_HOME", &state).current_dir(&tmp);
+        cmd
+    };
+
+    let lock = laine_core::config::lock_config_update(&config).unwrap();
+    let mut left_process = cli().args(["repo", "add", "left"]).spawn().unwrap();
+    let mut right_process = cli().args(["repo", "add", "right"]).spawn().unwrap();
+    drop(lock);
+    assert!(left_process.wait().unwrap().success());
+    assert!(right_process.wait().unwrap().success());
+    let stored = WorkspaceConfig::load_from_path(&config).unwrap();
+    assert!(stored.find_service("left").is_some());
+    assert!(stored.find_service("right").is_some());
+
+    fs::copy(&config, &replacement).unwrap();
+    let mut first = cli()
+        .args(["workspace", "add", "left", "laine.toml"])
+        .spawn()
+        .unwrap();
+    let mut second = cli()
+        .args(["workspace", "add", "right", "laine.toml"])
+        .spawn()
+        .unwrap();
+    assert!(first.wait().unwrap().success());
+    assert!(second.wait().unwrap().success());
+
+    let duplicate = cli()
+        .args(["workspace", "add", "left", "replacement.toml"])
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("--replace"));
+    assert!(
+        cli()
+            .args(["workspace", "add", "left", "replacement.toml", "--replace"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let invalid = cli()
+        .args(["init", "unused.toml", "--workspace", "../outside"])
+        .output()
+        .unwrap();
+    assert!(!invalid.status.success());
+    assert!(!tmp.join("unused.toml").exists());
+
+    let registry =
+        laine_core::workspace::WorkspaceRegistry::load_from_path(&state.join("workspaces.toml"))
+            .unwrap();
+    assert_eq!(
+        registry.workspaces["left"],
+        laine_core::workspace::normalize_absolute_path(&replacement)
+    );
+    assert_eq!(
+        registry.workspaces["right"],
+        laine_core::workspace::normalize_absolute_path(&config)
+    );
+    fs::remove_dir_all(&tmp).unwrap();
 }

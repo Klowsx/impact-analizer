@@ -14,7 +14,9 @@ use laine_core::model::{
     ContractDiscrepancy, Evidence, ExtractionDiagnostic, ExtractionFailure, ExtractionStage,
     FileCoverage, HttpMethod, UnresolvedCall, WorkspaceIdentity,
 };
-use laine_core::openapi::{canonical_route_key, diff_contracts, extract_contract};
+use laine_core::openapi::{
+    OpenApiExtraction, canonical_route_key, diff_contracts, extract_contract_with_references,
+};
 use laine_core::policy::{evaluate_policy, filter_ignored_findings};
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
 use laine_core::workspace::{WorkspaceRegistry, normalize_absolute_path};
@@ -200,6 +202,7 @@ impl FileExtraction {
                 stage,
                 code: *code,
                 line,
+                json_pointer: None,
                 remediation: code.remediation().to_owned(),
             }));
         }
@@ -306,20 +309,40 @@ pub fn run_analysis_with_consumer_revision(
     // 1. Optional OpenAPI producer contract analysis
     let mut head_openapi_contract = None;
     let mut base_openapi_contract = None;
+    let mut head_openapi_complete = true;
     if let Some(openapi_rel) = target_service.openapi.as_deref() {
         let (base_document, head_document) =
             read_openapi_snapshots(&producer_git, &base_sha, &head_sha, openapi_rel)?;
-        files_analyzed += 1;
-        producer_base = FileCoverage {
-            discovered: 1,
-            read: 1,
-            analyzed: 1,
-            failed: 0,
-        };
-        producer_head = producer_base;
-
-        let base_contract = extract_contract(&target_service.name, &base_document.contents)?;
-        let head_contract = extract_contract(&target_service.name, &head_document.contents)?;
+        let before = extract_contract_with_references(
+            &target_service.name,
+            &base_document.file,
+            &base_document.contents,
+            |path| producer_git.read_file(&base_sha, Path::new(path)).ok(),
+        )?;
+        let after = extract_contract_with_references(
+            &target_service.name,
+            &head_document.file,
+            &head_document.contents,
+            |path| producer_git.read_file(&head_sha, Path::new(path)).ok(),
+        )?;
+        producer_base = record_openapi_coverage(
+            &before,
+            &mut diagnostics,
+            &target_service.name,
+            &base_sha,
+            ExtractionStage::ProducerBase,
+        );
+        producer_head = record_openapi_coverage(
+            &after,
+            &mut diagnostics,
+            &target_service.name,
+            &head_sha,
+            ExtractionStage::ProducerHead,
+        );
+        files_analyzed += producer_base.analyzed;
+        head_openapi_complete = after.diagnostics.is_empty();
+        let base_contract = before.contract;
+        let head_contract = after.contract;
         contract_changes.extend(diff_contracts(&base_contract, &head_contract));
 
         for (endpoint_id, endpoint) in &base_contract.endpoints {
@@ -416,6 +439,7 @@ pub fn run_analysis_with_consumer_revision(
         }
 
         if head_extraction.coverage.failed == 0
+            && head_openapi_complete
             && let Some(head_openapi) = head_openapi_contract.as_ref()
         {
             discrepancies = detect_openapi_discrepancies(head_openapi, &head_routes);
@@ -1092,6 +1116,37 @@ fn read_openapi_snapshots(
             Err(openapi_missing(path, base))
         }
         (None, None) => Err(openapi_missing(path, &format!("{base} and {head}"))),
+    }
+}
+
+// Conserva diagnósticos de referencias y descuenta solo los archivos que los contienen.
+fn record_openapi_coverage(
+    extraction: &OpenApiExtraction,
+    diagnostics: &mut Vec<ExtractionDiagnostic>,
+    repo: &str,
+    revision: &str,
+    stage: ExtractionStage,
+) -> FileCoverage {
+    let mut failed_files = HashSet::new();
+    for (source, code) in &extraction.diagnostics {
+        failed_files.insert(&source.file);
+        diagnostics.push(ExtractionDiagnostic {
+            repo: repo.to_owned(),
+            revision: revision.to_owned(),
+            file: source.file.clone(),
+            stage,
+            code: *code,
+            line: source.span.as_ref().map(|span| span.line),
+            json_pointer: Some(source.pointer.clone()),
+            remediation: code.remediation().to_owned(),
+        });
+    }
+    let failed = failed_files.len();
+    FileCoverage {
+        discovered: extraction.loaded_files,
+        read: extraction.loaded_files,
+        analyzed: extraction.loaded_files - failed,
+        failed,
     }
 }
 

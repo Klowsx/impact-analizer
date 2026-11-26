@@ -273,6 +273,8 @@ pub enum ExtractionFailure {
     FileParseFailed,
     DataflowLimitReached,
     RouteDeclarationUnresolved,
+    OpenApiReferenceUnresolved,
+    OpenApiReferenceCycle,
 }
 
 impl ExtractionFailure {
@@ -282,6 +284,10 @@ impl ExtractionFailure {
             Self::FileReadFailed => "File could not be read",
             Self::FileParseFailed => "File could not be parsed",
             Self::DataflowLimitReached => "Cross-file analysis reached the propagation limit",
+            Self::OpenApiReferenceUnresolved => {
+                "OpenAPI reference could not be resolved in this snapshot"
+            }
+            Self::OpenApiReferenceCycle => "OpenAPI reference reaches a cycle",
             Self::RouteDeclarationUnresolved => {
                 "Route declaration could not be resolved statically"
             }
@@ -295,6 +301,8 @@ impl ExtractionFailure {
             Self::FileParseFailed => "repair_source_syntax",
             Self::DataflowLimitReached => "check_remaining_dependency_hops",
             Self::RouteDeclarationUnresolved => "review_dynamic_route_declaration",
+            Self::OpenApiReferenceUnresolved => "check_openapi_reference_target",
+            Self::OpenApiReferenceCycle => "review_openapi_reference_cycle",
         }
     }
 }
@@ -316,6 +324,8 @@ pub struct ExtractionDiagnostic {
     pub code: ExtractionFailure,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_pointer: Option<String>,
     #[serde(default)]
     pub remediation: String,
 }

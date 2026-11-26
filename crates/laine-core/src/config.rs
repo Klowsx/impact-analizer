@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -140,6 +140,67 @@ pub fn matching_http_url(value: &str) -> Option<String> {
     Some(format!("{}://{host}{path}", scheme.to_ascii_lowercase()))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEndpointMatch {
+    pub service: String,
+    pub normalized_path: String,
+}
+
+// Resuelve el montaje más específico y deja como ambiguos los empates entre servicios.
+pub fn resolve_http_service_url(
+    raw_url: &str,
+    services: &[ServiceConfig],
+) -> std::result::Result<Option<ServiceEndpointMatch>, String> {
+    let Some(url) = matching_http_url(raw_url) else {
+        return Ok(None);
+    };
+    let mut names = BTreeSet::new();
+    let mut longest = 0;
+    for service in services {
+        for base in &service.base_urls {
+            let Some(base) = matching_http_url(base) else {
+                continue;
+            };
+            let base = base.trim_end_matches('/');
+            if base.len() >= longest
+                && url
+                    .strip_prefix(base)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            {
+                if base.len() > longest {
+                    longest = base.len();
+                    names.clear();
+                }
+                names.insert(service.name.as_str());
+            }
+        }
+    }
+
+    match names.len() {
+        0 => Ok(None),
+        1 => Ok(names.first().map(|name| ServiceEndpointMatch {
+            service: (*name).to_string(),
+            normalized_path: normalize_relative_path(&url[longest..], None),
+        })),
+        _ => Err(format!(
+            "ambiguous service base URL (candidates: {})",
+            names.into_iter().collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+// Normaliza una ruta de cliente y aplica el prefijo configurado cuando existe.
+pub fn normalize_relative_path(raw_path: &str, path_prefix: Option<&str>) -> String {
+    let path = raw_path.split(['?', '#']).next().unwrap_or(raw_path).trim();
+    let segments = path_prefix
+        .into_iter()
+        .chain([path])
+        .flat_map(|part| part.trim().split('/'))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    format!("/{}", segments.join("/"))
+}
+
 // Sanea cualquier URL HTTP(S) al reescribir el TOML y conserva ajustes de otros tipos.
 fn sanitize_config_value(value: &str) -> String {
     if is_absolute_http_url(value) {
@@ -157,6 +218,7 @@ impl WorkspaceConfig {
         Self::parse_toml(&raw)
     }
 
+    // Valida la versión y que cada nombre identifique un único servicio.
     pub fn parse_toml(raw: &str) -> Result<Self> {
         let cfg: WorkspaceConfig = toml::from_str(raw)?;
         if cfg.version != 1 {
@@ -164,6 +226,15 @@ impl WorkspaceConfig {
                 "unsupported config version {} (expected 1)",
                 cfg.version
             )));
+        }
+        let mut names = BTreeSet::new();
+        for service in &cfg.services {
+            if !names.insert(&service.name) {
+                return Err(LaineError::ConfigInvalid(format!(
+                    "duplicate service name '{}'",
+                    service.name
+                )));
+            }
         }
         Ok(cfg)
     }

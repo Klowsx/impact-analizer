@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use laine_core::config::{
-    CustomClientConfig, ServiceConfig, is_absolute_http_url, matching_http_url,
+    CustomClientConfig, ServiceConfig, ServiceEndpointMatch, is_absolute_http_url,
+    normalize_relative_path, resolve_http_service_url,
 };
 use laine_core::model::HttpMethod;
 use serde::{Deserialize, Serialize};
@@ -144,12 +145,6 @@ enum CallTarget {
         method: HttpMethod,
         url_arg_index: usize,
     },
-}
-
-#[derive(Debug, Clone)]
-struct ServiceEndpointMatch {
-    service: String,
-    normalized_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -890,6 +885,7 @@ impl<'a> PyFileExtractor<'a> {
         None
     }
 
+    // Extrae llamadas HTTP y conserva el diagnóstico si la URL apunta a varios servicios.
     fn process_http_call(
         &mut self,
         stmt: &LogicalStmt,
@@ -954,16 +950,16 @@ impl<'a> PyFileExtractor<'a> {
             UrlEval::Resolved(url_str) => {
                 let matched_result: Result<Option<ServiceEndpointMatch>, String> = match &target {
                     CallTarget::Requests { .. } | CallTarget::Httpx { .. } => {
-                        Ok(resolve_url_against_services(&url_str, self.ctx.services))
+                        resolve_http_service_url(&url_str, self.ctx.services)
                     }
                     CallTarget::ClientInstance { base_url, .. } => {
                         if is_absolute_http_url(&url_str) {
-                            Ok(resolve_url_against_services(&url_str, self.ctx.services))
+                            resolve_http_service_url(&url_str, self.ctx.services)
                         } else {
                             match base_url {
                                 Some(UrlEval::Resolved(base)) => {
                                     let combined = join_base_and_relative(base, &url_str);
-                                    Ok(resolve_url_against_services(&combined, self.ctx.services))
+                                    resolve_http_service_url(&combined, self.ctx.services)
                                 }
                                 Some(UrlEval::Dynamic(reason)) => Err(reason.clone()),
                                 None => Err("relative URL on HTTP client without static base_url"
@@ -977,7 +973,7 @@ impl<'a> PyFileExtractor<'a> {
                         ..
                     } => {
                         if is_absolute_http_url(&url_str) {
-                            Ok(resolve_url_against_services(&url_str, self.ctx.services))
+                            resolve_http_service_url(&url_str, self.ctx.services)
                         } else {
                             Ok(Some(ServiceEndpointMatch {
                                 service: target_service.clone(),
@@ -2011,89 +2007,6 @@ fn join_base_and_relative(base: &str, rel: &str) -> String {
     } else {
         format!("{b}/{r}")
     }
-}
-
-// Compara URL y bases saneadas sin ampliar los límites del host o del montaje.
-fn resolve_url_against_services(
-    raw_url: &str,
-    services: &[ServiceConfig],
-) -> Option<ServiceEndpointMatch> {
-    let url = matching_http_url(raw_url)?;
-
-    let mut best_match: Option<(usize, ServiceEndpointMatch)> = None;
-
-    for service in services {
-        for base_url in &service.base_urls {
-            let Some(base) = matching_http_url(base_url) else {
-                continue;
-            };
-            let trimmed_base = base.trim_end_matches('/');
-            if let Some(rest) = strip_base_prefix(&url, trimmed_base) {
-                let normalized_path = normalize_consumer_path(rest);
-                let score = trimmed_base.len();
-                let should_replace = best_match
-                    .as_ref()
-                    .is_none_or(|(best_len, _)| score > *best_len);
-                if should_replace {
-                    best_match = Some((
-                        score,
-                        ServiceEndpointMatch {
-                            service: service.name.clone(),
-                            normalized_path,
-                        },
-                    ));
-                }
-            }
-        }
-    }
-
-    best_match.map(|(_, matched)| matched)
-}
-
-fn strip_base_prefix<'a>(url: &'a str, base: &str) -> Option<&'a str> {
-    let rest = url.strip_prefix(base)?;
-    if rest.is_empty() || rest.starts_with('/') {
-        Some(rest)
-    } else {
-        None
-    }
-}
-
-fn normalize_consumer_path(raw_path: &str) -> String {
-    let segments: Vec<&str> = raw_path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-
-    if segments.is_empty() {
-        "/".to_string()
-    } else {
-        format!("/{}", segments.join("/"))
-    }
-}
-
-fn normalize_relative_path(raw_path: &str, path_prefix: Option<&str>) -> String {
-    let without_fragment = raw_path.split('#').next().unwrap_or(raw_path);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment)
-        .trim();
-
-    let combined = match path_prefix {
-        Some(prefix) if !prefix.trim().is_empty() => {
-            let p = prefix.trim().trim_end_matches('/');
-            let r = without_query.trim_start_matches('/');
-            if r.is_empty() {
-                p.to_string()
-            } else {
-                format!("{p}/{r}")
-            }
-        }
-        _ => without_query.to_string(),
-    };
-
-    normalize_consumer_path(&combined)
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use petgraph::visit::EdgeRef;
 
 use crate::model::{Confidence, HttpMethod};
 use crate::openapi::canonical_route_key;
+use crate::request::HttpRequestEvidence;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GraphNode {
@@ -40,6 +41,7 @@ pub enum GraphEdge {
         line: usize,
         snippet: String,
         confidence: Confidence,
+        request: Option<Box<HttpRequestEvidence>>,
     },
     ReadsField {
         revision: String,
@@ -213,7 +215,7 @@ impl DependencyGraph {
     }
 
     #[allow(clippy::too_many_arguments)]
-    // Vincula la llamada y devuelve el primer nodo en orden canónico cuando hay varios candidatos.
+    // Link a call without argument evidence and return the first endpoint in canonical order.
     pub fn link_consumes(
         &mut self,
         consumer_repo: &str,
@@ -224,6 +226,33 @@ impl DependencyGraph {
         consumer_path: &str,
         line: usize,
         snippet: &str,
+    ) -> NodeIndex {
+        self.link_consumes_with_request(
+            consumer_repo,
+            consumer_file,
+            revision,
+            target_service,
+            method,
+            consumer_path,
+            line,
+            snippet,
+            None,
+        )
+    }
+
+    // Attach the call and its static request evidence to each candidate endpoint.
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_consumes_with_request(
+        &mut self,
+        consumer_repo: &str,
+        consumer_file: &str,
+        revision: &str,
+        target_service: &str,
+        method: HttpMethod,
+        consumer_path: &str,
+        line: usize,
+        snippet: &str,
+        request: Option<&HttpRequestEvidence>,
     ) -> NodeIndex {
         let file_idx = self.add_file(consumer_repo, consumer_file);
         let assignments = self.assign_endpoints(target_service, method, consumer_path);
@@ -237,6 +266,7 @@ impl DependencyGraph {
                     line,
                     snippet: snippet.to_string(),
                     confidence,
+                    request: request.cloned().map(Box::new),
                 },
             );
         }
@@ -423,51 +453,68 @@ impl DependencyGraph {
     }
 
     /// Busca las llamadas vinculadas a la identidad exacta de la operación.
+    // Return one endpoint consumer per source line for endpoint-wide changes.
     pub fn consumers_of_endpoint(
         &self,
         service: &str,
         method: HttpMethod,
         producer_path: &str,
     ) -> Vec<EndpointConsumerHit> {
+        let mut hits = BTreeMap::<_, EndpointConsumerHit>::new();
+        for (hit, _) in self.endpoint_call_hits(service, method, producer_path) {
+            let key = (hit.repo.clone(), hit.file.clone(), hit.line);
+            if hits.get(&key).is_none_or(|current| {
+                (hit.confidence, &hit.revision, &hit.snippet)
+                    > (current.confidence, &current.revision, &current.snippet)
+            }) {
+                hits.insert(key, hit);
+            }
+        }
+        hits.into_values().collect()
+    }
+
+    // Preserve separate calls on the same line so each request can be checked.
+    pub(crate) fn endpoint_call_hits(
+        &self,
+        service: &str,
+        method: HttpMethod,
+        producer_path: &str,
+    ) -> impl Iterator<Item = (EndpointConsumerHit, Option<&HttpRequestEvidence>)> {
         let key = (
-            service.to_string(),
+            service.to_owned(),
             method,
             canonical_route_key(producer_path),
         );
-        let Some(&endpoint) = self.endpoints.get(&key) else {
-            return Vec::new();
-        };
-        let mut hits = BTreeMap::<_, EndpointConsumerHit>::new();
-
-        for edge in self.graph.edges_directed(endpoint, Direction::Incoming) {
-            if let GraphEdge::Consumes {
-                revision,
-                line,
-                snippet,
-                confidence,
-            } = edge.weight()
-                && let GraphNode::File { repo, path } = &self.graph[edge.source()]
-            {
-                let key = (repo.clone(), path.clone(), *line);
-                if hits.get(&key).is_none_or(|hit| {
-                    (*confidence, revision, snippet) > (hit.confidence, &hit.revision, &hit.snippet)
-                }) {
-                    hits.insert(
-                        key,
-                        EndpointConsumerHit {
-                            repo: repo.clone(),
-                            revision: revision.clone(),
-                            file: path.clone(),
-                            line: *line,
-                            snippet: snippet.clone(),
-                            confidence: *confidence,
-                        },
-                    );
-                }
-            }
-        }
-
-        hits.into_values().collect()
+        self.endpoints
+            .get(&key)
+            .into_iter()
+            .flat_map(move |&endpoint| self.graph.edges_directed(endpoint, Direction::Incoming))
+            .filter_map(|edge| {
+                let GraphEdge::Consumes {
+                    revision,
+                    line,
+                    snippet,
+                    confidence,
+                    request,
+                } = edge.weight()
+                else {
+                    return None;
+                };
+                let GraphNode::File { repo, path } = &self.graph[edge.source()] else {
+                    return None;
+                };
+                Some((
+                    EndpointConsumerHit {
+                        repo: repo.clone(),
+                        revision: revision.clone(),
+                        file: path.clone(),
+                        line: *line,
+                        snippet: snippet.clone(),
+                        confidence: *confidence,
+                    },
+                    request.as_deref(),
+                ))
+            })
     }
 
     /// Performs a cycle-safe BFS to discover all repositories transitively depending on `target_repo`.

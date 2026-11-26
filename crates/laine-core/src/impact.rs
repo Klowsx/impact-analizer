@@ -7,6 +7,7 @@ use crate::model::{
     ProducerEvidence, Severity, UnresolvedCall,
 };
 use crate::openapi::{ApiContract, canonical_route_key};
+use crate::request::{ArgumentCompatibility, HttpRequestEvidence};
 
 pub struct ImpactInput<'a> {
     pub target_repo: &'a str,
@@ -50,6 +51,107 @@ fn consumers_for_endpoint(graph: &DependencyGraph, endpoint: &EndpointId) -> Vec
             ],
         })
         .collect()
+}
+
+// Identify the changed argument and compare it against the corresponding request section.
+fn request_compatibility<'a>(
+    change: &'a ContractChange,
+    request: &HttpRequestEvidence,
+    line: usize,
+) -> (&'a str, &'a str, ArgumentCompatibility) {
+    let (section, field, required, expected) = match change {
+        ContractChange::RequestFieldAddedRequired {
+            field_path,
+            field_type,
+            ..
+        } => ("body", Some(field_path.as_str()), true, field_type),
+        ContractChange::RequestFieldTypeChanged {
+            field_path,
+            new_type,
+            ..
+        } => ("body", Some(field_path.as_str()), false, new_type),
+        ContractChange::RequiredParameterAdded {
+            location,
+            name,
+            param_type,
+            ..
+        } => (location.as_str(), Some(name.as_str()), true, param_type),
+        ContractChange::RequestParameterTypeChanged {
+            location,
+            name,
+            new_type,
+            ..
+        } => (location.as_str(), Some(name.as_str()), false, new_type),
+        ContractChange::BodyTypeChanged {
+            status_code: None,
+            new_type,
+            ..
+        } => ("body", None, false, new_type),
+        _ => unreachable!("only request changes have argument evidence"),
+    };
+    let result = match (section, field) {
+        ("body", field) => request.body.compare(field, required, expected, line),
+        ("query", Some(name)) => request.query.compare_query(name, required, expected, line),
+        ("header", Some(name)) => {
+            request
+                .headers
+                .compare(Some(&name.to_ascii_lowercase()), required, expected, line)
+        }
+        _ => ArgumentCompatibility::Unknown(None),
+    };
+    (section, field.unwrap_or("<root>"), result)
+}
+
+// Omit compatible calls and cap confidence when the argument is unverified.
+fn consumers_for_request_change(
+    graph: &DependencyGraph,
+    change: &ContractChange,
+) -> Vec<AffectedConsumer> {
+    let endpoint = change.endpoint();
+    let mut affected = BTreeMap::new();
+    let empty = HttpRequestEvidence::default();
+    for (hit, request) in graph.endpoint_call_hits(
+        &endpoint.service,
+        endpoint.method,
+        &endpoint.normalized_path,
+    ) {
+        let request = request.unwrap_or(&empty);
+        let (section, name, result) = request_compatibility(change, request, hit.line);
+        let (line, confidence, status) = match result {
+            ArgumentCompatibility::Compatible => continue,
+            ArgumentCompatibility::Incompatible(line) => (line, hit.confidence, "Incompatible"),
+            ArgumentCompatibility::Unknown(line) => (
+                line.unwrap_or(hit.line),
+                hit.confidence.min(Confidence::Possible),
+                "Unverified",
+            ),
+        };
+        let label = format!("{status} HTTP {section} argument {name:?}");
+        let consumer = AffectedConsumer {
+            repo: hit.repo.clone(),
+            evidence: Evidence {
+                repo: hit.repo.clone(),
+                revision: hit.revision,
+                file: hit.file.clone(),
+                line,
+                snippet: label.clone(),
+            },
+            confidence,
+            dependency_path: vec![
+                format!("{} {}", endpoint.method.as_str(), endpoint.normalized_path),
+                format!("HTTP call @ {}/{}:{}", hit.repo, hit.file, hit.line),
+                format!("{label} @ {}/{}:{line}", hit.repo, hit.file),
+            ],
+        };
+        let key = (hit.repo, hit.file, line, hit.line);
+        if affected
+            .get(&key)
+            .is_none_or(|previous: &AffectedConsumer| previous.confidence < confidence)
+        {
+            affected.insert(key, consumer);
+        }
+    }
+    affected.into_values().collect()
 }
 
 /// Cruza los cambios de contrato con el grafo para producir un informe reproducible.
@@ -120,17 +222,24 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
                     })
                     .collect::<Vec<_>>()
             }
-            ContractChange::RequestParameterTypeChanged { .. }
-            | ContractChange::BodyTypeChanged { .. } => {
-                consumers_for_endpoint(graph, change.endpoint())
-                    .into_iter()
-                    .map(|mut consumer| {
-                        consumer.confidence = consumer.confidence.min(Confidence::Possible);
-                        consumer
-                    })
-                    .collect()
-            }
-            _ => consumers_for_endpoint(graph, change.endpoint()),
+            ContractChange::RequestFieldAddedRequired { .. }
+            | ContractChange::RequestFieldTypeChanged { .. }
+            | ContractChange::RequiredParameterAdded { .. }
+            | ContractChange::RequestParameterTypeChanged { .. }
+            | ContractChange::BodyTypeChanged {
+                status_code: None, ..
+            } => consumers_for_request_change(graph, &change),
+            ContractChange::BodyTypeChanged {
+                status_code: Some(_),
+                ..
+            } => consumers_for_endpoint(graph, change.endpoint())
+                .into_iter()
+                .map(|mut consumer| {
+                    consumer.confidence = consumer.confidence.min(Confidence::Possible);
+                    consumer
+                })
+                .collect(),
+            ContractChange::EndpointRemoved { endpoint } => consumers_for_endpoint(graph, endpoint),
         };
 
         let severity = match (&change, consumers.is_empty()) {
@@ -346,7 +455,7 @@ mod tests {
     use super::*;
     use crate::model::HttpMethod;
 
-    // Comprueba que los cambios de request apunten al contrato de head.
+    // Check producer lines and keep callers without argument evidence possible.
     #[test]
     fn request_side_changes_map_to_endpoint_consumers_and_head_lines() {
         let mut graph = DependencyGraph::new();
@@ -447,6 +556,7 @@ paths:
             assert_eq!(finding.severity, Severity::High);
             assert_eq!(finding.consumers.len(), 1);
             assert_eq!(finding.consumers[0].repo, "checkout-web");
+            assert_eq!(finding.consumers[0].confidence, Confidence::Possible);
             assert!(finding.producer_evidence.line.unwrap() > 1);
             assert_eq!(finding.producer_evidence.revision, "head111");
         }

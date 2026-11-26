@@ -18,6 +18,7 @@ use laine_core::openapi::{
     OpenApiExtraction, canonical_route_key, diff_contracts, extract_contract_with_references,
 };
 use laine_core::policy::{evaluate_policy, filter_ignored_findings};
+use laine_core::request::HttpRequestEvidence;
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
 use laine_core::workspace::{WorkspaceRegistry, normalize_absolute_path};
 use laine_py::{
@@ -73,6 +74,8 @@ struct CachedConsumeEdge {
     method: HttpMethod,
     normalized_path: String,
     line: usize,
+    #[serde(default)]
+    request: HttpRequestEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -722,6 +725,7 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
                         method: call.method,
                         normalized_path: call.normalized_path.clone(),
                         line: call.line,
+                        request: call.request.clone(),
                     });
                 }
 
@@ -772,6 +776,7 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
                     method: call.method,
                     normalized_path: call.normalized_path.clone(),
                     line: call.line,
+                    request: call.request.clone(),
                 });
 
                 if let Some(ref response_type) = call.response_type {
@@ -935,7 +940,7 @@ fn apply_cached_consumer_repo(
     unresolved_calls: &mut Vec<UnresolvedCall>,
 ) {
     for edge in &snapshot.consumes {
-        graph.link_consumes(
+        graph.link_consumes_with_request(
             service_name,
             &edge.file,
             consumer_rev,
@@ -944,6 +949,7 @@ fn apply_cached_consumer_repo(
             &edge.normalized_path,
             edge.line,
             "HTTP call",
+            Some(&edge.request),
         );
     }
 

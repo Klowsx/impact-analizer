@@ -158,6 +158,9 @@ Internally tagged enum (`#[serde(tag = "kind", rename_all = "snake_case")]`). Ba
 | `"endpoint_removed"` | `endpoint: EndpointId` | Base spec / route file | All consumers with `Consumes` edge to `endpoint`. |
 | `"response_field_removed"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string`, `previous_type: string` | Base spec | Consumers with `ReadsField` edge matching `field_path` (or nested child). |
 | `"response_field_type_changed"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string`, `previous_type: string`, `new_type: string` | Base spec | Consumers with `ReadsField` edge matching `field_path` (or nested child). |
+| `"response_field_made_optional"` | `endpoint: EndpointId`, `status_code: string`, `field_path: string` | Head spec with base comparison | Consumers with matching field reads. |
+| `"body_type_changed"` | `endpoint: EndpointId`, `status_code?: string`, `previous_type: string`, `new_type: string` | Base spec for a response, head spec for a request | Callers of the endpoint with `POSSIBLE` confidence. `status_code` is present for responses. |
+| `"request_parameter_type_changed"` | `endpoint: EndpointId`, `location: string`, `name: string`, `previous_type: string`, `new_type: string` | Head spec with base comparison | Callers of the endpoint with `POSSIBLE` confidence. |
 | `"request_field_added_required"` | `endpoint: EndpointId`, `field_path: string`, `field_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |
 | `"request_field_type_changed"` | `endpoint: EndpointId`, `field_path: string`, `previous_type: string`, `new_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |
 | `"required_parameter_added"` | `endpoint: EndpointId`, `location: string`, `name: string`, `param_type: string` | Head spec (fallback: base) | All consumers with `Consumes` edge to `endpoint`. |

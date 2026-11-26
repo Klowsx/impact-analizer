@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use saphyr::{LoadableYamlNode, MarkedYaml, Scalar, YamlData};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,8 @@ pub struct ParameterSchema {
     pub param_type: String,
     pub required: bool,
     #[serde(skip)]
+    type_source: Option<ContractSource>,
+    #[serde(skip)]
     source: Option<ContractSource>,
 }
 
@@ -41,6 +43,10 @@ pub struct EndpointContract {
     source: Option<ContractSource>,
     /// HTTP status code (e.g. "200") -> flattened field path (e.g. "fullName", "address.city") -> schema.
     pub responses: BTreeMap<String, BTreeMap<String, FieldSchema>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub response_bodies: BTreeMap<String, FieldSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<FieldSchema>,
     /// Flattened JSON request body field path -> schema.
     #[serde(default)]
     pub request_fields: BTreeMap<String, FieldSchema>,
@@ -78,6 +84,26 @@ impl ApiContract {
             } => {
                 let field = endpoint.responses.get(status_code)?.get(field_path)?;
                 field.type_source.as_ref().or(field.source.as_ref())
+            }
+            ContractChange::ResponseFieldMadeOptional {
+                status_code,
+                field_path,
+                ..
+            } => {
+                let field = endpoint.responses.get(status_code)?.get(field_path)?;
+                field.required_source.as_ref().or(field.source.as_ref())
+            }
+            ContractChange::BodyTypeChanged { status_code, .. } => {
+                let body = if let Some(status) = status_code {
+                    endpoint.response_bodies.get(status)?
+                } else {
+                    endpoint.request_body.as_ref()?
+                };
+                body.source.as_ref()
+            }
+            ContractChange::RequestParameterTypeChanged { location, name, .. } => {
+                let parameter = endpoint.parameters.get(&(location.clone(), name.clone()))?;
+                parameter.type_source.as_ref().or(parameter.source.as_ref())
             }
             ContractChange::RequestFieldAddedRequired { field_path, .. } => {
                 let field = endpoint.request_fields.get(field_path)?;
@@ -227,6 +253,10 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
         .ok_or_else(|| LaineError::OpenApiParse("missing top-level `paths` object".into()))?;
 
     let mut endpoints = BTreeMap::new();
+    let uses_nullable = root
+        .get("openapi")
+        .and_then(Value::as_str)
+        .is_some_and(|version| version.starts_with("3.0."));
     let sources = index_sources(&root, raw_spec);
 
     for (raw_path, path_item) in paths_obj {
@@ -242,7 +272,13 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
             .get("parameters")
             .and_then(Value::as_array)
         {
-            collect_parameters(&root, params, &mut path_level_params, &sources);
+            collect_parameters(
+                &root,
+                params,
+                &mut path_level_params,
+                &sources,
+                uses_nullable,
+            );
         }
 
         for (method_key, operation) in path_map {
@@ -257,7 +293,13 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
             };
 
             if let Some(params) = operation.get("parameters").and_then(Value::as_array) {
-                collect_parameters(&root, params, &mut endpoint_contract.parameters, &sources);
+                collect_parameters(
+                    &root,
+                    params,
+                    &mut endpoint_contract.parameters,
+                    &sources,
+                    uses_nullable,
+                );
             }
 
             if let Some(request_body_val) = operation.get("requestBody") {
@@ -265,6 +307,9 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
                 let resolved_body = resolve_ref(&root, request_body_val, &mut visited);
 
                 if let Some(schema) = extract_json_schema(resolved_body) {
+                    let resolved_schema = resolve_ref(&root, schema, &mut visited.clone());
+                    endpoint_contract.request_body =
+                        Some(body_schema(resolved_schema, &sources, uses_nullable));
                     collect_schema_fields(
                         &root,
                         schema,
@@ -272,6 +317,7 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
                         &mut visited,
                         &mut endpoint_contract.request_fields,
                         &sources,
+                        uses_nullable,
                     );
                 }
             }
@@ -286,6 +332,11 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
                     let resolved_response = resolve_ref(&root, response_val, &mut visited);
 
                     if let Some(schema) = extract_json_schema(resolved_response) {
+                        let resolved_schema = resolve_ref(&root, schema, &mut visited.clone());
+                        endpoint_contract.response_bodies.insert(
+                            status_code.clone(),
+                            body_schema(resolved_schema, &sources, uses_nullable),
+                        );
                         let mut fields = BTreeMap::new();
                         collect_schema_fields(
                             &root,
@@ -294,6 +345,7 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
                             &mut visited,
                             &mut fields,
                             &sources,
+                            uses_nullable,
                         );
                         endpoint_contract
                             .responses
@@ -314,7 +366,7 @@ pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
     Ok(ApiContract { endpoints })
 }
 
-/// Compares `base` (before) against `head` (after) and returns breaking contract changes.
+/// Compara lo que el request acepta y lo que el response garantiza entre base y head.
 ///
 /// Additive backwards-compatible changes (new endpoints, new response fields, new optional
 /// request fields or optional parameters) are intentionally not reported as breaking changes.
@@ -329,6 +381,30 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
             continue;
         };
 
+        for (status_code, base_body) in &base_endpoint.response_bodies {
+            if let Some(head_body) = head_endpoint.response_bodies.get(status_code)
+                && excludes_types(&head_body.field_type, &base_body.field_type)
+            {
+                changes.push(ContractChange::BodyTypeChanged {
+                    endpoint: endpoint_id.clone(),
+                    status_code: Some(status_code.clone()),
+                    previous_type: base_body.field_type.clone(),
+                    new_type: head_body.field_type.clone(),
+                });
+            }
+        }
+        if let (Some(base_body), Some(head_body)) =
+            (&base_endpoint.request_body, &head_endpoint.request_body)
+            && excludes_types(&base_body.field_type, &head_body.field_type)
+        {
+            changes.push(ContractChange::BodyTypeChanged {
+                endpoint: endpoint_id.clone(),
+                status_code: None,
+                previous_type: base_body.field_type.clone(),
+                new_type: head_body.field_type.clone(),
+            });
+        }
+
         for (status_code, base_fields) in &base_endpoint.responses {
             let head_fields = head_endpoint.responses.get(status_code);
 
@@ -342,16 +418,24 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
                             previous_type: base_field.field_type.clone(),
                         });
                     }
-                    Some(head_field) if head_field.field_type != base_field.field_type => {
-                        changes.push(ContractChange::ResponseFieldTypeChanged {
-                            endpoint: endpoint_id.clone(),
-                            status_code: status_code.clone(),
-                            field_path: field_path.clone(),
-                            previous_type: base_field.field_type.clone(),
-                            new_type: head_field.field_type.clone(),
-                        });
+                    Some(head_field) => {
+                        if excludes_types(&head_field.field_type, &base_field.field_type) {
+                            changes.push(ContractChange::ResponseFieldTypeChanged {
+                                endpoint: endpoint_id.clone(),
+                                status_code: status_code.clone(),
+                                field_path: field_path.clone(),
+                                previous_type: base_field.field_type.clone(),
+                                new_type: head_field.field_type.clone(),
+                            });
+                        }
+                        if base_field.required && !head_field.required {
+                            changes.push(ContractChange::ResponseFieldMadeOptional {
+                                endpoint: endpoint_id.clone(),
+                                status_code: status_code.clone(),
+                                field_path: field_path.clone(),
+                            });
+                        }
                     }
-                    Some(_) => {}
                 }
             }
         }
@@ -375,7 +459,7 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
                             field_type: head_field.field_type.clone(),
                         });
                     }
-                    if base_field.field_type != head_field.field_type {
+                    if excludes_types(&base_field.field_type, &head_field.field_type) {
                         changes.push(ContractChange::RequestFieldTypeChanged {
                             endpoint: endpoint_id.clone(),
                             field_path: field_path.clone(),
@@ -388,11 +472,21 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
         }
 
         for ((location, name), head_param) in &head_endpoint.parameters {
-            let was_required = base_endpoint
+            let base_param = base_endpoint
                 .parameters
-                .get(&(location.clone(), name.clone()))
-                .is_some_and(|p| p.required);
-            if head_param.required && !was_required {
+                .get(&(location.clone(), name.clone()));
+            if let Some(base_param) = base_param
+                && excludes_types(&base_param.param_type, &head_param.param_type)
+            {
+                changes.push(ContractChange::RequestParameterTypeChanged {
+                    endpoint: endpoint_id.clone(),
+                    location: location.clone(),
+                    name: name.clone(),
+                    previous_type: base_param.param_type.clone(),
+                    new_type: head_param.param_type.clone(),
+                });
+            }
+            if head_param.required && !base_param.is_some_and(|parameter| parameter.required) {
                 changes.push(ContractChange::RequiredParameterAdded {
                     endpoint: endpoint_id.clone(),
                     location: location.clone(),
@@ -412,6 +506,7 @@ fn collect_parameters(
     params: &[Value],
     out: &mut BTreeMap<(String, String), ParameterSchema>,
     sources: &SourceIndex,
+    uses_nullable: bool,
 ) {
     for param_val in params {
         let mut visited = HashSet::new();
@@ -430,21 +525,23 @@ fn collect_parameters(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
 
-        let param_type = resolved
+        let schema = resolved
             .get("schema")
             .or_else(|| extract_json_schema(resolved))
-            .map(|schema| {
-                let mut schema_visited = visited.clone();
-                let resolved_schema = resolve_ref(root, schema, &mut schema_visited);
-                extract_type_label(resolved_schema)
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+            .map(|schema| resolve_ref(root, schema, &mut visited.clone()));
+        let param_type = schema.map_or_else(
+            || "unknown".to_string(),
+            |schema| extract_type_label(schema, uses_nullable),
+        );
 
         out.insert(
             (location.to_string(), name.to_string()),
             ParameterSchema {
                 param_type,
                 required,
+                type_source: schema
+                    .and_then(|node| sources.get(&std::ptr::from_ref(node)))
+                    .cloned(),
                 source: resolved
                     .get("name")
                     .and_then(|node| sources.get(&std::ptr::from_ref(node)))
@@ -515,6 +612,7 @@ fn collect_schema_fields(
     visited: &mut HashSet<String>,
     out: &mut BTreeMap<String, FieldSchema>,
     sources: &SourceIndex,
+    uses_nullable: bool,
 ) {
     let mut local_visited = visited.clone();
     let resolved = resolve_ref(root, schema, &mut local_visited);
@@ -522,7 +620,15 @@ fn collect_schema_fields(
     // Support `allOf` composition by merging sub-schemas.
     if let Some(all_of) = resolved.get("allOf").and_then(Value::as_array) {
         for sub in all_of {
-            collect_schema_fields(root, sub, prefix, &mut local_visited, out, sources);
+            collect_schema_fields(
+                root,
+                sub,
+                prefix,
+                &mut local_visited,
+                out,
+                sources,
+                uses_nullable,
+            );
         }
         // Apply `required` constraints declared in any `allOf` branch to sibling-defined fields.
         for sub in all_of {
@@ -549,7 +655,7 @@ fn collect_schema_fields(
                 format!("{prefix}.{prop_name}")
             };
 
-            let field_type = extract_type_label(resolved_prop);
+            let field_type = extract_type_label(resolved_prop, uses_nullable);
             let is_required = required_set.contains(prop_name.as_str());
             let source = sources.get(&std::ptr::from_ref(prop_schema)).cloned();
             let type_source = if std::ptr::eq(resolved_prop, prop_schema) {
@@ -581,10 +687,19 @@ fn collect_schema_fields(
                     &mut prop_visited,
                     out,
                     sources,
+                    uses_nullable,
                 );
             } else if let Some(items) = resolved_prop.get("items") {
                 let array_prefix = format!("{full_path}[]");
-                collect_schema_fields(root, items, &array_prefix, &mut prop_visited, out, sources);
+                collect_schema_fields(
+                    root,
+                    items,
+                    &array_prefix,
+                    &mut prop_visited,
+                    out,
+                    sources,
+                    uses_nullable,
+                );
             }
         }
     } else if let Some(items) = resolved.get("items") {
@@ -593,7 +708,15 @@ fn collect_schema_fields(
         } else {
             format!("{prefix}[]")
         };
-        collect_schema_fields(root, items, &array_prefix, &mut local_visited, out, sources);
+        collect_schema_fields(
+            root,
+            items,
+            &array_prefix,
+            &mut local_visited,
+            out,
+            sources,
+            uses_nullable,
+        );
     }
 
     apply_required_flags(resolved, prefix, out, sources);
@@ -624,21 +747,51 @@ fn apply_required_flags(
     }
 }
 
-fn extract_type_label(schema: &Value) -> String {
-    match schema.get("type") {
-        Some(Value::String(ty)) => ty.clone(),
-        Some(Value::Array(arr)) => {
-            let parts: Vec<&str> = arr.iter().filter_map(Value::as_str).collect();
-            if parts.is_empty() {
-                "unknown".to_string()
-            } else {
-                parts.join(" | ")
-            }
-        }
-        _ if schema.get("properties").is_some() => "object".to_string(),
-        _ if schema.get("items").is_some() => "array".to_string(),
-        _ => "unknown".to_string(),
+// Conserva el tipo del cuerpo y el puntero al esquema raíz, incluso sin propiedades.
+fn body_schema(schema: &Value, sources: &SourceIndex, uses_nullable: bool) -> FieldSchema {
+    FieldSchema {
+        field_type: extract_type_label(schema, uses_nullable),
+        required: false,
+        source: sources.get(&std::ptr::from_ref(schema)).cloned(),
+        type_source: None,
+        required_source: None,
     }
+}
+
+// Normaliza los tipos de la unión para que su orden y sus duplicados no afecten el diff.
+fn extract_type_label(schema: &Value, uses_nullable: bool) -> String {
+    let mut types = match schema.get("type") {
+        Some(Value::String(ty)) => BTreeSet::from([ty.as_str()]),
+        Some(Value::Array(types)) => types.iter().filter_map(Value::as_str).collect(),
+        _ if schema.get("properties").is_some() => BTreeSet::from(["object"]),
+        _ if schema.get("items").is_some() => BTreeSet::from(["array"]),
+        _ => BTreeSet::new(),
+    };
+    if uses_nullable
+        && schema.get("type").is_some_and(Value::is_string)
+        && schema.get("nullable").and_then(Value::as_bool) == Some(true)
+    {
+        types.insert("null");
+    }
+    if types.contains("number") {
+        types.remove("integer");
+    }
+    if types.is_empty() {
+        "unknown".to_owned()
+    } else {
+        types.into_iter().collect::<Vec<_>>().join(" | ")
+    }
+}
+
+// Busca un tipo del origen que el destino no admite. Todo entero también es número.
+fn excludes_types(origin: &str, destination: &str) -> bool {
+    origin != "unknown"
+        && destination != "unknown"
+        && origin.split(" | ").any(|part| {
+            !destination
+                .split(" | ")
+                .any(|accepted| accepted == part || (accepted == "number" && part == "integer"))
+        })
 }
 
 #[cfg(test)]
@@ -657,6 +810,129 @@ mod tests {
         let parsed = extract_contract("api", yaml).unwrap();
         let marked = extract_contract("api", &format!("\u{feff}{yaml}")).unwrap();
         assert_eq!(parsed, marked);
+    }
+
+    // Comprueba equivalencia 3.0/3.1, compatibilidad direccional y cuerpos sin propiedades.
+    #[test]
+    fn compares_openapi_types_and_required_fields_directionally() {
+        let base = r#"
+openapi: 3.0.3
+paths:
+  /items:
+    head: {}
+    options: {}
+    trace: {}
+    post:
+      parameters:
+        - {in: query, name: tenant, required: true, schema: {type: integer}}
+      requestBody:
+        content:
+          application/json:
+            schema: {type: number}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [always]
+                properties:
+                  always: {type: string}
+                  equivalent: {type: integer, nullable: true}
+                  narrower: {type: number}
+                  wider: {type: string}
+        '201':
+          content:
+            application/json:
+              schema: {type: string}
+"#;
+        let head = r#"
+openapi: 3.1.0
+paths:
+  /items:
+    post:
+      parameters:
+        - {in: query, name: tenant, required: true, schema: {type: boolean}}
+      requestBody:
+        content:
+          application/json:
+            schema: {type: integer}
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  always: {type: string}
+                  equivalent: {type: ['null', integer, integer]}
+                  narrower: {type: integer}
+                  wider: {type: [string, 'null']}
+        '201':
+          content:
+            application/json:
+              schema: {type: [string, integer]}
+"#;
+        let before = extract_contract("api", base).unwrap();
+        let after = extract_contract("api", head).unwrap();
+        let changes = diff_contracts(&before, &after);
+        assert_eq!(changes.len(), 8, "{changes:?}");
+        assert!(changes.iter().any(|change| matches!(change, ContractChange::ResponseFieldMadeOptional { field_path, .. } if field_path == "always")));
+        assert!(changes.iter().any(|change| matches!(change, ContractChange::ResponseFieldTypeChanged { field_path, .. } if field_path == "wider")));
+        let param = changes.iter().find(|change| matches!(change, ContractChange::RequestParameterTypeChanged { name, .. } if name == "tenant")).unwrap();
+        assert!(
+            before
+                .source_for_change(param)
+                .unwrap()
+                .pointer
+                .ends_with("/0/schema")
+        );
+        for status in [None, Some("201")] {
+            let body = changes.iter().find(|change| matches!(change, ContractChange::BodyTypeChanged { status_code, .. } if status_code.as_deref() == status)).unwrap();
+            assert!(
+                after
+                    .source_for_change(body)
+                    .unwrap()
+                    .pointer
+                    .ends_with("/schema")
+            );
+        }
+        for method in [HttpMethod::Head, HttpMethod::Options, HttpMethod::Trace] {
+            assert!(changes.iter().any(|change| matches!(change, ContractChange::EndpointRemoved { endpoint } if endpoint.method == method)));
+        }
+
+        let widened_request = head.replace("schema: {type: integer}", "schema: {type: number}");
+        assert!(
+            !diff_contracts(&after, &extract_contract("api", &widened_request).unwrap())
+                .iter()
+                .any(|change| matches!(
+                    change,
+                    ContractChange::BodyTypeChanged {
+                        status_code: None,
+                        ..
+                    }
+                ))
+        );
+    }
+
+    // Comprueba que reordenar una unión de tipos JSON Schema no altera el contrato.
+    #[test]
+    fn ignores_openapi_type_union_order() {
+        let spec = r#"
+openapi: 3.1.0
+paths:
+  /items:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {type: [integer, 'null']}
+"#;
+        let before = extract_contract("api", spec).unwrap();
+        let after =
+            extract_contract("api", &spec.replace("integer, 'null'", "'null', integer")).unwrap();
+        assert!(diff_contracts(&before, &after).is_empty());
     }
 
     #[test]

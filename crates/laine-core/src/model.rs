@@ -12,9 +12,13 @@ pub enum HttpMethod {
     Put,
     Patch,
     Delete,
+    Head,
+    Options,
+    Trace,
 }
 
 impl HttpMethod {
+    // Convierte los verbos HTTP de OpenAPI a su identidad estable.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.to_ascii_lowercase().as_str() {
             "get" => Some(Self::Get),
@@ -22,10 +26,14 @@ impl HttpMethod {
             "put" => Some(Self::Put),
             "patch" => Some(Self::Patch),
             "delete" => Some(Self::Delete),
+            "head" => Some(Self::Head),
+            "options" => Some(Self::Options),
+            "trace" => Some(Self::Trace),
             _ => None,
         }
     }
 
+    // Devuelve el nombre canónico del verbo para informes y selectores.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Get => "GET",
@@ -33,6 +41,9 @@ impl HttpMethod {
             Self::Put => "PUT",
             Self::Patch => "PATCH",
             Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+            Self::Trace => "TRACE",
         }
     }
 }
@@ -115,6 +126,18 @@ pub enum ContractChange {
         previous_type: String,
         new_type: String,
     },
+    ResponseFieldMadeOptional {
+        endpoint: EndpointId,
+        status_code: String,
+        field_path: String,
+    },
+    BodyTypeChanged {
+        endpoint: EndpointId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_code: Option<String>,
+        previous_type: String,
+        new_type: String,
+    },
     RequestFieldAddedRequired {
         endpoint: EndpointId,
         field_path: String,
@@ -123,6 +146,13 @@ pub enum ContractChange {
     RequestFieldTypeChanged {
         endpoint: EndpointId,
         field_path: String,
+        previous_type: String,
+        new_type: String,
+    },
+    RequestParameterTypeChanged {
+        endpoint: EndpointId,
+        location: String,
+        name: String,
         previous_type: String,
         new_type: String,
     },
@@ -141,9 +171,12 @@ impl ContractChange {
             Self::EndpointRemoved { endpoint }
             | Self::ResponseFieldRemoved { endpoint, .. }
             | Self::ResponseFieldTypeChanged { endpoint, .. }
+            | Self::ResponseFieldMadeOptional { endpoint, .. }
+            | Self::BodyTypeChanged { endpoint, .. }
             | Self::RequestFieldAddedRequired { endpoint, .. }
             | Self::RequestFieldTypeChanged { endpoint, .. }
-            | Self::RequiredParameterAdded { endpoint, .. } => endpoint,
+            | Self::RequiredParameterAdded { endpoint, .. }
+            | Self::RequestParameterTypeChanged { endpoint, .. } => endpoint,
         }
     }
 }

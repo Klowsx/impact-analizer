@@ -67,6 +67,11 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
                 endpoint,
                 field_path,
                 ..
+            }
+            | ContractChange::ResponseFieldMadeOptional {
+                endpoint,
+                field_path,
+                ..
             } => {
                 let hits = graph.consumers_of_field(
                     &endpoint.service,
@@ -114,6 +119,16 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
                         }
                     })
                     .collect::<Vec<_>>()
+            }
+            ContractChange::RequestParameterTypeChanged { .. }
+            | ContractChange::BodyTypeChanged { .. } => {
+                consumers_for_endpoint(graph, change.endpoint())
+                    .into_iter()
+                    .map(|mut consumer| {
+                        consumer.confidence = consumer.confidence.min(Confidence::Possible);
+                        consumer
+                    })
+                    .collect()
             }
             _ => consumers_for_endpoint(graph, change.endpoint()),
         };
@@ -201,9 +216,22 @@ fn producer_sources(
         change,
         ContractChange::EndpointRemoved { .. } | ContractChange::ResponseFieldRemoved { .. }
     );
-    let response_type = matches!(change, ContractChange::ResponseFieldTypeChanged { .. });
-    let type_changed =
-        response_type || matches!(change, ContractChange::RequestFieldTypeChanged { .. });
+    let response_type = matches!(
+        change,
+        ContractChange::ResponseFieldTypeChanged { .. }
+            | ContractChange::BodyTypeChanged {
+                status_code: Some(_),
+                ..
+            }
+    );
+    let type_changed = response_type
+        || matches!(
+            change,
+            ContractChange::RequestFieldTypeChanged { .. }
+                | ContractChange::RequestParameterTypeChanged { .. }
+                | ContractChange::BodyTypeChanged { .. }
+                | ContractChange::ResponseFieldMadeOptional { .. }
+        );
     let base_first = removed || response_type;
     let evidence = |base| {
         let (contract, revision, file) = if base {
@@ -267,6 +295,34 @@ fn producer_description(change: &ContractChange, base: bool) -> String {
         } => {
             let ty = if base { previous_type } else { new_type };
             format!("Field {field_path} ({ty})")
+        }
+        ContractChange::ResponseFieldMadeOptional { field_path, .. } => {
+            let presence = if base { "required" } else { "optional" };
+            format!("Response field {field_path} ({presence})")
+        }
+        ContractChange::BodyTypeChanged {
+            status_code,
+            previous_type,
+            new_type,
+            ..
+        } => {
+            let ty = if base { previous_type } else { new_type };
+            let body = if status_code.is_some() {
+                "Response"
+            } else {
+                "Request"
+            };
+            format!("{body} body ({ty})")
+        }
+        ContractChange::RequestParameterTypeChanged {
+            location,
+            name,
+            previous_type,
+            new_type,
+            ..
+        } => {
+            let ty = if base { previous_type } else { new_type };
+            format!("{location} parameter {name} ({ty})")
         }
         ContractChange::RequestFieldAddedRequired {
             field_path,

@@ -1,7 +1,7 @@
 use std::fmt::Write;
 
 use laine_core::model::{
-    AnalysisCoverage, AnalysisReport, Confidence, ContractChange, EndpointId, ExtractionDiagnostic,
+    AnalysisCoverage, AnalysisReport, Confidence, ContractChange, ExtractionDiagnostic,
     ProducerEvidence, Severity,
 };
 
@@ -24,6 +24,7 @@ pub fn omit_snippets(report: &mut AnalysisReport) {
 }
 
 // Muestra evidencia, cobertura y decisión de política del análisis.
+// Presenta hallazgos y cobertura con las mismas descripciones que el informe Markdown.
 pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
     let mut out = String::new();
 
@@ -68,102 +69,14 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
                 "BREAKING CHANGE [{:?} | {:?}] ({})",
                 finding.confidence, finding.severity, finding.id
             );
-            match &finding.change {
-                ContractChange::EndpointRemoved { endpoint } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(out, "  Change:   Removed endpoint");
-                }
-                ContractChange::ResponseFieldRemoved {
-                    endpoint,
-                    status_code,
-                    field_path,
-                    previous_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Removed response field `{field_path}` ({previous_type}, HTTP {status_code})"
-                    );
-                }
-                ContractChange::ResponseFieldTypeChanged {
-                    endpoint,
-                    status_code,
-                    field_path,
-                    previous_type,
-                    new_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Changed response field `{field_path}` type: {previous_type} -> {new_type} (HTTP {status_code})"
-                    );
-                }
-                ContractChange::RequestFieldAddedRequired {
-                    endpoint,
-                    field_path,
-                    field_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Added required request field `{field_path}` ({field_type})"
-                    );
-                }
-                ContractChange::RequestFieldTypeChanged {
-                    endpoint,
-                    field_path,
-                    previous_type,
-                    new_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Changed request field `{field_path}` type: {previous_type} -> {new_type}"
-                    );
-                }
-                ContractChange::RequiredParameterAdded {
-                    endpoint,
-                    location,
-                    name,
-                    param_type,
-                } => {
-                    let _ = writeln!(
-                        out,
-                        "  Endpoint: {} {}",
-                        endpoint.method.as_str(),
-                        endpoint.normalized_path
-                    );
-                    let _ = writeln!(
-                        out,
-                        "  Change:   Added required {location} parameter `{name}` ({param_type})"
-                    );
-                }
-            }
+            let endpoint = finding.change.endpoint();
+            let _ = writeln!(
+                out,
+                "  Endpoint: {} {}",
+                endpoint.method.as_str(),
+                endpoint.normalized_path
+            );
+            let _ = writeln!(out, "  Change:   {}", describe_change(&finding.change));
 
             let _ = writeln!(
                 out,
@@ -340,7 +253,7 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
         let _ = writeln!(out, "| --- | --- | --- | --- | --- | --- |");
 
         for finding in &report.findings {
-            let endpoint = change_endpoint(&finding.change);
+            let endpoint = finding.change.endpoint();
             let endpoint_str = format!(
                 "`{} {}`",
                 endpoint.method.as_str(),
@@ -371,7 +284,7 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
         let _ = writeln!(out);
 
         for finding in &report.findings {
-            let endpoint = change_endpoint(&finding.change);
+            let endpoint = finding.change.endpoint();
             let change_desc = describe_change(&finding.change);
             let _ = writeln!(out, "<details>");
             let _ = writeln!(
@@ -584,17 +497,7 @@ fn describe_extraction_diagnostic(diagnostic: &ExtractionDiagnostic) -> String {
     )
 }
 
-fn change_endpoint(change: &ContractChange) -> &EndpointId {
-    match change {
-        ContractChange::EndpointRemoved { endpoint }
-        | ContractChange::ResponseFieldRemoved { endpoint, .. }
-        | ContractChange::ResponseFieldTypeChanged { endpoint, .. }
-        | ContractChange::RequestFieldAddedRequired { endpoint, .. }
-        | ContractChange::RequestFieldTypeChanged { endpoint, .. }
-        | ContractChange::RequiredParameterAdded { endpoint, .. } => endpoint,
-    }
-}
-
+// Describe cada cambio con el mismo formato para terminal y Markdown.
 fn describe_change(change: &ContractChange) -> String {
     match change {
         ContractChange::EndpointRemoved { .. } => "Removed endpoint".to_string(),
@@ -615,6 +518,29 @@ fn describe_change(change: &ContractChange) -> String {
         } => format!(
             "Changed response field `{field_path}` type: {previous_type} -> {new_type} (HTTP {status_code})"
         ),
+        ContractChange::ResponseFieldMadeOptional {
+            status_code,
+            field_path,
+            ..
+        } => format!("Response field `{field_path}` became optional (HTTP {status_code})"),
+        ContractChange::BodyTypeChanged {
+            status_code,
+            previous_type,
+            new_type,
+            ..
+        } => match status_code {
+            Some(status) => {
+                format!("Changed response body type: {previous_type} -> {new_type} (HTTP {status})")
+            }
+            None => format!("Changed request body type: {previous_type} -> {new_type}"),
+        },
+        ContractChange::RequestParameterTypeChanged {
+            location,
+            name,
+            previous_type,
+            new_type,
+            ..
+        } => format!("Changed {location} parameter `{name}` type: {previous_type} -> {new_type}"),
         ContractChange::RequestFieldAddedRequired {
             field_path,
             field_type,

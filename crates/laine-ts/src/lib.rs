@@ -11,7 +11,7 @@ pub use cross_file::{
     CrossFileAnalysis, CrossFileFieldRead, analyze_cross_file_dataflow,
     analyze_cross_file_dataflow_with_limits,
 };
-pub use express::extract_express_routes;
+pub use express::{extract_express_routes, extract_express_snapshot};
 pub use extractor::{
     ExtractContext, ExtractedFieldRead, ExtractedHttpCall, ExtractedUnresolvedCall, FileExtraction,
     HttpClientKind, extract_file, extract_file_with_context,

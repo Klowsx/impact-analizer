@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, HashSet};
 
 use laine_core::model::{EndpointId, HttpMethod};
-use laine_core::routes::{ExtractedRoute, normalize_route_path};
+use laine_core::routes::{
+    ExtractedRoute, RouteExtraction, RouteMountGraph, RouteOperation, RouteTarget,
+    normalize_route_path,
+};
 
 /// Extracts FastAPI HTTP routes from a Python module.
 ///
@@ -20,13 +23,68 @@ pub fn extract_fastapi_routes(
     source: &str,
     mount_prefix: Option<&str>,
 ) -> Vec<ExtractedRoute> {
-    extract_python_routes(
+    extract_fastapi_snapshot(
         service,
-        file_path,
-        source,
+        &BTreeMap::from([(file_path.to_owned(), source.to_owned())]),
         mount_prefix,
-        PyRouteStyle::FastApi,
     )
+    .routes
+}
+
+/// Links FastAPI routers across Python modules before applying their mount prefixes.
+pub fn extract_fastapi_snapshot(
+    service: &str,
+    sources: &BTreeMap<String, String>,
+    mount_prefix: Option<&str>,
+) -> RouteExtraction {
+    let modules: BTreeMap<_, _> = sources
+        .iter()
+        .map(|(file, source)| {
+            (
+                file.as_str(),
+                scan_route_module(source, PyRouteStyle::FastApi),
+            )
+        })
+        .collect();
+    let mut graph = RouteMountGraph::default();
+    for (&file, module) in &modules {
+        for ctor in &module.constructors {
+            let target = (file.to_owned(), ctor.name.clone());
+            if ctor.application {
+                graph.add_application(target);
+            } else {
+                graph.add_router(target, ctor.prefix.clone(), ctor.line);
+            }
+        }
+        let lines: Vec<_> = sources[file].lines().collect();
+        for dec in &module.decorators {
+            let target = resolve_python_target(&modules, file, &dec.target)
+                .unwrap_or_else(|| (file.to_owned(), dec.target.clone()));
+            for method in &dec.methods {
+                graph.add_operation(
+                    target.clone(),
+                    RouteOperation {
+                        method: *method,
+                        path: dec.raw_path.clone(),
+                        file: file.to_owned(),
+                        line: dec.line,
+                        snippet: lines[dec.line - 1].trim().to_owned(),
+                    },
+                );
+            }
+        }
+        for mount in &module.mounts {
+            let parent = resolve_python_target(&modules, file, &mount.parent);
+            if let (Some(parent), Some(child), Some(prefix)) = (parent, &mount.child, &mount.prefix)
+                && let Some(child) = resolve_python_target(&modules, file, child)
+            {
+                graph.add_mount(parent, child, prefix.clone(), file, mount.line);
+            } else {
+                graph.mark_unresolved(file, mount.line);
+            }
+        }
+    }
+    graph.resolve(service, mount_prefix, normalize_fastapi_path)
 }
 
 /// Extrae las rutas HTTP de Flask de un módulo Python.
@@ -47,13 +105,45 @@ pub fn extract_flask_routes(
     source: &str,
     mount_prefix: Option<&str>,
 ) -> Vec<ExtractedRoute> {
-    extract_python_routes(
-        service,
-        file_path,
-        source,
-        mount_prefix,
-        PyRouteStyle::Flask,
-    )
+    let module = scan_route_module(source, PyRouteStyle::Flask);
+    let raw_lines: Vec<&str> = source.lines().collect();
+    let router_prefixes = module
+        .constructors
+        .into_iter()
+        .filter_map(|ctor| ctor.prefix.map(|prefix| (ctor.name, prefix)))
+        .collect();
+    let mut mounts: BTreeMap<String, Vec<MountEntry>> = BTreeMap::new();
+    for mount in module.mounts {
+        if let Some(child) = mount.child {
+            mounts.entry(child).or_default().push(MountEntry {
+                parent: mount.parent,
+                prefix: mount.prefix,
+            });
+        }
+    }
+
+    let mut routes = Vec::new();
+    for dec in module.decorators {
+        let chains = resolve_prefix_chains(&dec.target, mount_prefix, &router_prefixes, &mounts);
+        let snippet = raw_lines[dec.line - 1].trim().to_owned();
+        for chain in chains {
+            let prefix_refs: Vec<&str> = chain.iter().map(String::as_str).collect();
+            let normalized_path = normalize_flask_path(&prefix_refs, &dec.raw_path);
+            for method in &dec.methods {
+                routes.push(ExtractedRoute {
+                    endpoint: EndpointId {
+                        service: service.to_owned(),
+                        method: *method,
+                        normalized_path: normalized_path.clone(),
+                    },
+                    file: file_path.to_owned(),
+                    line: dec.line,
+                    snippet: snippet.clone(),
+                });
+            }
+        }
+    }
+    routes
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +166,28 @@ struct PendingDecorator {
     raw_path: String,
 }
 
+#[derive(Default)]
+struct RouteModule {
+    imports: BTreeMap<String, String>,
+    constructors: Vec<Constructor>,
+    mounts: Vec<MountCall>,
+    decorators: Vec<PendingDecorator>,
+}
+
+struct Constructor {
+    name: String,
+    application: bool,
+    prefix: Option<String>,
+    line: usize,
+}
+
+struct MountCall {
+    parent: String,
+    child: Option<String>,
+    prefix: Option<String>,
+    line: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CallArg {
     pub name: Option<String>,
@@ -83,20 +195,10 @@ pub(crate) struct CallArg {
     pub offset: usize,
 }
 
-// Extrae decoradores y montajes y compone las rutas según el framework.
-fn extract_python_routes(
-    service: &str,
-    file_path: &str,
-    source: &str,
-    mount_prefix: Option<&str>,
-    style: PyRouteStyle,
-) -> Vec<ExtractedRoute> {
+/// Collects imports, router declarations, mounts and operations in source order.
+fn scan_route_module(source: &str, style: PyRouteStyle) -> RouteModule {
     let cleaned = strip_python_comments_and_docstrings(source);
-    let raw_lines: Vec<&str> = source.lines().collect();
-
-    let mut router_prefixes: BTreeMap<String, String> = BTreeMap::new();
-    let mut mounts: BTreeMap<String, Vec<MountEntry>> = BTreeMap::new();
-    let mut decorators: Vec<PendingDecorator> = Vec::new();
+    let mut module = RouteModule::default();
 
     let bytes = cleaned.as_bytes();
     let mut i = 0usize;
@@ -127,7 +229,7 @@ fn extract_python_routes(
         // 1. Decorator: `@<target>.<method>(...)`
         if at_line_start && b == b'@' {
             if let Some((dec, next_i)) = parse_route_decorator(&cleaned, i, line, style) {
-                decorators.push(dec);
+                module.decorators.push(dec);
                 line += count_newlines(&bytes[i..next_i]);
                 at_line_start = false;
                 i = next_i;
@@ -140,22 +242,22 @@ fn extract_python_routes(
 
         // 2. Statement-level router/blueprint constructor or mount call
         if at_line_start && is_ident_start(b) {
-            if let Some((var_name, prefix, next_i)) = try_parse_router_ctor(&cleaned, i, style) {
-                if let Some(p) = prefix {
-                    router_prefixes.insert(var_name, p);
-                }
-                line += count_newlines(&bytes[i..next_i]);
-                at_line_start = false;
-                i = next_i;
-                continue;
-            }
-
-            if let Some((parent, child, prefix, next_i)) = try_parse_mount_call(&cleaned, i, style)
+            let next = if style == PyRouteStyle::FastApi
+                && let Some(end) = collect_python_import(&cleaned, i, &mut module.imports)
             {
-                mounts
-                    .entry(child)
-                    .or_default()
-                    .push(MountEntry { parent, prefix });
+                Some(end)
+            } else if let Some((ctor, end)) =
+                try_parse_router_ctor(&cleaned, i, line, style, &module.imports)
+            {
+                module.constructors.push(ctor);
+                Some(end)
+            } else if let Some((mount, end)) = try_parse_mount_call(&cleaned, i, line, style) {
+                module.mounts.push(mount);
+                Some(end)
+            } else {
+                None
+            };
+            if let Some(next_i) = next {
                 line += count_newlines(&bytes[i..next_i]);
                 at_line_start = false;
                 i = next_i;
@@ -167,38 +269,135 @@ fn extract_python_routes(
         i += 1;
     }
 
-    let mut routes = Vec::new();
-    for dec in decorators {
-        let chains =
-            resolve_prefix_chains(&dec.target, mount_prefix, &router_prefixes, &mounts, style);
-        let snippet = raw_lines
-            .get(dec.line.saturating_sub(1))
-            .map(|l| l.trim().to_string())
-            .unwrap_or_default();
+    module
+}
 
-        for chain in chains {
-            let prefix_refs: Vec<&str> = chain.iter().map(String::as_str).collect();
-            let normalized_path = match style {
-                PyRouteStyle::FastApi => normalize_fastapi_path(&prefix_refs, &dec.raw_path),
-                PyRouteStyle::Flask => normalize_flask_path(&prefix_refs, &dec.raw_path),
+/// Expands import aliases and follows the referenced symbol to its declaring module.
+fn resolve_python_target(
+    modules: &BTreeMap<&str, RouteModule>,
+    file: &str,
+    reference: &str,
+) -> Option<RouteTarget> {
+    let mut file = file.to_owned();
+    let mut name = reference.to_owned();
+    let mut seen = HashSet::new();
+    while seen.insert((file.clone(), name.clone())) {
+        let module = modules.get(file.as_str())?;
+        let (root, suffix) = name.split_once('.').unwrap_or((&name, ""));
+        if let Some(import) = module.imports.get(root) {
+            let qualified = if suffix.is_empty() {
+                import.clone()
+            } else {
+                format!("{import}.{suffix}")
             };
-
-            for method in &dec.methods {
-                routes.push(ExtractedRoute {
-                    endpoint: EndpointId {
-                        service: service.to_string(),
-                        method: *method,
-                        normalized_path: normalized_path.clone(),
-                    },
-                    file: file_path.to_string(),
-                    line: dec.line,
-                    snippet: snippet.clone(),
-                });
-            }
+            let (path, target) = qualified.rsplit_once('.')?;
+            // Preserve the leading dot when importing a symbol from the current package.
+            let path = if path.trim_matches('.').is_empty() {
+                &qualified[..path.len() + 1]
+            } else {
+                path
+            };
+            file = python_module_file(modules, &file, path)?;
+            name = target.to_owned();
+        } else {
+            return (module.constructors.iter().any(|ctor| ctor.name == name)
+                || module.decorators.iter().any(|dec| dec.target == name))
+            .then_some((file, name));
         }
     }
+    None
+}
 
-    routes
+/// Resolves absolute imports from the snapshot and relative imports from their package.
+fn python_module_file(
+    modules: &BTreeMap<&str, RouteModule>,
+    importer: &str,
+    module: &str,
+) -> Option<String> {
+    let path = module.trim_start_matches('.');
+    let relative = module.len() - path.len();
+    let mut package: Vec<_> = importer.split('/').collect();
+    package.pop();
+    let path = path.replace('.', "/");
+    let probe = |root: &[&str]| {
+        let stem = root
+            .iter()
+            .copied()
+            .chain((!path.is_empty()).then_some(path.as_str()))
+            .collect::<Vec<_>>()
+            .join("/");
+        let package = if stem.is_empty() {
+            "__init__.py".to_owned()
+        } else {
+            format!("{stem}/__init__.py")
+        };
+        [format!("{stem}.py"), package]
+            .into_iter()
+            .find(|candidate| modules.contains_key(candidate.as_str()))
+    };
+    if relative == 0 {
+        (0..=package.len()).find_map(|count| probe(&package[..count]))
+    } else {
+        let keep = package.len().checked_sub(relative - 1)?;
+        probe(&package[..keep])
+    }
+}
+
+/// Records Python absolute and relative imports, including parenthesized import lists.
+fn collect_python_import(
+    cleaned: &str,
+    start: usize,
+    imports: &mut BTreeMap<String, String>,
+) -> Option<usize> {
+    let bytes = cleaned.as_bytes();
+    let (keyword, end) = read_ident(cleaned, start)?;
+    let (module, pos) = match keyword {
+        "import" => (None, end),
+        "from" => {
+            let path_start = skip_inline_ws(bytes, end);
+            let mut path_end = path_start;
+            while bytes.get(path_end) == Some(&b'.') {
+                path_end += 1;
+            }
+            if let Some((_, end)) = read_dotted_ident(cleaned, path_end) {
+                path_end = end;
+            }
+            let (keyword, end) = read_ident(cleaned, skip_inline_ws(bytes, path_end))?;
+            if keyword != "import" || path_start == path_end {
+                return None;
+            }
+            (Some(&cleaned[path_start..path_end]), end)
+        }
+        _ => return None,
+    };
+    let pos = skip_inline_ws(bytes, pos);
+    let (items, end) = if bytes.get(pos) == Some(&b'(') {
+        let end = find_matching_delim(bytes, pos, b'(', b')')?;
+        (&cleaned[pos + 1..end], end + 1)
+    } else {
+        let end = cleaned[pos..]
+            .find(['\n', ';'])
+            .map_or(bytes.len(), |end| pos + end);
+        (&cleaned[pos..end], end)
+    };
+    for item in items.split(',') {
+        let mut words = item.split_whitespace();
+        let Some(name) = words.next() else { continue };
+        let alias = (words.next() == Some("as")).then(|| words.next()).flatten();
+        if let Some(module) = module {
+            let separator = if module.ends_with('.') { "" } else { "." };
+            imports.insert(
+                alias.unwrap_or(name).to_owned(),
+                format!("{module}{separator}{name}"),
+            );
+        } else if let Some(alias) = alias {
+            imports.insert(alias.to_owned(), name.to_owned());
+        } else {
+            let root = name.split('.').next().unwrap_or(name);
+            imports.insert(root.to_owned(), root.to_owned());
+        }
+    }
+    Some(end)
 }
 
 fn parse_route_decorator(
@@ -266,11 +465,14 @@ fn parse_route_decorator(
     ))
 }
 
+/// Reads a framework constructor and distinguishes omitted and dynamic FastAPI prefixes.
 fn try_parse_router_ctor(
     cleaned: &str,
     start: usize,
+    line: usize,
     style: PyRouteStyle,
-) -> Option<(String, Option<String>, usize)> {
+    imports: &BTreeMap<String, String>,
+) -> Option<(Constructor, usize)> {
     let bytes = cleaned.as_bytes();
     let (var_name, mut pos) = read_ident(cleaned, start)?;
     pos = skip_inline_ws(bytes, pos);
@@ -289,14 +491,13 @@ fn try_parse_router_ctor(
     pos = skip_inline_ws(bytes, pos + 1);
 
     let (ctor_chain, after_ctor) = read_dotted_ident(cleaned, pos)?;
+    let ctor_chain = imports.get(ctor_chain).map_or(ctor_chain, String::as_str);
     let ctor_name = ctor_chain.rsplit('.').next().unwrap_or(ctor_chain);
-    let (expected_ctor, prefix_kwarg) = match style {
-        PyRouteStyle::FastApi => ("APIRouter", "prefix"),
-        PyRouteStyle::Flask => ("Blueprint", "url_prefix"),
+    let application = match (style, ctor_name) {
+        (PyRouteStyle::FastApi, "FastAPI") => true,
+        (PyRouteStyle::FastApi, "APIRouter") | (PyRouteStyle::Flask, "Blueprint") => false,
+        _ => return None,
     };
-    if ctor_name != expected_ctor {
-        return None;
-    }
 
     let open_paren = skip_ws(bytes, after_ctor);
     if bytes.get(open_paren) != Some(&b'(') {
@@ -304,23 +505,35 @@ fn try_parse_router_ctor(
     }
     let close_paren = find_matching_delim(bytes, open_paren, b'(', b')')?;
     let args = parse_call_args(&cleaned[open_paren + 1..close_paren], open_paren + 1);
-    let prefix = extract_kwarg_string(&args, prefix_kwarg);
-
-    Some((var_name.to_string(), prefix, close_paren + 1))
+    let prefix = match style {
+        PyRouteStyle::FastApi => fastapi_prefix(&args),
+        PyRouteStyle::Flask => extract_kwarg_string(&args, "url_prefix"),
+    };
+    Some((
+        Constructor {
+            name: var_name.to_owned(),
+            application,
+            prefix,
+            line,
+        },
+        close_paren + 1,
+    ))
 }
 
+/// Keeps dynamic FastAPI mount arguments so they can be reported with their source line.
 fn try_parse_mount_call(
     cleaned: &str,
     start: usize,
+    line: usize,
     style: PyRouteStyle,
-) -> Option<(String, String, Option<String>, usize)> {
+) -> Option<(MountCall, usize)> {
     let bytes = cleaned.as_bytes();
     let (chain, after_chain) = read_dotted_ident(cleaned, start)?;
     let (parent, method_name) = chain.rsplit_once('.')?;
 
-    let (expected_method, target_kwarg, prefix_kwarg) = match style {
-        PyRouteStyle::FastApi => ("include_router", "router", "prefix"),
-        PyRouteStyle::Flask => ("register_blueprint", "blueprint", "url_prefix"),
+    let (expected_method, target_kwarg) = match style {
+        PyRouteStyle::FastApi => ("include_router", "router"),
+        PyRouteStyle::Flask => ("register_blueprint", "blueprint"),
     };
     if method_name != expected_method {
         return None;
@@ -333,56 +546,63 @@ fn try_parse_mount_call(
     let close_paren = find_matching_delim(bytes, open_paren, b'(', b')')?;
     let args = parse_call_args(&cleaned[open_paren + 1..close_paren], open_paren + 1);
 
-    let child_raw = args
+    let child = args
         .iter()
         .find(|a| a.name.as_deref() == Some(target_kwarg))
-        .or_else(|| args.iter().find(|a| a.name.is_none()))?
-        .value
-        .trim();
+        .or_else(|| args.iter().find(|a| a.name.is_none()))
+        .map(|arg| arg.value.trim())
+        .filter(|value| read_dotted_ident(value, 0).is_some_and(|(_, end)| end == value.len()))
+        .map(str::to_owned);
+    let prefix = match style {
+        PyRouteStyle::FastApi => fastapi_prefix(&args),
+        PyRouteStyle::Flask => extract_kwarg_string(&args, "url_prefix"),
+    };
 
-    if child_raw.is_empty()
-        || !child_raw
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'.')
-    {
-        return None;
-    }
-
-    let prefix = extract_kwarg_string(&args, prefix_kwarg);
     Some((
-        parent.to_string(),
-        child_raw.to_string(),
-        prefix,
+        MountCall {
+            parent: parent.to_owned(),
+            child,
+            prefix,
+            line,
+        },
         close_paren + 1,
     ))
 }
 
-// Reúne las cadenas de prefijos que llevan a un router o blueprint.
+/// Returns the empty FastAPI default only when no argument can supply a prefix.
+fn fastapi_prefix(args: &[CallArg]) -> Option<String> {
+    if let Some(prefix) = args
+        .iter()
+        .find(|arg| arg.name.as_deref() == Some("prefix"))
+    {
+        parse_python_string_literal(&prefix.value)
+    } else if args
+        .iter()
+        .any(|arg| arg.name.is_none() && arg.value.trim_start().starts_with("**"))
+    {
+        None
+    } else {
+        Some(String::new())
+    }
+}
+
+/// Collects all prefix chains for a Flask blueprint.
 fn resolve_prefix_chains(
     target: &str,
     mount_prefix: Option<&str>,
     router_prefixes: &BTreeMap<String, String>,
     mounts: &BTreeMap<String, Vec<MountEntry>>,
-    style: PyRouteStyle,
 ) -> Vec<Vec<String>> {
     let mut visited = HashSet::new();
-    resolve_prefix_chains_inner(
-        target,
-        mount_prefix,
-        router_prefixes,
-        mounts,
-        style,
-        &mut visited,
-    )
+    resolve_prefix_chains_inner(target, mount_prefix, router_prefixes, mounts, &mut visited)
 }
 
-// Recorre los montajes padre y aplica la regla de prefijos de cada framework.
+/// Traverses parent registrations, applying Flask's constructor-prefix override rule.
 fn resolve_prefix_chains_inner(
     target: &str,
     mount_prefix: Option<&str>,
     router_prefixes: &BTreeMap<String, String>,
     mounts: &BTreeMap<String, Vec<MountEntry>>,
-    style: PyRouteStyle,
     visited: &mut HashSet<String>,
 ) -> Vec<Vec<String>> {
     let own_prefix = router_prefixes.get(target);
@@ -406,19 +626,11 @@ fn resolve_prefix_chains_inner(
                 mount_prefix,
                 router_prefixes,
                 mounts,
-                style,
                 visited,
             );
             for mut chain in parent_chains {
-                match style {
-                    PyRouteStyle::FastApi => {
-                        chain.extend(entry.prefix.iter().chain(own_prefix).cloned());
-                    }
-                    PyRouteStyle::Flask => {
-                        // Incluso un prefijo vacío sustituye al valor del constructor.
-                        chain.extend(entry.prefix.as_ref().or(own_prefix).cloned());
-                    }
-                }
+                // An explicit empty prefix also overrides the constructor default.
+                chain.extend(entry.prefix.as_ref().or(own_prefix).cloned());
                 all_chains.push(chain);
             }
         }

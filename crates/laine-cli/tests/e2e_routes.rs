@@ -5,8 +5,8 @@ use std::process::Command;
 use laine_cli::engine::{AnalyzeRequest, run_analysis, run_analysis_with_options};
 use laine_cli::report::{render_json, render_markdown, render_terminal};
 use laine_core::model::{
-    Confidence, ContractChange, ExtractionFailure, ExtractionStage, FileCoverage, HttpMethod,
-    Severity,
+    AnalysisReport, Confidence, ContractChange, ExtractionFailure, ExtractionStage, FileCoverage,
+    HttpMethod, Severity,
 };
 
 fn git(dir: &Path, args: &[&str]) {
@@ -30,6 +30,294 @@ fn init_repo(dir: &Path) {
     git(dir, &["init", "-b", "main"]);
     git(dir, &["config", "user.name", "Laine Test"]);
     git(dir, &["config", "user.email", "test@laine.local"]);
+}
+
+/// Runs the CLI against two committed snapshots with a consumer of the original route.
+fn analyze_mount_change(
+    case: &str,
+    framework: &str,
+    files: &[(&str, &str)],
+    changed_file: &str,
+    changed_source: &str,
+    consumed_path: &str,
+) -> AnalysisReport {
+    let tmp = std::env::temp_dir().join(format!(
+        "laine-mounts-{}-{case}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let api = tmp.join("api");
+    let web = tmp.join("web");
+    init_repo(&api);
+    init_repo(&web);
+    for (path, contents) in files {
+        let file = api.join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, contents).unwrap();
+    }
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "test: add routes"]);
+    fs::write(api.join(changed_file), changed_source).unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "test: change mount"]);
+    fs::write(
+        web.join("client.ts"),
+        format!("fetch('http://api{consumed_path}');"),
+    )
+    .unwrap();
+    git(&web, &["add", "."]);
+    git(&web, &["commit", "-m", "test: consume route"]);
+    let paths = files
+        .iter()
+        .map(|(path, _)| format!("\"{path}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    fs::write(
+        tmp.join("laine.toml"),
+        format!(
+            r#"version = 1
+[policy]
+fail_on = "low"
+[[services]]
+name = "api"
+path = "./api"
+base_urls = ["http://api"]
+[services.routes]
+framework = "{framework}"
+files = [{paths}]
+[[services]]
+name = "web"
+path = "./web"
+"#
+        ),
+    )
+    .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_laine"))
+        .current_dir(&tmp)
+        .args([
+            "analyze",
+            "--config",
+            "laine.toml",
+            "--repo",
+            "api",
+            "--base",
+            "HEAD~1",
+            "--head",
+            "HEAD",
+            "--format",
+            "json",
+            "--no-cache",
+        ])
+        .output()
+        .unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+    let report: AnalysisReport = serde_json::from_slice(&run.stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid report: {error}; stderr: {}",
+            String::from_utf8_lossy(&run.stderr)
+        )
+    });
+    assert_eq!(run.status.code(), report.exit_code.map(i32::from));
+    report
+}
+
+/// Verifies that only the old path is reported and its consumer is connected.
+fn assert_removed_mount(report: &AnalysisReport, path: &str) {
+    assert!(report.coverage.as_ref().unwrap().complete, "{report:?}");
+    assert_eq!(report.findings.len(), 1, "{report:?}");
+    let finding = &report.findings[0];
+    let ContractChange::EndpointRemoved { endpoint } = &finding.change else {
+        panic!("expected an endpoint removal, got {finding:?}");
+    };
+    assert_eq!(endpoint.method, HttpMethod::Get);
+    assert_eq!(endpoint.normalized_path, path);
+    assert_eq!(finding.confidence, Confidence::Confirmed);
+    assert_eq!(finding.consumers[0].evidence.file, "client.ts");
+}
+
+/// Covers imported Express routers, including a router mounted at two prefixes.
+#[test]
+fn detects_removed_express_mounts_across_modules() {
+    let app = "import express from 'express';\nimport { usersRouter as r } from './routes/users';\nconst app = express();\n";
+    let router = "import { Router } from 'express';\nexport const usersRouter = Router();\nusersRouter.get('/users', handler);";
+    for (case, base, head, path) in [
+        (
+            "express-move",
+            "app.use('/v1', r);",
+            "app.use('/v2', r);",
+            "/v1/users",
+        ),
+        (
+            "express-remove-one",
+            "app.use('/v1', r);\napp.use('/v2', r);",
+            "app.use('/v1', r);",
+            "/v2/users",
+        ),
+        ("express-remove-root", "app.use(r);", "", "/users"),
+    ] {
+        let report = analyze_mount_change(
+            case,
+            "express",
+            &[
+                ("src/app.ts", &format!("{app}{base}")),
+                ("src/routes/users.ts", router),
+            ],
+            "src/app.ts",
+            &format!("{app}{head}"),
+            path,
+        );
+        assert_removed_mount(&report, path);
+    }
+}
+
+/// Preserves existing same-file Express prefix detection for short router names.
+#[test]
+fn detects_same_module_express_mount_move() {
+    let app = "const app = express();\nconst r = express.Router();\nr.get('/users', handler);\n";
+    let report = analyze_mount_change(
+        "express-control",
+        "express",
+        &[("app.ts", &format!("{app}app.use('/v1', r);"))],
+        "app.ts",
+        &format!("{app}app.use('/v2', r);"),
+        "/v1/users",
+    );
+    assert_removed_mount(&report, "/v1/users");
+}
+
+/// Follows a nested Express mount through a namespace import and a default export.
+#[test]
+fn detects_nested_express_mount_move() {
+    let app = "import * as routes from './routes';\nconst app = express();\napp.use('/api', routes.publicRoutes);";
+    let barrel = "export { default as publicRoutes } from './public';";
+    let parent =
+        "import r from './users';\nconst router = express.Router();\nexport default router;\n";
+    let router = "const r = express.Router();\nr.get('/users', handler);\nexport default r;";
+    let report = analyze_mount_change(
+        "express-nested",
+        "express",
+        &[
+            ("app.ts", app),
+            ("routes/index.ts", barrel),
+            (
+                "routes/public.ts",
+                &format!("{parent}router.use('/v1', r);"),
+            ),
+            ("routes/users.ts", router),
+        ],
+        "routes/public.ts",
+        &format!("{parent}router.use('/v2', r);"),
+        "/api/v1/users",
+    );
+    assert_removed_mount(&report, "/api/v1/users");
+}
+
+/// Resolves an imported FastAPI router and combines nested registration and constructor prefixes.
+#[test]
+fn detects_removed_fastapi_mounts_across_modules() {
+    let router = "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get('/users')\ndef get_users():\n    return []\n";
+    let main = "from fastapi import FastAPI\nfrom routers.users import router\napp = FastAPI()\n";
+    let report = analyze_mount_change(
+        "fastapi-move",
+        "fastapi",
+        &[
+            (
+                "main.py",
+                &format!("{main}app.include_router(router, prefix='/v1')"),
+            ),
+            ("routers/users.py", router),
+        ],
+        "main.py",
+        &format!("{main}app.include_router(router, prefix='/v2')"),
+        "/v1/users",
+    );
+    assert_removed_mount(&report, "/v1/users");
+
+    let app = "from fastapi import FastAPI\nfrom routes.public import outer\napp = FastAPI()\napp.include_router(outer, prefix='/api')\n";
+    let parent = "from fastapi import APIRouter as Router\nfrom . import users as endpoints\nouter = Router(prefix='/public')\n";
+    let report = analyze_mount_change(
+        "fastapi-nested",
+        "fastapi",
+        &[
+            ("main.py", app),
+            (
+                "routes/public.py",
+                &format!("{parent}outer.include_router(endpoints.router, prefix='/v1')"),
+            ),
+            (
+                "routes/users.py",
+                &router.replace("APIRouter()", "APIRouter(prefix='/internal')"),
+            ),
+        ],
+        "routes/public.py",
+        &format!("{parent}outer.include_router(endpoints.router, prefix='/v2')"),
+        "/api/public/v1/internal/users",
+    );
+    assert_removed_mount(&report, "/api/public/v1/internal/users");
+}
+
+/// Reports dynamic, missing and cyclic mounts at their source line without a false removal.
+#[test]
+fn reports_unknown_mounts_as_incomplete() {
+    for (case, framework, file, base, head) in [
+        (
+            "express-prefix",
+            "express",
+            "app.ts",
+            "const app = express(); const r = express.Router(); r.get('/users', handler);\napp.use('/v1', r);",
+            "const app = express(); const r = express.Router(); r.get('/users', handler);\napp.use(process.env.PREFIX, r);",
+        ),
+        (
+            "express-cycle",
+            "express",
+            "app.ts",
+            "const app = express(); const r = express.Router(); r.get('/users', handler);\napp.use('/v1', r);",
+            "const app = express(); const r = express.Router(); r.get('/users', handler);\nr.use('/v1', r);",
+        ),
+        (
+            "fastapi-target",
+            "fastapi",
+            "app.py",
+            "from fastapi import FastAPI, APIRouter\napp = FastAPI()\nr = APIRouter()\napp.include_router(r, prefix='/v1')\n@r.get('/users')\ndef users(): pass",
+            "from fastapi import FastAPI, APIRouter\napp = FastAPI()\nr = APIRouter()\napp.include_router(load_router(), prefix='/v1')\n@r.get('/users')\ndef users(): pass",
+        ),
+        (
+            "fastapi-prefix",
+            "fastapi",
+            "app.py",
+            "from fastapi import FastAPI, APIRouter\napp = FastAPI()\nr = APIRouter()\napp.include_router(r, prefix='/v1')\n@r.get('/users')\ndef users(): pass",
+            "from fastapi import FastAPI, APIRouter\napp = FastAPI()\nr = APIRouter()\napp.include_router(r, prefix=compute_prefix())\n@r.get('/users')\ndef users(): pass",
+        ),
+        (
+            "fastapi-import",
+            "fastapi",
+            "app.py",
+            "from fastapi import FastAPI, APIRouter\napp = FastAPI()\nr = APIRouter()\napp.include_router(r, prefix='/v1')\n@r.get('/users')\ndef users(): pass",
+            "from fastapi import FastAPI\nfrom missing import r\napp = FastAPI()\napp.include_router(r, prefix='/v1')",
+        ),
+    ] {
+        let report =
+            analyze_mount_change(case, framework, &[(file, base)], file, head, "/v1/users");
+        assert!(report.findings.is_empty(), "{report:?}");
+        let coverage = report.coverage.as_ref().unwrap();
+        assert!(!coverage.complete, "{report:?}");
+        assert_eq!(coverage.producer_head.failed, 1);
+        assert_eq!(report.diagnostics.len(), 1, "{report:?}");
+        let diagnostic = &report.diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            ExtractionFailure::RouteDeclarationUnresolved
+        );
+        assert_eq!(diagnostic.stage, ExtractionStage::ProducerHead);
+        assert_eq!(diagnostic.file, file);
+        assert_eq!(
+            diagnostic.line,
+            Some(if framework == "express" { 2 } else { 4 })
+        );
+    }
 }
 
 // Verifica que un archivo malformado reste cobertura sin simular una eliminación de rutas.

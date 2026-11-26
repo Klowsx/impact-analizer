@@ -1,0 +1,25 @@
+Laine v0.1.0 — Cross-Repo Impact Analysis
+Target: customer-service (<SHA> -> <SHA>)
+Analyzed: 4 repos | 6 files | 12 nodes | 15 edges | <elapsed> ms
+
+Coverage: COMPLETE | producer base: 1/1 analyzed, 1 read, 0 failed | producer head: 1/1 analyzed, 1 read, 0 failed | consumers: 5/5 analyzed, 5 read, 0 failed
+
+BREAKING CHANGE [Confirmed | High] (LAINE-001)
+  Endpoint: GET /customers/:id
+  Change:   Removed response field `fullName` (string, HTTP 200)
+  Source:   customer-service/openapi.yaml:30:19 (/paths/~1customers~1{id}/get/responses/200/content/application~1json/schema/properties/fullName) (revision <SHA>)
+
+  Affected consumers (2):
+    1. billing-service [Confirmed]
+       File: billing-service/src/invoices/customer.ts:4 (commit <SHA>)
+       Evidence: Response field: fullName
+       Path: GET /customers/:id -> HTTP call @ billing-service/src/invoices/customer.ts:2 -> read `fullName` @ billing-service/src/invoices/customer.ts:4
+    2. notification-service [Confirmed]
+       File: notification-service/src/email/welcome.ts:5 (commit <SHA>)
+       Evidence: Response field: fullName
+       Path: GET /customers/:id -> HTTP call @ notification-service/src/email/welcome.ts:4 -> read `fullName` @ notification-service/src/email/welcome.ts:5
+
+UNRESOLVED CALLS [UNKNOWN] (1)
+  - billing-service/src/legacy/sync.ts:5 (dynamic URL variable `url` cannot be resolved statically)
+
+RESULT: POLICY BLOCKED (exit code 2) — 1 finding(s) meet or exceed fail_on threshold (Low)

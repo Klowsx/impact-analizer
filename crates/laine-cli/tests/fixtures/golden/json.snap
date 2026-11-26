@@ -1,0 +1,130 @@
+{
+  "base_rev": "<SHA>",
+  "consumer_revisions": {
+    "billing-service": "<SHA>",
+    "customer-service": "<SHA>",
+    "notification-service": "<SHA>",
+    "shipping-service": "<SHA>"
+  },
+  "coverage": {
+    "complete": true,
+    "consumers": {
+      "analyzed": 5,
+      "discovered": 5,
+      "failed": 0,
+      "read": 5
+    },
+    "producer_base": {
+      "analyzed": 1,
+      "discovered": 1,
+      "failed": 0,
+      "read": 1
+    },
+    "producer_head": {
+      "analyzed": 1,
+      "discovered": 1,
+      "failed": 0,
+      "read": 1
+    }
+  },
+  "exit_code": 2,
+  "findings": [
+    {
+      "change": {
+        "endpoint": {
+          "method": "GET",
+          "normalized_path": "/customers/:id",
+          "service": "customer-service"
+        },
+        "field_path": "fullName",
+        "kind": "response_field_removed",
+        "previous_type": "string",
+        "status_code": "200"
+      },
+      "confidence": "CONFIRMED",
+      "consumers": [
+        {
+          "confidence": "CONFIRMED",
+          "dependency_path": [
+            "GET /customers/:id",
+            "HTTP call @ billing-service/src/invoices/customer.ts:2",
+            "read `fullName` @ billing-service/src/invoices/customer.ts:4"
+          ],
+          "evidence": {
+            "file": "src/invoices/customer.ts",
+            "line": 4,
+            "repo": "billing-service",
+            "revision": "<SHA>",
+            "snippet": "Response field: fullName"
+          },
+          "repo": "billing-service"
+        },
+        {
+          "confidence": "CONFIRMED",
+          "dependency_path": [
+            "GET /customers/:id",
+            "HTTP call @ notification-service/src/email/welcome.ts:4",
+            "read `fullName` @ notification-service/src/email/welcome.ts:5"
+          ],
+          "evidence": {
+            "file": "src/email/welcome.ts",
+            "line": 5,
+            "repo": "notification-service",
+            "revision": "<SHA>",
+            "snippet": "Response field: fullName"
+          },
+          "repo": "notification-service"
+        }
+      ],
+      "id": "LAINE-001",
+      "producer_evidence": {
+        "description": "Response field fullName (string)",
+        "file": "openapi.yaml",
+        "json_pointer": "/paths/~1customers~1{id}/get/responses/200/content/application~1json/schema/properties/fullName",
+        "line": 30,
+        "repo": "customer-service",
+        "revision": "<SHA>",
+        "snippet": "",
+        "span": {
+          "column": 19,
+          "end_column": 27,
+          "end_line": 30,
+          "line": 30
+        }
+      },
+      "severity": "HIGH"
+    }
+  ],
+  "head_rev": "<SHA>",
+  "policy": {
+    "blocking_findings": 1,
+    "blocking_unresolved_calls": 0,
+    "exit_code": 2,
+    "reason": "1 finding(s) meet or exceed fail_on threshold (Low)",
+    "should_fail": true
+  },
+  "schema_version": 1,
+  "stats": {
+    "files_analyzed": 6,
+    "graph_edges": 15,
+    "graph_nodes": 12,
+    "repositories": 4
+  },
+  "target_repo": "customer-service",
+  "unresolved_calls": [
+    {
+      "evidence": {
+        "file": "src/legacy/sync.ts",
+        "line": 5,
+        "repo": "billing-service",
+        "revision": "<SHA>",
+        "snippet": "Unresolved HTTP call"
+      },
+      "reason": "dynamic URL variable `url` cannot be resolved statically",
+      "repo": "billing-service"
+    }
+  ],
+  "workspace": {
+    "id": "<workspace-id>"
+  }
+}

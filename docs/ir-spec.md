@@ -67,8 +67,8 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 |---|---|---|---|---|
 | `schema_version` | `integer` (`u32`) | Yes | Always `1` for this specification | Major schema version for forward/backward compatibility. |
 | `target_repo` | `string` | Yes | — | Name of the producer repository whose diff was analyzed. |
-| `base_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Base commit before the change. |
-| `head_rev` | `string` | Yes | Resolved 40-char Git commit SHA | Head commit after the change. |
+| `base_rev` | `string` | Yes | Resolved 40-character Git commit SHA, or the `WORKTREE` / `STAGED` pseudo-revision | Base snapshot before the change. |
+| `head_rev` | `string` | Yes | Resolved 40-character Git commit SHA, or the `WORKTREE` / `STAGED` pseudo-revision | Head snapshot after the change. |
 | `policy` | `object` | For CLI analysis | Omitted by reports produced without workspace policy | The policy decision for the reported findings and unresolved calls. |
 | `exit_code` | `integer` | For CLI analysis | `0` or `2`, matching the process | The effective exit code of a completed analysis. |
 | `workspace` | `object` | For CLI analysis | `repo_roots` is present only with `--include-repo-roots` | Local workspace identifier and optional checkout map. |
@@ -87,6 +87,8 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 Coverage counts discovered, read, analyzed, and failed source files. When a known read or parse error leaves coverage incomplete, diagnostics include `repo`, `revision`, `file`, `stage`, `code`, and `remediation`. Route removals require complete route extraction on both sides. OpenAPI changes can still be reported if both OpenAPI snapshots were analyzed. The policy decision applies to the evidence collected. `dataflow_limit_reached` identifies files with cross-file TypeScript summaries that would require additional propagation rounds. Laravel declarations that cannot be determined statically report `route_declaration_unresolved` and the source `line` when available. OpenAPI references are read from the same revision as the main specification. An unresolved reference or cycle includes its `file`, `line` when available, and `json_pointer`. Operations with unresolved schemas are skipped for the schema diff. Fields declared in only some `oneOf` or `anyOf` alternatives are conditional.
 
 `workspace.id` is a stable identifier for the resolved configuration path on the local machine. Evidence paths are relative to their repositories. Add `--include-repo-roots` to a JSON analysis to map those repository names to absolute local checkouts.
+
+`base_rev` and `head_rev` contain the revisions resolved by the CLI. Git refs such as `main`, `HEAD`, tags, and abbreviated SHAs are reported as full 40-character commit SHAs. The local pseudo-revisions are preserved as uppercase `WORKTREE` (the current on-disk files) or `STAGED` (the Git index). For example, a local analysis can report a committed base and a `WORKTREE` head, or a committed base and a `STAGED` head.
 
 ### 3.2 `AnalysisStats`
 

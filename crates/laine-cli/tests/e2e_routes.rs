@@ -32,11 +32,12 @@ fn init_repo(dir: &Path) {
     git(dir, &["config", "user.email", "test@laine.local"]);
 }
 
-/// Runs the CLI against two committed snapshots with a consumer of the original route.
+/// Runs the CLI against two revisions with a consumer of the original route.
 fn analyze_mount_change(
     case: &str,
     framework: &str,
     files: &[(&str, &str)],
+    listed_files: Option<&[&str]>,
     changed_file: &str,
     changed_source: &str,
     consumed_path: &str,
@@ -70,9 +71,13 @@ fn analyze_mount_change(
     .unwrap();
     git(&web, &["add", "."]);
     git(&web, &["commit", "-m", "test: consume route"]);
-    let paths = files
-        .iter()
-        .map(|(path, _)| format!("\"{path}\""))
+    let paths = listed_files
+        .map_or_else(
+            || files.iter().map(|(path, _)| *path).collect(),
+            |paths| paths.to_vec(),
+        )
+        .into_iter()
+        .map(|path| format!("\"{path}\""))
         .collect::<Vec<_>>()
         .join(", ");
     fs::write(
@@ -138,7 +143,7 @@ fn assert_removed_mount(report: &AnalysisReport, path: &str) {
     assert_eq!(finding.consumers[0].evidence.file, "client.ts");
 }
 
-/// Covers imported Express routers, including a router mounted at two prefixes.
+/// Verifies Express imports, multiple mounts, and the default mount prefix.
 #[test]
 fn detects_removed_express_mounts_across_modules() {
     let app = "import express from 'express';\nimport { usersRouter as r } from './routes/users';\nconst app = express();\n";
@@ -156,7 +161,12 @@ fn detects_removed_express_mounts_across_modules() {
             "app.use('/v1', r);",
             "/v2/users",
         ),
-        ("express-remove-root", "app.use(r);", "", "/users"),
+        (
+            "express-move-root",
+            "app.use(r);",
+            "app.use('/v2', r);",
+            "/users",
+        ),
     ] {
         let report = analyze_mount_change(
             case,
@@ -165,6 +175,7 @@ fn detects_removed_express_mounts_across_modules() {
                 ("src/app.ts", &format!("{app}{base}")),
                 ("src/routes/users.ts", router),
             ],
+            None,
             "src/app.ts",
             &format!("{app}{head}"),
             path,
@@ -173,7 +184,105 @@ fn detects_removed_express_mounts_across_modules() {
     }
 }
 
-/// Preserves existing same-file Express prefix detection for short router names.
+/// Verifies that unlisted Express mount files can provide prefixes for listed operations.
+#[test]
+fn detects_express_mount_changes_outside_the_route_file_list() {
+    let app = "import { usersRouter } from './users';\nconst app = express();\n";
+    let users = "export const usersRouter = express.Router();\nusersRouter.get('/users', handler);";
+    let other_app = "const app = express();\napp.get('/health', handler);";
+    let base_app = format!("{app}app.use('/v1', usersRouter);\napp.get('/outside', handler);");
+    for (case, include_other_app) in [
+        ("express-unlisted-mount", false),
+        ("express-unlisted-mount-other-app", true),
+    ] {
+        let mut sources = vec![("app.ts", base_app.as_str()), ("users.ts", users)];
+        let mut listed_files = vec!["users.ts"];
+        if include_other_app {
+            sources.push(("other.ts", other_app));
+            listed_files.push("other.ts");
+        }
+        let report = analyze_mount_change(
+            case,
+            "express",
+            &sources,
+            Some(&listed_files),
+            "app.ts",
+            &format!("{app}app.use('/v2', usersRouter);"),
+            "/v1/users",
+        );
+        assert_removed_mount(&report, "/v1/users");
+        assert_eq!(report.findings[0].producer_evidence.file, "users.ts");
+        assert_eq!(report.exit_code, Some(2));
+    }
+}
+
+/// Flags an unmounted router even when the listed application exposes other routes.
+#[test]
+fn reports_unmounted_express_router_alongside_application() {
+    let users = "export const usersRouter = express.Router();\nusersRouter.get('/users', handler);";
+    let report = analyze_mount_change(
+        "express-unmounted-router",
+        "express",
+        &[
+            (
+                "app.ts",
+                "const app = express();\napp.get('/health', handler);",
+            ),
+            ("routes/users.ts", users),
+        ],
+        Some(&["app.ts", "routes/users.ts"]),
+        "routes/users.ts",
+        &users.replace("/users", "/people"),
+        "/users",
+    );
+    assert_incomplete_mount(&report, "routes/users.ts", 2);
+}
+
+/// Flags a listed application's mount when it exposes an operation outside the file list.
+#[test]
+fn reports_listed_express_mount_of_unlisted_router() {
+    let app = "import { usersRouter } from './routes/users';\nconst app = express();\n";
+    let report = analyze_mount_change(
+        "express-listed-mount",
+        "express",
+        &[
+            ("app.ts", &format!("{app}app.use('/v1', usersRouter);")),
+            (
+                "routes/users.ts",
+                "export const usersRouter = express.Router();\nusersRouter.get('/users', handler);",
+            ),
+        ],
+        Some(&["app.ts"]),
+        "app.ts",
+        &format!("{app}app.use('/v2', usersRouter);"),
+        "/v1/users",
+    );
+    assert_incomplete_mount(&report, "app.ts", 3);
+}
+
+/// Checks that both revisions report the expected line and suppress route-removal findings.
+fn assert_incomplete_mount(report: &AnalysisReport, file: &str, line: usize) {
+    assert!(report.findings.is_empty(), "{report:?}");
+    let coverage = report.coverage.as_ref().unwrap();
+    assert!(!coverage.complete, "{report:?}");
+    assert_eq!(coverage.producer_base.failed, 1);
+    assert_eq!(coverage.producer_head.failed, 1);
+    assert_eq!(report.diagnostics.len(), 2, "{report:?}");
+    for stage in [ExtractionStage::ProducerBase, ExtractionStage::ProducerHead] {
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.stage == stage
+                    && diagnostic.code == ExtractionFailure::RouteDeclarationUnresolved
+                    && diagnostic.file == file
+                    && diagnostic.line == Some(line)),
+            "{report:?}"
+        );
+    }
+}
+
+/// Verifies Express prefix changes with short router names in a single file.
 #[test]
 fn detects_same_module_express_mount_move() {
     let app = "const app = express();\nconst r = express.Router();\nr.get('/users', handler);\n";
@@ -181,6 +290,7 @@ fn detects_same_module_express_mount_move() {
         "express-control",
         "express",
         &[("app.ts", &format!("{app}app.use('/v1', r);"))],
+        None,
         "app.ts",
         &format!("{app}app.use('/v2', r);"),
         "/v1/users",
@@ -208,6 +318,7 @@ fn detects_nested_express_mount_move() {
             ),
             ("routes/users.ts", router),
         ],
+        None,
         "routes/public.ts",
         &format!("{parent}router.use('/v2', r);"),
         "/api/v1/users",
@@ -215,7 +326,7 @@ fn detects_nested_express_mount_move() {
     assert_removed_mount(&report, "/api/v1/users");
 }
 
-/// Resolves an imported FastAPI router and combines nested registration and constructor prefixes.
+/// Verifies that FastAPI resolves a router imported from another module.
 #[test]
 fn detects_removed_fastapi_mounts_across_modules() {
     let router = "from fastapi import APIRouter\nrouter = APIRouter()\n@router.get('/users')\ndef get_users():\n    return []\n";
@@ -230,12 +341,18 @@ fn detects_removed_fastapi_mounts_across_modules() {
             ),
             ("routers/users.py", router),
         ],
+        None,
         "main.py",
         &format!("{main}app.include_router(router, prefix='/v2')"),
         "/v1/users",
     );
     assert_removed_mount(&report, "/v1/users");
+}
 
+/// Verifies both paths from a nested FastAPI router mounted with multiple prefixes.
+#[test]
+fn detects_nested_fastapi_router_at_multiple_prefixes() {
+    let router = "from fastapi import APIRouter\nrouter = APIRouter(prefix='/internal')\n@router.get('/users')\ndef get_users():\n    return []\n";
     let app = "from fastapi import FastAPI\nfrom routes.public import outer\napp = FastAPI()\napp.include_router(outer, prefix='/api')\n";
     let parent = "from fastapi import APIRouter as Router\nfrom . import users as endpoints\nouter = Router(prefix='/public')\n";
     let report = analyze_mount_change(
@@ -245,21 +362,98 @@ fn detects_removed_fastapi_mounts_across_modules() {
             ("main.py", app),
             (
                 "routes/public.py",
-                &format!("{parent}outer.include_router(endpoints.router, prefix='/v1')"),
+                &format!(
+                    "{parent}outer.include_router(endpoints.router, prefix='/v1')\nouter.include_router(endpoints.router, prefix='/v2')"
+                ),
             ),
-            (
-                "routes/users.py",
-                &router.replace("APIRouter()", "APIRouter(prefix='/internal')"),
-            ),
+            ("routes/users.py", router),
         ],
+        Some(&["routes/users.py"]),
         "routes/public.py",
-        &format!("{parent}outer.include_router(endpoints.router, prefix='/v2')"),
-        "/api/public/v1/internal/users",
+        &format!("{parent}outer.include_router(endpoints.router, prefix='/v3')"),
+        "/api/public/v2/internal/users",
     );
-    assert_removed_mount(&report, "/api/public/v1/internal/users");
+    assert!(report.coverage.as_ref().unwrap().complete, "{report:?}");
+    let mut paths: Vec<_> = report
+        .findings
+        .iter()
+        .map(|finding| {
+            let ContractChange::EndpointRemoved { endpoint } = &finding.change else {
+                panic!("expected an endpoint removal, got {finding:?}");
+            };
+            endpoint.normalized_path.as_str()
+        })
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "/api/public/v1/internal/users",
+            "/api/public/v2/internal/users"
+        ]
+    );
 }
 
-/// Reports dynamic, missing and cyclic mounts at their source line without a false removal.
+/// Verifies cycle diagnostics for Express and FastAPI mounts outside the list.
+#[test]
+fn reports_cycles_in_unlisted_mount_modules() {
+    let express_app =
+        "import { outer } from './outer';\nconst app = express();\napp.use('/api', outer);";
+    let express_outer = "import { users } from './users';\nexport const outer = express.Router();\nouter.use('/v1', users);";
+    let express_users = "import { outer } from './outer';\nexport const users = express.Router();\nusers.get('/users', handler);";
+    let fastapi_app = "from fastapi import FastAPI\nfrom outer import outer\napp = FastAPI()\napp.include_router(outer, prefix='/api')";
+    let fastapi_outer = "from fastapi import APIRouter\nfrom users import users\nouter = APIRouter()\nouter.include_router(users, prefix='/v1')";
+    let fastapi_users = "from fastapi import APIRouter\nfrom outer import outer\nusers = APIRouter()\n@users.get('/users')\ndef get_users(): pass";
+    for (framework, files, head_users, edges) in [
+        (
+            "express",
+            [
+                ("app.ts", express_app),
+                ("outer.ts", express_outer),
+                ("users.ts", express_users),
+            ],
+            format!("{express_users}\nusers.use('/loop', outer);"),
+            [("outer.ts", 3), ("users.ts", 4)],
+        ),
+        (
+            "fastapi",
+            [
+                ("app.py", fastapi_app),
+                ("outer.py", fastapi_outer),
+                ("users.py", fastapi_users),
+            ],
+            format!("{fastapi_users}\nusers.include_router(outer, prefix='/loop')"),
+            [("outer.py", 4), ("users.py", 6)],
+        ),
+    ] {
+        let users = files[2].0;
+        let report = analyze_mount_change(
+            "unlisted-cycle",
+            framework,
+            &files,
+            Some(&[users]),
+            users,
+            &head_users,
+            "/api/v1/users",
+        );
+        assert!(report.findings.is_empty(), "{report:?}");
+        let coverage = report.coverage.as_ref().unwrap();
+        assert!(!coverage.complete);
+        assert_eq!(coverage.producer_base.failed, 0);
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| {
+                diagnostic.stage == ExtractionStage::ProducerHead
+                    && diagnostic.code == ExtractionFailure::RouteDeclarationUnresolved
+                    && edges.iter().any(|(file, line)| {
+                        diagnostic.file == *file && diagnostic.line == Some(*line)
+                    })
+            }),
+            "{framework}: {report:?}"
+        );
+    }
+}
+
+/// Verifies that dynamic, missing, and cyclic mounts report their source lines.
 #[test]
 fn reports_unknown_mounts_as_incomplete() {
     for (case, framework, file, base, head) in [
@@ -299,23 +493,26 @@ fn reports_unknown_mounts_as_incomplete() {
             "from fastapi import FastAPI\nfrom missing import r\napp = FastAPI()\napp.include_router(r, prefix='/v1')",
         ),
     ] {
-        let report =
-            analyze_mount_change(case, framework, &[(file, base)], file, head, "/v1/users");
+        let report = analyze_mount_change(
+            case,
+            framework,
+            &[(file, base)],
+            None,
+            file,
+            head,
+            "/v1/users",
+        );
         assert!(report.findings.is_empty(), "{report:?}");
         let coverage = report.coverage.as_ref().unwrap();
         assert!(!coverage.complete, "{report:?}");
         assert_eq!(coverage.producer_head.failed, 1);
-        assert_eq!(report.diagnostics.len(), 1, "{report:?}");
-        let diagnostic = &report.diagnostics[0];
-        assert_eq!(
-            diagnostic.code,
-            ExtractionFailure::RouteDeclarationUnresolved
-        );
-        assert_eq!(diagnostic.stage, ExtractionStage::ProducerHead);
-        assert_eq!(diagnostic.file, file);
-        assert_eq!(
-            diagnostic.line,
-            Some(if framework == "express" { 2 } else { 4 })
+        assert!(
+            report.diagnostics.iter().any(|diagnostic| diagnostic.stage
+                == ExtractionStage::ProducerHead
+                && diagnostic.code == ExtractionFailure::RouteDeclarationUnresolved
+                && diagnostic.file == file
+                && diagnostic.line == Some(if framework == "express" { 2 } else { 4 })),
+            "{report:?}"
         );
     }
 }

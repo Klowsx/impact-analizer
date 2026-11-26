@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
@@ -988,35 +988,38 @@ fn extract_producer_routes(
     route_cfg: &RouteSourceConfig,
 ) -> Result<(Vec<ExtractedRoute>, FileExtraction)> {
     let all_files = git.list_files(rev)?;
-    let candidate_files: Vec<String> = if !route_cfg.files.is_empty() {
-        let present: HashSet<_> = all_files.iter().map(String::as_str).collect();
-        let mut files: Vec<_> = route_cfg
-            .files
-            .iter()
-            .map(|p| {
-                p.to_string_lossy()
-                    .replace('\\', "/")
-                    .trim_start_matches("./")
-                    .to_owned()
-            })
-            .filter(|file| present.contains(file.as_str()))
-            .collect();
-        files.sort_unstable();
-        files.dedup();
-        files
-    } else {
-        all_files
-            .iter()
-            .filter(|file| match route_cfg.framework {
+    let selected: BTreeSet<_> = route_cfg
+        .files
+        .iter()
+        .map(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_owned()
+        })
+        .collect();
+    // Look for mounts and imports outside the configured files in the same revision.
+    let candidate_files: Vec<_> = all_files
+        .iter()
+        .filter(|file| {
+            if selected.contains(file.as_str()) {
+                return true;
+            }
+            match route_cfg.framework {
                 RouteFramework::Laravel => {
-                    matches!(file.as_str(), "routes/api.php" | "routes/web.php")
+                    selected.is_empty()
+                        && matches!(file.as_str(), "routes/api.php" | "routes/web.php")
                 }
-                RouteFramework::Express => is_analyzable_ts_or_js(file),
-                RouteFramework::FastApi | RouteFramework::Flask => is_analyzable_python(file),
-            })
-            .cloned()
-            .collect()
-    };
+                RouteFramework::Express => {
+                    is_analyzable_ts_or_js(file)
+                        && (selected.is_empty() || !file.to_ascii_lowercase().ends_with(".vue"))
+                }
+                RouteFramework::FastApi => is_analyzable_python(file),
+                RouteFramework::Flask => selected.is_empty() && is_analyzable_python(file),
+            }
+        })
+        .cloned()
+        .collect();
 
     let batch_contents = git.read_files_batch(rev, &candidate_files)?;
     let mut extraction = FileExtraction::from_reads(&candidate_files, &batch_contents);
@@ -1030,14 +1033,21 @@ fn extract_producer_routes(
                 .collect::<Vec<_>>();
             let configs = git.read_files_batch(rev, &config_files)?;
             let resolver = ModuleResolver::from_git_snapshot(&all_files, &configs);
-            let (snapshot, errors) =
-                extract_express_snapshot(service_name, &batch_contents, &resolver, prefix);
+            let (snapshot, errors) = extract_express_snapshot(
+                service_name,
+                &batch_contents,
+                &resolver,
+                prefix,
+                &selected,
+            );
             for file in errors.keys() {
                 extraction.record_parse_failure(file);
             }
             snapshot
         }
-        RouteFramework::FastApi => extract_fastapi_snapshot(service_name, &batch_contents, prefix),
+        RouteFramework::FastApi => {
+            extract_fastapi_snapshot(service_name, &batch_contents, prefix, &selected)
+        }
         RouteFramework::Laravel => {
             let mut routes = Vec::new();
             for (file, raw) in batch_contents {

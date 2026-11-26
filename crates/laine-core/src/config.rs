@@ -158,7 +158,10 @@ pub enum RouteFramework {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteSourceConfig {
     pub framework: RouteFramework,
-    /// Optional explicit list of route files relative to the service repository root.
+    /// Optional list of files that contribute route operations, relative to the service root.
+    /// Express and FastAPI also scan other source files in the revision for router mounts.
+    /// A listed router without a mount chain or a listed mount exposing an unlisted operation
+    /// makes route extraction incomplete.
     #[serde(default)]
     pub files: Vec<PathBuf>,
     /// Optional mount prefix prepended to extracted routes (e.g. `"/api"`).

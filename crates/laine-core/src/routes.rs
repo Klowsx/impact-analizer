@@ -91,22 +91,49 @@ impl RouteMountGraph {
             .insert(line);
     }
 
-    /// Expands operations at all reachable prefixes and reports recursive mounts.
+    /// Expands operations at reachable prefixes and reports unresolved or out-of-scope mounts.
     pub fn resolve(
         mut self,
         service: &str,
         prefix: Option<&str>,
         normalize: fn(&[&str], &str) -> String,
+        route_files: &BTreeSet<String>,
     ) -> RouteExtraction {
+        let in_scope = |file: &str| route_files.is_empty() || route_files.contains(file);
+        let allow_standalone = route_files.is_empty() && self.applications.is_empty();
+        let mut unresolved_mounts = std::mem::take(&mut self.unresolved_mounts);
         let mut memo = BTreeMap::new();
         let mut active = BTreeSet::new();
-        let mut cycles = BTreeMap::new();
         for target in self.parents.keys() {
-            self.prefixes(target, &mut memo, &mut active, &mut cycles);
+            self.prefixes(
+                target,
+                allow_standalone,
+                &mut memo,
+                &mut active,
+                &mut unresolved_mounts,
+            );
         }
         let mut routes = Vec::new();
+        let mut excluded_targets = Vec::new();
         for (target, operation) in &self.operations {
-            for chain in self.prefixes(target, &mut memo, &mut active, &mut cycles) {
+            if !in_scope(&operation.file) {
+                excluded_targets.push(target);
+                continue;
+            }
+            let chains = self.prefixes(
+                target,
+                allow_standalone,
+                &mut memo,
+                &mut active,
+                &mut unresolved_mounts,
+            );
+            if chains.is_empty() {
+                unresolved_mounts
+                    .entry(operation.file.clone())
+                    .or_default()
+                    .insert(operation.line);
+            }
+            for chain in chains {
                 let prefixes: Vec<_> = prefix.into_iter().chain(chain).collect();
                 routes.push(ExtractedRoute {
                     endpoint: EndpointId {
@@ -120,15 +147,25 @@ impl RouteMountGraph {
                 });
             }
         }
-        for (file, lines) in cycles {
-            self.unresolved_mounts
-                .entry(file)
-                .or_default()
-                .extend(lines);
+        // Report listed mount sites that lead to excluded operations, including through nested routers.
+        let mut visited = BTreeSet::new();
+        while let Some(target) = excluded_targets.pop() {
+            if !visited.insert(target) {
+                continue;
+            }
+            for mount in self.parents.get(target).into_iter().flatten() {
+                if in_scope(&mount.file) {
+                    unresolved_mounts
+                        .entry(mount.file.clone())
+                        .or_default()
+                        .insert(mount.line);
+                }
+                excluded_targets.push(&mount.parent);
+            }
         }
         RouteExtraction {
             routes,
-            unresolved_mounts: self.unresolved_mounts,
+            unresolved_mounts,
         }
     }
 
@@ -136,9 +173,10 @@ impl RouteMountGraph {
     fn prefixes<'a>(
         &'a self,
         target: &'a RouteTarget,
+        allow_standalone: bool,
         memo: &mut BTreeMap<&'a RouteTarget, PrefixChains<'a>>,
         active: &mut BTreeSet<&'a RouteTarget>,
-        cycles: &mut BTreeMap<String, BTreeSet<usize>>,
+        unresolved_mounts: &mut BTreeMap<String, BTreeSet<usize>>,
     ) -> PrefixChains<'a> {
         if let Some(chains) = memo.get(target) {
             return chains.clone();
@@ -149,19 +187,25 @@ impl RouteMountGraph {
         if let Some(mounts) = self.parents.get(target) {
             for mount in mounts {
                 if active.contains(&mount.parent) {
-                    cycles
+                    unresolved_mounts
                         .entry(mount.file.clone())
                         .or_default()
                         .insert(mount.line);
                     continue;
                 }
-                for mut chain in self.prefixes(&mount.parent, memo, active, cycles) {
+                for mut chain in self.prefixes(
+                    &mount.parent,
+                    allow_standalone,
+                    memo,
+                    active,
+                    unresolved_mounts,
+                ) {
                     chain.push(mount.prefix.as_str());
                     chains.push(chain);
                 }
             }
-        } else if router.is_none() || self.applications.is_empty() {
-            // Router-only snapshots still expose their standalone routes.
+        } else if router.is_none() || allow_standalone {
+            // Allow standalone extraction when the caller did not configure an explicit file list.
             chains.push(Vec::new());
         }
         if let Some(prefix) = router {

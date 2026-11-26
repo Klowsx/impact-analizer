@@ -30,7 +30,7 @@ pub fn extract_express_routes(
     let sources = BTreeMap::from([(file_path.to_owned(), source.to_owned())]);
     let resolver = ModuleResolver::from_git_snapshot(&[file_path.to_owned()], &BTreeMap::new());
     let (mut extraction, mut parse_errors) =
-        extract_express_snapshot(service, &sources, &resolver, mount_prefix);
+        extract_express_snapshot(service, &sources, &resolver, mount_prefix, &BTreeSet::new());
     if let Some(errors) = parse_errors.remove(file_path) {
         return Err(errors);
     }
@@ -49,6 +49,7 @@ pub fn extract_express_snapshot(
     sources: &BTreeMap<String, String>,
     resolver: &ModuleResolver,
     mount_prefix: Option<&str>,
+    route_files: &BTreeSet<String>,
 ) -> (RouteExtraction, BTreeMap<String, Vec<String>>) {
     let mut modules = BTreeMap::new();
     let mut parse_errors = BTreeMap::new();
@@ -143,7 +144,7 @@ pub fn extract_express_snapshot(
         }
     }
     (
-        graph.resolve(service, mount_prefix, normalize_route_path),
+        graph.resolve(service, mount_prefix, normalize_route_path, route_files),
         parse_errors,
     )
 }

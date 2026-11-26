@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use laine_core::model::{EndpointId, HttpMethod};
 use laine_core::routes::{
@@ -27,6 +27,7 @@ pub fn extract_fastapi_routes(
         service,
         &BTreeMap::from([(file_path.to_owned(), source.to_owned())]),
         mount_prefix,
+        &BTreeSet::new(),
     )
     .routes
 }
@@ -36,6 +37,7 @@ pub fn extract_fastapi_snapshot(
     service: &str,
     sources: &BTreeMap<String, String>,
     mount_prefix: Option<&str>,
+    route_files: &BTreeSet<String>,
 ) -> RouteExtraction {
     let modules: BTreeMap<_, _> = sources
         .iter()
@@ -84,7 +86,7 @@ pub fn extract_fastapi_snapshot(
             }
         }
     }
-    graph.resolve(service, mount_prefix, normalize_fastapi_path)
+    graph.resolve(service, mount_prefix, normalize_fastapi_path, route_files)
 }
 
 /// Extrae las rutas HTTP de Flask de un módulo Python.

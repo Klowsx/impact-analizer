@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
@@ -22,11 +22,11 @@ use laine_core::request::HttpRequestEvidence;
 use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
 use laine_core::workspace::{WorkspaceRegistry, normalize_absolute_path};
 use laine_py::{
-    PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
+    PyExtractContext, extract_fastapi_snapshot, extract_flask_routes, extract_python_file,
 };
 use laine_ts::{
     ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow_with_limits,
-    extract_express_routes, extract_file_with_context, extract_type_definitions,
+    extract_express_snapshot, extract_file_with_context, extract_type_definitions,
     extract_zod_schemas, resolve_type_fields,
 };
 use rayon::prelude::*;
@@ -986,56 +986,78 @@ fn apply_cached_consumer_repo(
     }
 }
 
-// Extrae las rutas y conserva los fallos de lectura o parseo de esa revisión.
+// Extracts routes and keeps unresolved mounts tied to the analyzed revision.
 fn extract_producer_routes(
     git: &GitRepo,
     service_name: &str,
     rev: &str,
     route_cfg: &RouteSourceConfig,
 ) -> Result<(Vec<ExtractedRoute>, FileExtraction)> {
-    let candidate_files: Vec<String> = if !route_cfg.files.is_empty() {
-        let present: HashSet<_> = git.list_files(rev)?.into_iter().collect();
-        let mut files: Vec<_> = route_cfg
-            .files
-            .iter()
-            .map(|p| {
-                p.to_string_lossy()
-                    .replace('\\', "/")
-                    .trim_start_matches("./")
-                    .to_owned()
-            })
-            .filter(|file| present.contains(file))
-            .collect();
-        files.sort_unstable();
-        files.dedup();
-        files
-    } else {
-        let all_files = git.list_files(rev)?;
-        match route_cfg.framework {
-            RouteFramework::Laravel => all_files
-                .into_iter()
-                .filter(|f| f == "routes/api.php" || f == "routes/web.php")
-                .collect(),
-            RouteFramework::Express => all_files
-                .into_iter()
-                .filter(|f| is_analyzable_ts_or_js(f))
-                .collect(),
-            RouteFramework::FastApi | RouteFramework::Flask => all_files
-                .into_iter()
-                .filter(|f| is_analyzable_python(f))
-                .collect(),
-        }
-    };
+    let all_files = git.list_files(rev)?;
+    let selected: BTreeSet<_> = route_cfg
+        .files
+        .iter()
+        .map(|path| {
+            path.to_string_lossy()
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_owned()
+        })
+        .collect();
+    // Look for mounts and imports outside the configured files in the same revision.
+    let candidate_files: Vec<_> = all_files
+        .iter()
+        .filter(|file| {
+            if selected.contains(file.as_str()) {
+                return true;
+            }
+            match route_cfg.framework {
+                RouteFramework::Laravel => {
+                    selected.is_empty()
+                        && matches!(file.as_str(), "routes/api.php" | "routes/web.php")
+                }
+                RouteFramework::Express => {
+                    is_analyzable_ts_or_js(file)
+                        && (selected.is_empty() || !file.to_ascii_lowercase().ends_with(".vue"))
+                }
+                RouteFramework::FastApi => is_analyzable_python(file),
+                RouteFramework::Flask => selected.is_empty() && is_analyzable_python(file),
+            }
+        })
+        .cloned()
+        .collect();
 
-    let mut routes = Vec::new();
     let batch_contents = git.read_files_batch(rev, &candidate_files)?;
     let mut extraction = FileExtraction::from_reads(&candidate_files, &batch_contents);
-
-    for (file, raw) in batch_contents {
-        match route_cfg.framework {
-            RouteFramework::Laravel => {
-                let (found, unresolved) =
-                    analyze_laravel_routes(service_name, &file, &raw, route_cfg.prefix.as_deref());
+    let prefix = route_cfg.prefix.as_deref();
+    let snapshot = match route_cfg.framework {
+        RouteFramework::Express => {
+            let config_files = all_files
+                .iter()
+                .filter(|file| is_tsconfig_file(file))
+                .cloned()
+                .collect::<Vec<_>>();
+            let configs = git.read_files_batch(rev, &config_files)?;
+            let resolver = ModuleResolver::from_git_snapshot(&all_files, &configs);
+            let (snapshot, errors) = extract_express_snapshot(
+                service_name,
+                &batch_contents,
+                &resolver,
+                prefix,
+                &selected,
+            );
+            for file in errors.keys() {
+                extraction.record_parse_failure(file);
+            }
+            snapshot
+        }
+        RouteFramework::FastApi => {
+            extract_fastapi_snapshot(service_name, &batch_contents, prefix, &selected)
+        }
+        RouteFramework::Laravel => {
+            let mut routes = Vec::new();
+            for (file, raw) in batch_contents {
+                let (found, unresolved) = analyze_laravel_routes(service_name, &file, &raw, prefix);
                 routes.extend(found);
                 if !unresolved.is_empty() {
                     extraction
@@ -1043,33 +1065,24 @@ fn extract_producer_routes(
                     extraction.failure_lines.insert(file, unresolved);
                 }
             }
-            RouteFramework::Express => {
-                match extract_express_routes(service_name, &file, &raw, route_cfg.prefix.as_deref())
-                {
-                    Ok(extracted) => routes.extend(extracted),
-                    Err(_) => extraction.record_parse_failure(&file),
-                }
-            }
-            RouteFramework::FastApi => {
-                routes.extend(extract_fastapi_routes(
-                    service_name,
-                    &file,
-                    &raw,
-                    route_cfg.prefix.as_deref(),
-                ));
-            }
-            RouteFramework::Flask => {
-                routes.extend(extract_flask_routes(
-                    service_name,
-                    &file,
-                    &raw,
-                    route_cfg.prefix.as_deref(),
-                ));
-            }
+            return Ok((routes, extraction));
         }
+        RouteFramework::Flask => {
+            let routes = batch_contents
+                .into_iter()
+                .flat_map(|(file, raw)| extract_flask_routes(service_name, &file, &raw, prefix))
+                .collect();
+            return Ok((routes, extraction));
+        }
+    };
+    for (file, lines) in snapshot.unresolved_mounts {
+        extraction.record_incomplete(&file, ExtractionFailure::RouteDeclarationUnresolved);
+        extraction
+            .failure_lines
+            .insert(file, lines.into_iter().collect());
     }
 
-    Ok((routes, extraction))
+    Ok((snapshot.routes, extraction))
 }
 
 // Conserva archivos ilegibles como errores de lectura y sigue renombres detectados por Git.

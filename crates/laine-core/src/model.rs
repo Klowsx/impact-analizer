@@ -238,6 +238,7 @@ pub struct AnalysisCoverage {
 pub enum ExtractionFailure {
     FileReadFailed,
     FileParseFailed,
+    DataflowLimitReached,
 }
 
 impl ExtractionFailure {
@@ -246,6 +247,7 @@ impl ExtractionFailure {
         match self {
             Self::FileReadFailed => "File could not be read",
             Self::FileParseFailed => "File could not be parsed",
+            Self::DataflowLimitReached => "Cross-file analysis reached the propagation limit",
         }
     }
 
@@ -254,6 +256,7 @@ impl ExtractionFailure {
         match self {
             Self::FileReadFailed => "check_input_paths",
             Self::FileParseFailed => "repair_source_syntax",
+            Self::DataflowLimitReached => "check_remaining_dependency_hops",
         }
     }
 }

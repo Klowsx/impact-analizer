@@ -47,6 +47,12 @@ pub struct CrossFileFieldRead {
     pub trace: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossFileAnalysis {
+    pub field_reads: Vec<CrossFileFieldRead>,
+    pub limited_files: BTreeSet<String>,
+}
+
 /// Runs a 3-pass summary-based interprocedural dataflow analysis across a set of JS/TS/JSX/TSX/Vue files:
 ///
 /// 1. **Pass 1:** Extracts per-file `ModuleSummary` (imports, barrel re-exports, exported endpoint-returning
@@ -60,6 +66,15 @@ pub fn analyze_cross_file_dataflow(
     ctx: ExtractContext<'_>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Vec<CrossFileFieldRead> {
+    analyze_cross_file_dataflow_with_limits(files, ctx, resolve_import).field_reads
+}
+
+// Propaga la evidencia y señala los archivos donde quedó una transición fuera del límite.
+pub fn analyze_cross_file_dataflow_with_limits(
+    files: &[(String, String)],
+    ctx: ExtractContext<'_>,
+    resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+) -> CrossFileAnalysis {
     // Canonical deterministic ordering regardless of caller input order.
     let mut file_map: BTreeMap<&str, &str> = BTreeMap::new();
     for (path, source) in files {
@@ -93,7 +108,10 @@ pub fn analyze_cross_file_dataflow(
         );
     }
 
-    dedup_and_sort_reads(raw_reads)
+    CrossFileAnalysis {
+        field_reads: dedup_and_sort_reads(raw_reads),
+        limited_files: propagated.limited_files,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +231,7 @@ struct PropagatedSummaries {
     resolved_exports: EndpointMap,
     resolved_internal: EndpointMap,
     resolved_param_reads: ParamReadMap,
+    limited_files: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -300,11 +319,7 @@ fn extract_parse_blocks(file_path: &str, source: &str) -> Vec<ParsedBlock> {
             .into_iter()
             .map(|(block, is_setup)| ParsedBlock {
                 code: block.code,
-                source_type: if block.is_ts {
-                    SourceType::ts().with_module(true)
-                } else {
-                    SourceType::mjs()
-                },
+                source_type: block.lang.source_type(),
                 is_vue_setup: is_setup,
             })
             .collect();
@@ -2834,6 +2849,7 @@ impl<'a> Visit<'a> for ParamReadScanner<'_> {
 // Pass 2: Bounded Fixed-Point Propagation (Max 6 Hops, Cycle-Safe)
 // ---------------------------------------------------------------------------
 
+// Propaga hasta seis saltos y reserva una pasada de verificación para detectar trabajo pendiente.
 fn propagate_summaries(
     summaries: &BTreeMap<String, ModuleSummary>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
@@ -2914,9 +2930,16 @@ fn propagate_summaries(
         }
     }
 
-    // Fixed-point loop bounded at MAX_PROPAGATION_HOPS (6).
-    for _hop in 0..MAX_PROPAGATION_HOPS {
-        let mut changed = false;
+    let mut limited_files = BTreeSet::new();
+    for hop in 0..=MAX_PROPAGATION_HOPS {
+        let verification = (hop == MAX_PROPAGATION_HOPS).then(|| {
+            (
+                resolved_exports.clone(),
+                resolved_internal.clone(),
+                resolved_param_reads.clone(),
+            )
+        });
+        let mut changed_files = BTreeSet::new();
 
         // 2a. Propagate barrel re-exports (`export * from`, `export { ... } from`, `export * as ns from`).
         let export_snapshot = resolved_exports.clone();
@@ -2937,6 +2960,7 @@ fn propagate_summaries(
                     }
                     for ep in endpoints {
                         if ep.hops >= MAX_PROPAGATION_HOPS {
+                            limited_files.insert(file.clone());
                             continue;
                         }
                         let mut next = ep.clone();
@@ -2950,7 +2974,7 @@ fn propagate_summaries(
                             (file.clone(), src_key.clone()),
                             next,
                         ) {
-                            changed = true;
+                            changed_files.insert(file.clone());
                         }
                     }
                 }
@@ -2963,7 +2987,7 @@ fn propagate_summaries(
                         .or_default();
                     for r in reads {
                         if insert_unique_param_read(entry, r.clone()) {
-                            changed = true;
+                            changed_files.insert(file.clone());
                         }
                     }
                 }
@@ -2999,6 +3023,7 @@ fn propagate_summaries(
                             };
                             for ep in endpoints {
                                 if ep.hops >= MAX_PROPAGATION_HOPS {
+                                    limited_files.insert(file.clone());
                                     continue;
                                 }
                                 let mut next = ep.clone();
@@ -3012,7 +3037,7 @@ fn propagate_summaries(
                                     (file.clone(), dest_key.clone()),
                                     next,
                                 ) {
-                                    changed = true;
+                                    changed_files.insert(file.clone());
                                 }
                             }
                         }
@@ -3036,7 +3061,7 @@ fn propagate_summaries(
                                 .or_default();
                             for r in reads {
                                 if insert_unique_param_read(entry, r.clone()) {
-                                    changed = true;
+                                    changed_files.insert(file.clone());
                                 }
                             }
                         }
@@ -3055,6 +3080,7 @@ fn propagate_summaries(
                             let dest_key = format!("{exported_name}.{src_key}");
                             for ep in endpoints {
                                 if ep.hops >= MAX_PROPAGATION_HOPS {
+                                    limited_files.insert(file.clone());
                                     continue;
                                 }
                                 let mut next = ep.clone();
@@ -3068,7 +3094,7 @@ fn propagate_summaries(
                                     (file.clone(), dest_key.clone()),
                                     next,
                                 ) {
-                                    changed = true;
+                                    changed_files.insert(file.clone());
                                 }
                             }
                         }
@@ -3082,7 +3108,7 @@ fn propagate_summaries(
                                 .or_default();
                             for r in reads {
                                 if insert_unique_param_read(entry, r.clone()) {
-                                    changed = true;
+                                    changed_files.insert(file.clone());
                                 }
                             }
                         }
@@ -3108,6 +3134,7 @@ fn propagate_summaries(
                         &exports_snap_2,
                         &internal_snap_2,
                         resolve_import,
+                        &mut limited_files,
                     );
                     for ep in propagated_eps {
                         if insert_or_improve_endpoint(
@@ -3115,7 +3142,7 @@ fn propagate_summaries(
                             (file.clone(), local_key.clone()),
                             ep,
                         ) {
-                            changed = true;
+                            changed_files.insert(file.clone());
                         }
                     }
                 }
@@ -3133,6 +3160,7 @@ fn propagate_summaries(
                         &exports_snap_2,
                         &internal_snap_2,
                         resolve_import,
+                        &mut limited_files,
                     );
                     for ep in propagated_eps {
                         if insert_or_improve_endpoint(
@@ -3140,14 +3168,20 @@ fn propagate_summaries(
                             (file.clone(), export_key.clone()),
                             ep,
                         ) {
-                            changed = true;
+                            changed_files.insert(file.clone());
                         }
                     }
                 }
             }
         }
 
-        if !changed {
+        if let Some((exports, internal, params)) = verification {
+            limited_files.extend(changed_files);
+            (resolved_exports, resolved_internal, resolved_param_reads) =
+                (exports, internal, params);
+            break;
+        }
+        if changed_files.is_empty() {
             break;
         }
     }
@@ -3156,6 +3190,7 @@ fn propagate_summaries(
         resolved_exports,
         resolved_internal,
         resolved_param_reads,
+        limited_files,
     }
 }
 
@@ -3188,6 +3223,7 @@ fn make_direct_resolved_endpoint(
     }
 }
 
+// Resuelve retornos delegados y registra cuando el siguiente salto excede el límite.
 fn resolve_delegation_summary(
     file: &str,
     summary: &ModuleSummary,
@@ -3195,6 +3231,7 @@ fn resolve_delegation_summary(
     resolved_exports: &EndpointMap,
     resolved_internal: &EndpointMap,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+    limited_files: &mut BTreeSet<String>,
 ) -> Vec<ResolvedExportEndpoint> {
     let ExportReturnSummary::Delegated {
         target,
@@ -3247,10 +3284,6 @@ fn resolve_delegation_summary(
 
     let mut out = Vec::new();
     for callee_ep in candidates {
-        if callee_ep.hops >= MAX_PROPAGATION_HOPS {
-            continue;
-        }
-
         let Some((new_projection, new_prefix)) = compose_delegated_projection(
             &callee_ep.projection,
             &callee_ep.field_prefix,
@@ -3262,6 +3295,11 @@ fn resolve_delegation_summary(
         ) else {
             continue;
         };
+
+        if callee_ep.hops >= MAX_PROPAGATION_HOPS {
+            limited_files.insert(file.to_owned());
+            continue;
+        }
 
         let new_confidence = if *via_framework_hook {
             callee_ep.confidence.min(Confidence::Likely)
@@ -5581,6 +5619,54 @@ mod tests {
     use laine_core::config::{CustomClientConfig, ServiceConfig};
 
     use super::*;
+
+    // Distingue una cadena que concluye en el límite de otra que necesita un salto más.
+    #[test]
+    fn reports_summaries_that_exceed_the_hop_limit() {
+        let services = vec![laine_core::config::ServiceConfig {
+            name: "api".into(),
+            path: "api".into(),
+            openapi: None,
+            routes: None,
+            base_urls: vec!["http://api".into()],
+        }];
+        let env = BTreeMap::new();
+        let ctx = ExtractContext {
+            services: &services,
+            clients: &[],
+            env: &env,
+        };
+        let mut files = vec![("step0.ts".into(), "export async function load() { const res = await fetch('http://api/users'); return res.json(); }".into())];
+        let resolver = |_: &str, spec: &str| Some(format!("{}.ts", spec.trim_start_matches("./")));
+        for hop in 1..=MAX_PROPAGATION_HOPS {
+            files.push((
+                format!("step{hop}.ts"),
+                format!("export {{ load }} from './step{}';", hop - 1),
+            ));
+        }
+        files.push(("read.ts".into(), format!("import {{ load }} from './step{MAX_PROPAGATION_HOPS}'; const user = await load(); console.log(user.name);")));
+        let bounded = analyze_cross_file_dataflow_with_limits(&files, ctx, &resolver);
+        assert!(
+            bounded.limited_files.is_empty(),
+            "{:?}",
+            bounded.limited_files
+        );
+        assert!(
+            bounded
+                .field_reads
+                .iter()
+                .any(|read| read.field_path == "name")
+        );
+
+        let excessive = format!("step{}.ts", MAX_PROPAGATION_HOPS + 1);
+        files.push((
+            excessive.clone(),
+            format!("export {{ load }} from './step{MAX_PROPAGATION_HOPS}';"),
+        ));
+        let result = analyze_cross_file_dataflow_with_limits(&files, ctx, &resolver);
+        assert_eq!(result.limited_files, BTreeSet::from([excessive]));
+        assert_eq!(result.field_reads, bounded.field_reads);
+    }
 
     fn user_services() -> Vec<ServiceConfig> {
         vec![ServiceConfig {

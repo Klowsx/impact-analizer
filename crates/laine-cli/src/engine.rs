@@ -22,7 +22,7 @@ use laine_py::{
     PyExtractContext, extract_fastapi_routes, extract_flask_routes, extract_python_file,
 };
 use laine_ts::{
-    ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow,
+    ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow_with_limits,
     extract_express_routes, extract_file_with_context, extract_type_definitions,
     extract_zod_schemas, resolve_type_fields,
 };
@@ -163,11 +163,12 @@ impl FileExtraction {
 
     // Descuenta un archivo que se pudo leer, pero cuya extracción falló.
     fn record_parse_failure(&mut self, file: &str) {
-        if self
-            .failures
-            .insert(file.to_owned(), ExtractionFailure::FileParseFailed)
-            .is_none()
-        {
+        self.record_incomplete(file, ExtractionFailure::FileParseFailed);
+    }
+
+    // Descuenta la cobertura de un archivo cuando se perdió parte de su evidencia.
+    fn record_incomplete(&mut self, file: &str, code: ExtractionFailure) {
+        if self.failures.insert(file.to_owned(), code).is_none() {
             self.coverage.analyzed -= 1;
             self.coverage.failed += 1;
         }
@@ -811,7 +812,7 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
         .collect();
     if !ts_files.is_empty() {
         let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
-        let cross_reads = analyze_cross_file_dataflow(
+        let cross = analyze_cross_file_dataflow_with_limits(
             &ts_files,
             ExtractContext {
                 services: &config.services,
@@ -820,7 +821,10 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
             },
             &|importer, specifier| resolver.resolve_import(importer, specifier),
         );
-        for item in cross_reads {
+        for file in cross.limited_files {
+            extraction.record_incomplete(&file, ExtractionFailure::DataflowLimitReached);
+        }
+        for item in cross.field_reads {
             field_reads.push(CachedFieldReadEdge {
                 file: item.read_file,
                 target_service: item.service,

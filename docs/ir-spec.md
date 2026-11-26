@@ -84,7 +84,7 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 
 `policy` contains `should_fail`, `exit_code`, `blocking_findings`, `blocking_unresolved_calls`, and `reason`. `exit_code` is `0` when policy passes or `2` when it blocks, matching the CLI process. A report can include findings below the configured threshold or be blocked by unresolved calls with zero findings.
 
-Coverage counts discovered, read, analyzed, and failed source files. When a known read or parse error leaves coverage incomplete, diagnostics include `repo`, `revision`, `file`, `stage`, `code`, and `remediation`. Route removals require complete route extraction on both sides. OpenAPI changes can still be reported if both OpenAPI snapshots were analyzed. The policy decision applies to the evidence collected.
+Coverage counts discovered, read, analyzed, and failed source files. When a known read or parse error leaves coverage incomplete, diagnostics include `repo`, `revision`, `file`, `stage`, `code`, and `remediation`. Route removals require complete route extraction on both sides. OpenAPI changes can still be reported if both OpenAPI snapshots were analyzed. The policy decision applies to the evidence collected. `dataflow_limit_reached` identifies files with cross-file TypeScript summaries that would require additional propagation rounds.
 
 `workspace.id` is a stable identifier for the resolved configuration path on the local machine. Evidence paths are relative to their repositories. Add `--include-repo-roots` to a JSON analysis to map those repository names to absolute local checkouts.
 

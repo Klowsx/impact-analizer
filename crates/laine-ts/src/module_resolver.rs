@@ -1,6 +1,11 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashSet};
 
+use oxc_ast::ast::{
+    BindingPattern, Declaration, ExportDefaultDeclarationKind, Expression,
+    ImportDeclarationSpecifier, ImportOrExportKind, ModuleExportName, Program, Statement,
+};
+
 const PROBE_EXTENSIONS: &[&str] = &[
     ".ts", ".tsx", ".vue", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
 ];
@@ -17,7 +22,235 @@ const BARREL_INDEX_FILES: &[&str] = &[
 const FALLBACK_ALIAS_ROOTS: &[&str] = &["app", "src", ""];
 
 const MAX_EXTENDS_DEPTH: usize = 32;
+const MAX_EXPORT_DEPTH: usize = 32;
 const MAX_JSON_DEPTH: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ImportedSymbol {
+    pub specifier: String,
+    pub name: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ModuleSymbols {
+    pub imports: BTreeMap<String, ImportedSymbol>,
+    exports: BTreeMap<String, String>,
+    reexports: BTreeMap<String, ImportedSymbol>,
+    stars: Vec<String>,
+}
+
+impl ModuleSymbols {
+    /// Records top-level imports and exports, including aliases and barrel forwards.
+    pub(crate) fn collect(&mut self, program: &Program<'_>, include_type_only: bool) {
+        for stmt in &program.body {
+            match stmt {
+                Statement::ImportDeclaration(decl)
+                    if include_type_only || decl.import_kind != ImportOrExportKind::Type =>
+                {
+                    let Some(source) = decl.source.value.as_str() else {
+                        continue;
+                    };
+                    for spec in decl.specifiers.iter().flatten() {
+                        let (local, name) = match spec {
+                            ImportDeclarationSpecifier::ImportSpecifier(named)
+                                if include_type_only
+                                    || named.import_kind != ImportOrExportKind::Type =>
+                            {
+                                (&named.local, export_name(&named.imported))
+                            }
+                            ImportDeclarationSpecifier::ImportDefaultSpecifier(default) => {
+                                (&default.local, Some("default"))
+                            }
+                            _ => continue,
+                        };
+                        if let Some(name) = name {
+                            self.imports.insert(
+                                local.name.to_string(),
+                                ImportedSymbol {
+                                    specifier: source.into(),
+                                    name: name.into(),
+                                },
+                            );
+                        }
+                    }
+                }
+                Statement::ExportFromDeclaration(decl)
+                    if include_type_only || decl.export_kind != ImportOrExportKind::Type =>
+                {
+                    for spec in &decl.specifiers {
+                        if !include_type_only && spec.export_kind == ImportOrExportKind::Type {
+                            continue;
+                        }
+                        let (Some(local), Some(exported)) =
+                            (export_name(&spec.local), export_name(&spec.exported))
+                        else {
+                            continue;
+                        };
+                        if let Some(specifier) = decl.source.value.as_str() {
+                            self.reexports.insert(
+                                exported.into(),
+                                ImportedSymbol {
+                                    specifier: specifier.into(),
+                                    name: local.into(),
+                                },
+                            );
+                        }
+                    }
+                }
+                Statement::ExportNamedDeclaration(decl)
+                    if include_type_only || decl.export_kind != ImportOrExportKind::Type =>
+                {
+                    for spec in &decl.specifiers {
+                        if (include_type_only || spec.export_kind != ImportOrExportKind::Type)
+                            && let (Some(local), Some(exported)) =
+                                (export_name(&spec.local), export_name(&spec.exported))
+                        {
+                            self.exports.insert(exported.into(), local.into());
+                        }
+                    }
+                }
+                Statement::ExportAllDeclaration(decl)
+                    if include_type_only || decl.export_kind != ImportOrExportKind::Type =>
+                {
+                    if decl.exported.is_none()
+                        && let Some(source) = decl.source.value.as_str()
+                    {
+                        self.stars.push(source.into());
+                    } else if let Some(name) = decl.exported.as_ref().and_then(export_name) {
+                        self.exports.insert(name.into(), name.into());
+                    }
+                }
+                Statement::ExportDeclaration(decl) => match &decl.declaration {
+                    Declaration::VariableDeclaration(vars) => {
+                        for var in &vars.declarations {
+                            if let BindingPattern::BindingIdentifier(id) = &var.id {
+                                self.exports
+                                    .insert(id.name.to_string(), id.name.to_string());
+                            }
+                        }
+                    }
+                    Declaration::TSInterfaceDeclaration(item) if include_type_only => {
+                        self.exports
+                            .insert(item.id.name.to_string(), item.id.name.to_string());
+                    }
+                    Declaration::TSTypeAliasDeclaration(item) if include_type_only => {
+                        self.exports
+                            .insert(item.id.name.to_string(), item.id.name.to_string());
+                    }
+                    Declaration::FunctionDeclaration(item) => {
+                        if let Some(id) = &item.id {
+                            self.exports
+                                .insert(id.name.to_string(), id.name.to_string());
+                        }
+                    }
+                    Declaration::ClassDeclaration(item) => {
+                        if let Some(id) = &item.id {
+                            self.exports
+                                .insert(id.name.to_string(), id.name.to_string());
+                        }
+                    }
+                    _ => {}
+                },
+                Statement::ExportDefaultDeclaration(decl) => {
+                    let name = match &decl.declaration {
+                        ExportDefaultDeclarationKind::TSInterfaceDeclaration(item)
+                            if include_type_only =>
+                        {
+                            item.id.name.as_str()
+                        }
+                        other => {
+                            match other.as_expression().map(Expression::get_inner_expression) {
+                                Some(Expression::Identifier(id)) => id.name.as_str(),
+                                _ => "default",
+                            }
+                        }
+                    };
+                    self.exports.insert("default".into(), name.into());
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Returns the spelling used to import or export a module symbol.
+fn export_name<'a>(name: &'a ModuleExportName<'_>) -> Option<&'a str> {
+    match name {
+        ModuleExportName::IdentifierName(id) => Some(id.name.as_str()),
+        ModuleExportName::IdentifierReference(id) => Some(id.name.as_str()),
+        ModuleExportName::StringLiteral(value) => value.value.as_str(),
+    }
+}
+
+/// Resolves a named or default import to the actual declaring module and local symbol.
+pub(crate) fn resolve_imported_symbol(
+    file: &str,
+    import: &ImportedSymbol,
+    modules: &BTreeMap<String, ModuleSymbols>,
+    resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+) -> Option<(String, String)> {
+    let target = resolve_import(file, &import.specifier)?;
+    resolve_export(
+        &target,
+        &import.name,
+        modules,
+        resolve_import,
+        &mut HashSet::new(),
+    )
+    .ok()
+    .flatten()
+}
+
+/// Follows explicit exports and accepts star exports only when their origin is unique.
+fn resolve_export(
+    file: &str,
+    name: &str,
+    modules: &BTreeMap<String, ModuleSymbols>,
+    resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+    active: &mut HashSet<(String, String)>,
+) -> Result<Option<(String, String)>, ()> {
+    let Some(module) = modules.get(file) else {
+        return Ok(None);
+    };
+    let key = (file.to_owned(), name.to_owned());
+    if active.len() >= MAX_EXPORT_DEPTH {
+        return Err(());
+    }
+    if !active.insert(key.clone()) {
+        return Ok(None);
+    }
+    let follow = |import: &ImportedSymbol, active: &mut HashSet<_>| {
+        let Some(target) = resolve_import(file, &import.specifier) else {
+            return Ok(None);
+        };
+        resolve_export(&target, &import.name, modules, resolve_import, active)
+    };
+    let result = if let Some(import) = module.reexports.get(name) {
+        follow(import, active)
+    } else if let Some(local) = module.exports.get(name) {
+        match module.imports.get(local) {
+            Some(import) => follow(import, active),
+            None => Ok(Some((file.to_owned(), local.clone()))),
+        }
+    } else if name == "default" {
+        Ok(None)
+    } else {
+        module.stars.iter().try_fold(None, |found, specifier| {
+            if let Some(target) = resolve_import(file, specifier)
+                && let Some(origin) =
+                    resolve_export(&target, name, modules, resolve_import, active)?
+            {
+                if found.as_ref().is_some_and(|previous| previous != &origin) {
+                    return Err(());
+                }
+                return Ok(Some(origin));
+            }
+            Ok(found)
+        })
+    };
+    active.remove(&key);
+    result
+}
 
 /// Fast, deterministic, zero-disk-I/O TypeScript/JavaScript/Vue module resolver
 /// operating purely over tracked POSIX file paths and config files from a Git snapshot.

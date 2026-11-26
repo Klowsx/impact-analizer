@@ -9,8 +9,9 @@ use laine_core::request::{
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, AssignmentOperator, AssignmentTarget, BindingPattern,
-    CallExpression, ChainElement, Expression, Function, ObjectExpression, ObjectPropertyKind,
-    Program, PropertyKey, Statement, TSTypeAnnotation, TemplateLiteral, VariableDeclarator,
+    CallExpression, ChainElement, Expression, FormalParameters, Function, ObjectExpression,
+    ObjectPropertyKind, Program, PropertyKey, Statement, TSTypeAnnotation, TemplateLiteral,
+    VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -18,6 +19,7 @@ use oxc_semantic::SemanticBuilder;
 use oxc_span::{GetSpan, SourceType, Span};
 use serde::{Deserialize, Serialize};
 
+use crate::cross_file::FileAxiosImports;
 use crate::url::{is_absolute_http_url, normalize_relative_path};
 use crate::vue::{extract_vue_scripts_with_setup, extract_vue_template_expressions};
 
@@ -104,6 +106,16 @@ pub fn extract_file_with_context(
     source: &str,
     ctx: ExtractContext<'_>,
 ) -> Result<FileExtraction, Vec<String>> {
+    extract_file_with_imported_axios(file_path, source, ctx, None)
+}
+
+/// Extracts calls and response reads with the Axios bindings resolved for this module.
+pub fn extract_file_with_imported_axios(
+    file_path: &str,
+    source: &str,
+    ctx: ExtractContext<'_>,
+    axios_imports: Option<&FileAxiosImports>,
+) -> Result<FileExtraction, Vec<String>> {
     if file_path.to_ascii_lowercase().ends_with(".vue") {
         let blocks = extract_vue_scripts_with_setup(source);
         let mut merged = FileExtraction {
@@ -114,8 +126,13 @@ pub fn extract_file_with_context(
 
         for (block, is_setup) in blocks {
             let source_type = block.lang.source_type();
-            let (extracted, top_bindings) =
-                extract_source_block_with_bindings(file_path, &block.code, source_type, ctx)?;
+            let (extracted, top_bindings) = extract_source_block_with_bindings(
+                file_path,
+                &block.code,
+                source_type,
+                ctx,
+                axios_imports,
+            )?;
             let call_offset = merged.calls.len();
 
             for mut call in extracted.calls {
@@ -156,15 +173,18 @@ pub fn extract_file_with_context(
 
     let source_type =
         SourceType::from_path(Path::new(file_path)).unwrap_or_else(|_| SourceType::ts());
-    let (extracted, _) = extract_source_block_with_bindings(file_path, source, source_type, ctx)?;
+    let (extracted, _) =
+        extract_source_block_with_bindings(file_path, source, source_type, ctx, axios_imports)?;
     Ok(extracted)
 }
 
+/// Parses a script and makes its imported instances available to the call visitor.
 fn extract_source_block_with_bindings(
     file_path: &str,
     source: &str,
     source_type: SourceType,
     ctx: ExtractContext<'_>,
+    axios_imports: Option<&FileAxiosImports>,
 ) -> Result<(FileExtraction, HashMap<String, VarBinding>), Vec<String>> {
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
@@ -188,6 +208,11 @@ fn extract_source_block_with_bindings(
 
     let helper_reads = collect_local_helper_reads(&parsed.program);
     let mut extractor = FileExtractor::new(file_path, source, ctx, helper_reads);
+    if let Some(imports) = axios_imports {
+        for (name, base_url) in imports.bindings(&parsed.program) {
+            extractor.bind_var(name, VarBinding::HttpClientInstance { base_url });
+        }
+    }
     extractor.visit_program(&parsed.program);
     Ok(extractor.finish_with_top_bindings())
 }
@@ -299,7 +324,7 @@ enum VarBinding {
     },
     StringLiteral(String),
     HttpClientInstance {
-        base_url: String,
+        base_url: Option<String>,
     },
     FetchResponse {
         call_id: usize,
@@ -368,7 +393,7 @@ enum CallTarget {
     UseFetch(Option<HttpMethod>),
     Axios(HttpMethod),
     AxiosInstance {
-        base_url: String,
+        base_url: Option<String>,
         method: HttpMethod,
     },
     Custom {
@@ -769,6 +794,7 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
+    /// Evaluates the base URL of a locally constructed Axios instance.
     fn detect_axios_create(&self, call: &CallExpression<'_>) -> Option<VarBinding> {
         let Expression::StaticMemberExpression(member) = unwrap_expr(&call.callee) else {
             return None;
@@ -790,13 +816,15 @@ impl<'s> FileExtractor<'s> {
             if property_key_name(&kv.key).as_deref() == Some("baseURL")
                 && let UrlEval::Resolved(base_url) = self.eval_url_expr(&kv.value)
             {
-                return Some(VarBinding::HttpClientInstance { base_url });
+                return Some(VarBinding::HttpClientInstance {
+                    base_url: Some(base_url),
+                });
             }
         }
         None
     }
 
-    // Reconoce clientes HTTP y separa los métodos estáticos de las opciones dinámicas.
+    // Recognizes configured clients, built-in clients, and scoped Axios instances.
     fn classify_http_call(&self, call: &CallExpression<'_>) -> Option<CallTarget> {
         // 1. Check configured custom clients first (so `$fetch`, `getClient().fetch`, `apiClient.post` work).
         if let Some(callee_str) = format_callee_expr(unwrap_expr(&call.callee)) {
@@ -1062,7 +1090,7 @@ impl<'s> FileExtractor<'s> {
         RequestArgument::new(line, kind)
     }
 
-    // Extrae llamadas HTTP y conserva diagnósticos para métodos y destinos indeterminados.
+    // Records each call and retains unresolved diagnostics for dynamic destinations and methods.
     fn process_http_call(&mut self, call: &CallExpression<'_>) -> Option<(CallResultShape, usize)> {
         let target = self.classify_http_call(call)?;
         if !self.seen_call_spans.insert(call.span.start) {
@@ -1136,14 +1164,15 @@ impl<'s> FileExtractor<'s> {
                         resolve_http_service_url(&url_str, self.ctx.services)
                     }
                     CallTarget::AxiosInstance { base_url, .. } => {
-                        let full_url = if is_absolute_http_url(&url_str) {
-                            url_str
-                        } else {
+                        if is_absolute_http_url(&url_str) {
+                            resolve_http_service_url(&url_str, self.ctx.services)
+                        } else if let Some(base_url) = base_url {
                             let base = base_url.trim_end_matches('/');
                             let rel = url_str.trim_start_matches('/');
-                            format!("{base}/{rel}")
-                        };
-                        resolve_http_service_url(&full_url, self.ctx.services)
+                            resolve_http_service_url(&format!("{base}/{rel}"), self.ctx.services)
+                        } else {
+                            Err("Axios instance base URL cannot be resolved statically".into())
+                        }
                     }
                     CallTarget::Custom {
                         target_service,
@@ -1741,6 +1770,17 @@ impl<'s> FileExtractor<'s> {
 }
 
 impl<'a> Visit<'a> for FileExtractor<'_> {
+    /// Keeps function parameters from resolving to an imported instance with the same name.
+    fn visit_formal_parameters(&mut self, params: &FormalParameters<'a>) {
+        for param in &params.items {
+            self.register_unassigned_pattern(&param.pattern);
+        }
+        if let Some(rest) = &params.rest {
+            self.register_unassigned_pattern(&rest.rest.argument);
+        }
+        walk::walk_formal_parameters(self, params);
+    }
+
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
         self.push_scope();
         walk::walk_block_statement(self, it);

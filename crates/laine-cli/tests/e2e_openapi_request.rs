@@ -183,7 +183,7 @@ path = "./checkout-web"
     let _ = fs::remove_dir_all(&tmp);
 }
 
-// Check request arguments in TS, Python, and Vue, including query array serialization.
+// Check request arguments in TS, Python, and Vue, including imported Axios clients.
 #[test]
 fn checks_request_arguments_before_attributing_impact() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-arguments-{}", std::process::id()));
@@ -243,6 +243,20 @@ fetch('http://api/search?tags=a');
 fetch('http://api/search?tags=a&tags=b');
 axios.get('http://api/search', { params: { tags: ['a', 'b'] } });
 fetch('http://api/search');
+"#,
+    )
+    .unwrap();
+    fs::write(
+        consumer.join("axios-client.ts"),
+        "import axios from 'axios';\nexport const api = axios.create({ baseURL: 'http://api' });\n",
+    )
+    .unwrap();
+    fs::write(
+        consumer.join("axios-orders.ts"),
+        r#"import { api } from './axios-client';
+api.post('/orders', { tenant: 'example' }, { params: { limit: 2 }, headers: { 'X-Mode': 'fast' } });
+api.post('/orders', { tenant: 42 }, { params: { limit: 'all' }, headers: { 'X-MODE': 'slow' } });
+api.get('/search', { params: { tags: ['a', 'b'] } });
 "#,
     )
     .unwrap();
@@ -332,6 +346,7 @@ path = "./consumer"
             .collect::<Vec<_>>(),
         [
             ("Orders.vue", 10, Confidence::Confirmed),
+            ("axios-orders.ts", 3, Confidence::Confirmed),
             ("client.ts", 8, Confidence::Confirmed),
             ("transport.ts", 3, Confidence::Possible),
             ("worker.py", 5, Confidence::Possible)
@@ -350,13 +365,27 @@ path = "./consumer"
     let limit = report.findings.iter().find(|finding| matches!(
         &finding.change, ContractChange::RequiredParameterAdded { name, .. } if name == "limit"
     )).unwrap();
-    assert_eq!(limit.consumers.len(), 1);
-    assert_eq!(limit.consumers[0].evidence.file, "client.ts");
-    assert_eq!(limit.consumers[0].confidence, Confidence::Confirmed);
     assert_eq!(
-        limit.consumers[0].evidence.snippet,
-        r#"Incompatible HTTP query argument "limit""#
+        limit
+            .consumers
+            .iter()
+            .map(|consumer| (
+                consumer.evidence.file.as_str(),
+                consumer.evidence.line,
+                consumer.confidence
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("axios-orders.ts", 3, Confidence::Confirmed),
+            ("client.ts", 6, Confidence::Confirmed),
+        ]
     );
+    for consumer in &limit.consumers {
+        assert_eq!(
+            consumer.evidence.snippet,
+            r#"Incompatible HTTP query argument "limit""#
+        );
+    }
     let mode = report.findings.iter().find(|finding| matches!(
         &finding.change, ContractChange::RequiredParameterAdded { name, .. } if name == "X-Mode"
     )).unwrap();
@@ -381,6 +410,7 @@ path = "./consumer"
             ))
             .collect::<Vec<_>>(),
         [
+            ("axios-orders.ts", 4, Confidence::Possible),
             ("client.ts", 10, Confidence::Possible),
             ("client.ts", 11, Confidence::Possible),
             ("client.ts", 12, Confidence::Possible),

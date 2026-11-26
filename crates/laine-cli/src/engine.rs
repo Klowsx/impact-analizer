@@ -25,9 +25,9 @@ use laine_py::{
     PyExtractContext, extract_fastapi_snapshot, extract_flask_routes, extract_python_file,
 };
 use laine_ts::{
-    ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow_with_limits,
-    extract_express_snapshot, extract_file_with_context, extract_type_definitions,
-    extract_zod_schemas, resolve_type_fields,
+    ExtractContext, ModuleResolver, TypeContractDef, analyze_cross_file_dataflow_with_imports,
+    collect_imported_axios_clients, extract_express_snapshot, extract_file_with_imported_axios,
+    extract_type_definitions, extract_zod_schemas, resolve_type_fields,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -655,10 +655,24 @@ fn load_consumer_inputs(git: &GitRepo, rev: &str) -> Result<ConsumerInputs> {
     })
 }
 
-// Extrae hechos estructurados de los archivos del snapshot que ya se leyeron.
+// Extracts consumer facts from the files in a repository snapshot.
 fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> CachedConsumerRepo {
     let mut extraction = FileExtraction::from_reads(&inputs.candidates, &inputs.sources);
     let file_contents: Vec<(String, String)> = inputs.sources.into_iter().collect();
+    let mut ts_files: Vec<_> = file_contents
+        .iter()
+        .filter(|(file, _)| is_analyzable_ts_or_js(file))
+        .cloned()
+        .collect();
+    let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
+    let resolve_import =
+        |importer: &str, specifier: &str| resolver.resolve_import(importer, specifier);
+    let ts_context = ExtractContext {
+        services: &config.services,
+        clients: &config.clients,
+        env: &config.env,
+    };
+    let axios_imports = collect_imported_axios_clients(&ts_files, ts_context, &resolve_import);
 
     // Pass 1 (parallel): build repo-wide TypeScript interface/type & Zod schema registry for
     // generic calls (`fetch<ReserveResponse>`), return-type annotations (`: Promise<UserDTO>`),
@@ -757,14 +771,11 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
                 return Some((consumes, field_reads, unresolved));
             }
 
-            let Ok(extracted) = extract_file_with_context(
+            let Ok(extracted) = extract_file_with_imported_axios(
                 file_path,
                 source,
-                ExtractContext {
-                    services: &config.services,
-                    clients: &config.clients,
-                    env: &config.env,
-                },
+                ts_context,
+                axios_imports.get(file_path),
             ) else {
                 return None;
             };
@@ -843,21 +854,13 @@ fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> Ca
 
     // Pass 3: Summary-based cross-file interprocedural dataflow across TS/JS/Vue modules
     // (`services/` -> `hooks`/`composables`/`stores` -> `components/`, JSX props, `useQuery`, etc.).
-    let ts_files: Vec<(String, String)> = file_contents
-        .iter()
-        .filter(|(p, _)| is_analyzable_ts_or_js(p) && !extraction.failures.contains_key(p))
-        .cloned()
-        .collect();
+    ts_files.retain(|(file, _)| !extraction.failures.contains_key(file));
     if !ts_files.is_empty() {
-        let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
-        let cross = analyze_cross_file_dataflow_with_limits(
+        let cross = analyze_cross_file_dataflow_with_imports(
             &ts_files,
-            ExtractContext {
-                services: &config.services,
-                clients: &config.clients,
-                env: &config.env,
-            },
-            &|importer, specifier| resolver.resolve_import(importer, specifier),
+            ts_context,
+            &resolve_import,
+            &axios_imports,
         );
         for file in cross.limited_files {
             extraction.record_incomplete(&file, ExtractionFailure::DataflowLimitReached);

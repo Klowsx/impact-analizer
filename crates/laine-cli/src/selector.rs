@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use std::io::{self, IsTerminal};
+use std::path::PathBuf;
 
 use console::{Key, Term, style};
-use laine_core::workspace::DiscoveredRepo;
+use laine_core::workspace::{DiscoveredRepo, same_repository_path};
 
 const MAX_VISIBLE_ITEMS: usize = 16;
 
@@ -81,12 +81,10 @@ pub fn ensure_selection_terminal() -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Muestra el selector de repositorios en stderr tras comprobar el terminal.
-/// Usa flechas, j/k o w/s para mover, espacio para marcar, a para marcar todo,
-/// Enter para confirmar y Esc o q para cancelar.
+/// Show the repository picker with the configured repository paths preselected.
 pub fn select_repositories(
     discovered: &[DiscoveredRepo],
-    preselected_names: &HashSet<String>,
+    preselected_paths: &[PathBuf],
     title: &str,
 ) -> Result<Vec<DiscoveredRepo>, String> {
     if discovered.is_empty() {
@@ -95,7 +93,11 @@ pub fn select_repositories(
 
     let preselected: Vec<bool> = discovered
         .iter()
-        .map(|r| preselected_names.contains(&r.name))
+        .map(|repo| {
+            preselected_paths
+                .iter()
+                .any(|path| same_repository_path(path, &repo.path))
+        })
         .collect();
     let mut state = SelectorState::new(discovered.len(), &preselected);
 
@@ -149,6 +151,7 @@ pub fn select_repositories(
     result
 }
 
+// Render the visible choices with paths for repositories whose labels collide.
 fn render_frame(
     term: &Term,
     title: &str,
@@ -203,8 +206,18 @@ fn render_frame(
         } else {
             repo.name.clone()
         };
+        let path = if discovered
+            .iter()
+            .filter(|candidate| candidate.name == repo.name)
+            .count()
+            > 1
+        {
+            format!(" [{}]", repo.path.display())
+        } else {
+            String::new()
+        };
         let kind = style(format!("({})", repo.detected_kind)).dim();
-        term.write_line(&format!(" {pointer} {checkbox} {label} {kind}"))?;
+        term.write_line(&format!(" {pointer} {checkbox} {label} {kind}{path}"))?;
         lines += 1;
     }
 

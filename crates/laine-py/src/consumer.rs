@@ -2732,11 +2732,13 @@ def missing_env_calls():
         let services = sample_services();
         let clients = vec![
             CustomClientConfig {
+                consumer_service: None,
                 callee: "api_client".into(),
                 target_service: "customer-service".into(),
                 path_prefix: Some("/api".into()),
             },
             CustomClientConfig {
+                consumer_service: None,
                 callee: "get_client().fetch".into(),
                 target_service: "customer-service".into(),
                 path_prefix: None,

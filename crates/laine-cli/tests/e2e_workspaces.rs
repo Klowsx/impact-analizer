@@ -6,6 +6,207 @@ use std::time::{Duration, Instant};
 
 use laine_core::config::WorkspaceConfig;
 
+// Reproduce the shared-callee and renamed-service failures through the managed workspace CLI.
+#[test]
+fn workspace_scan_scopes_clients_and_edit_preserves_renamed_services() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-client-scope-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let projects = tmp.join("projects");
+    let home = tmp.join("home");
+    let laine = |args: &[&str], cwd: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_laine"))
+            .current_dir(cwd)
+            .env("LAINE_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let spec = |path: &str| {
+        format!(
+            "openapi: 3.0.3\ninfo: {{ title: API, version: '1' }}\npaths:\n  {path}:\n    get:\n      responses:\n        '200': {{ description: ok }}\n"
+        )
+    };
+    for (backend, frontend, endpoint) in [
+        ("billing-api", "web-a", "/invoices"),
+        ("users-svc", "web-b", "/users"),
+    ] {
+        let producer = projects.join(backend);
+        let consumer = projects.join(frontend);
+        init_repo(&producer);
+        init_repo(&consumer);
+        fs::write(producer.join("openapi.yaml"), spec(endpoint)).unwrap();
+        fs::write(
+            consumer.join("calls.ts"),
+            format!("export const call = () => apiClient.get('{endpoint}');\n"),
+        )
+        .unwrap();
+        for repo in [&producer, &consumer] {
+            git(repo, &["add", "."]);
+            git(repo, &["commit", "-m", "initialize repository"]);
+        }
+    }
+
+    let output = laine(
+        &["init", "--scan", "--all", "--workspace", "demo"],
+        &projects,
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("web-a: `apiClient` -> billing-api"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("web-b: `apiClient` -> users-svc"),
+        "{stdout}"
+    );
+
+    let path = home.join("configs/demo.toml");
+    let mut config = WorkspaceConfig::load_from_path(&path).unwrap();
+    assert_eq!(config.clients.len(), 2);
+    let billing = config
+        .services
+        .iter_mut()
+        .find(|service| service.name == "billing-api")
+        .unwrap();
+    billing.name = "billing".into();
+    billing.base_urls = vec!["https://billing.example".into()];
+    let mapping = config
+        .clients
+        .iter_mut()
+        .find(|mapping| mapping.target_service == "billing-api")
+        .unwrap();
+    mapping.target_service = "billing".into();
+    mapping.path_prefix = Some("/manual".into());
+    config.save_to_path(&path).unwrap();
+
+    let output = laine(&["workspace", "edit", "demo", "--all"], &projects);
+    assert!(output.status.success(), "{output:?}");
+    let edited = WorkspaceConfig::load_from_path(&path).unwrap();
+    assert!(edited.find_service("billing-api").is_none());
+    assert_eq!(
+        edited.find_service("billing").unwrap().base_urls,
+        ["https://billing.example"]
+    );
+    assert_eq!(edited.clients, config.clients);
+
+    // Remove the endpoint from each producer and verify extraction uses the correct mapping.
+    for (backend, frontend, endpoint) in [
+        ("billing-api", "web-a", "/manual/invoices"),
+        ("users-svc", "web-b", "/users"),
+    ] {
+        let producer = projects.join(backend);
+        fs::write(producer.join("openapi.yaml"), spec(endpoint)).unwrap();
+        git(&producer, &["add", "."]);
+        git(
+            &producer,
+            &["commit", "--allow-empty", "-m", "store endpoint"],
+        );
+        fs::write(
+            producer.join("openapi.yaml"),
+            "openapi: 3.0.3\ninfo: { title: API, version: '1' }\npaths: {}\n",
+        )
+        .unwrap();
+        let output = laine(&["check"], &producer);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            stdout.contains(&format!("{frontend}/calls.ts:1")),
+            "{stdout}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+// Infer custom object names from all four framework catalogs and surface a positive tie.
+#[test]
+fn workspace_scan_uses_framework_routes_and_reports_ambiguous_wrappers() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-client-tie-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let projects = tmp.join("projects");
+    for (name, manifest_file, manifest, route_file, routes) in [
+        (
+            "express-api",
+            "package.json",
+            r#"{"dependencies":{"express":"5"}}"#,
+            "server.ts",
+            "import express from 'express'; const app = express(); app.get('/express', handler); app.get('/shared', handler);",
+        ),
+        (
+            "fastapi-api",
+            "requirements.txt",
+            "fastapi",
+            "app.py",
+            "from fastapi import FastAPI\napp = FastAPI()\n@app.get('/fastapi')\ndef item():\n    return {}\n",
+        ),
+        (
+            "flask-api",
+            "requirements.txt",
+            "flask",
+            "app.py",
+            "from flask import Flask\napp = Flask(__name__)\n@app.get('/flask')\n@app.get('/shared')\ndef item():\n    return {}\n",
+        ),
+        (
+            "laravel-api",
+            "artisan",
+            "#!/usr/bin/env php",
+            "routes/api.php",
+            "<?php\nRoute::get('/laravel', 'ItemController@index');",
+        ),
+    ] {
+        let producer = projects.join(name);
+        init_repo(&producer);
+        fs::write(producer.join(manifest_file), manifest).unwrap();
+        let route_path = producer.join(route_file);
+        fs::create_dir_all(route_path.parent().unwrap()).unwrap();
+        fs::write(route_path, routes).unwrap();
+    }
+    let portal = projects.join("portal");
+    init_repo(&portal);
+    fs::write(
+        portal.join("calls.ts"),
+        "nodeTransport.get('/express');\nfastTransport.get('/fastapi');\nflaskTransport.get('/flask');\nphpTransport.get('/api/laravel');\napiClient.get('/shared');\nhttpClient.get('/unknown');\n",
+    )
+    .unwrap();
+
+    let config_path = tmp.join("laine.toml");
+    let output = Command::new(env!("CARGO_BIN_EXE_laine"))
+        .current_dir(&projects)
+        .args(["init", "--scan", "--all", "--path"])
+        .arg(&config_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`apiClient` in 'portal': candidates: express-api, flask-api"),
+        "{stderr}"
+    );
+    let config = WorkspaceConfig::load_from_path(&config_path).unwrap();
+    let mappings: Vec<_> = config
+        .clients
+        .iter()
+        .map(|mapping| {
+            assert_eq!(mapping.consumer_service.as_deref(), Some("portal"));
+            assert_eq!(mapping.path_prefix, None);
+            (mapping.callee.as_str(), mapping.target_service.as_str())
+        })
+        .collect();
+    assert_eq!(
+        mappings,
+        [
+            ("fastTransport", "fastapi-api"),
+            ("flaskTransport", "flask-api"),
+            ("nodeTransport", "express-api"),
+            ("phpTransport", "laravel-api"),
+        ]
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// Verifica que el selector rechaza la entrada no interactiva aunque la tubería siga abierta.
 fn assert_selector_rejects_open_stdin(command: &mut Command) {
     let mut child = command

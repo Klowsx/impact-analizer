@@ -183,6 +183,9 @@ pub struct ServiceConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomClientConfig {
+    /// Restrict this mapping to a service name. Omit it for a workspace-wide fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_service: Option<String>,
     /// Callee pattern to recognize:
     /// - Exact call such as `getClient().fetch`, `$fetch`, `fetchApi`
     /// - Or an HTTP client object such as `apiClient` (matches `.get/.post/.put/.patch/.delete/.fetch`)
@@ -192,6 +195,22 @@ pub struct CustomClientConfig {
     /// Optional path prefix prepended to relative paths (e.g. `"/api"`).
     #[serde(default)]
     pub path_prefix: Option<String>,
+}
+
+impl WorkspaceConfig {
+    /// Select a consumer's mappings, giving its own entries precedence over global entries.
+    pub fn clients_for_consumer(&self, consumer: &str) -> Vec<CustomClientConfig> {
+        let scoped: Vec<_> = self
+            .clients
+            .iter()
+            .filter(|client| client.consumer_service.as_deref() == Some(consumer))
+            .collect();
+        let global = self.clients.iter().filter(|client| {
+            client.consumer_service.is_none()
+                && !scoped.iter().any(|entry| entry.callee == client.callee)
+        });
+        scoped.iter().copied().chain(global).cloned().collect()
+    }
 }
 
 // Identifica el esquema y el contenido de una URL HTTP(S) absoluta.
@@ -374,6 +393,7 @@ path = "./billing-service"
         assert!(matches!(err, LaineError::ConfigInvalid(_)));
     }
 
+    // Keep existing TOML entries global when the consumer field is omitted.
     #[test]
     fn parses_custom_clients_and_env_mappings() {
         let raw = r#"
@@ -398,9 +418,33 @@ path_prefix = "/api"
             Some("http://customer-service")
         );
         assert_eq!(cfg.clients.len(), 1);
+        assert_eq!(cfg.clients[0].consumer_service, None);
         assert_eq!(cfg.clients[0].callee, "getClient().fetch");
         assert_eq!(cfg.clients[0].target_service, "customer-service");
         assert_eq!(cfg.clients[0].path_prefix.as_deref(), Some("/api"));
+        assert_eq!(cfg.clients_for_consumer("legacy-portal"), cfg.clients);
+    }
+
+    // Resolve a scoped mapping first and retain the legacy default for other consumers.
+    #[test]
+    fn scoped_clients_override_global_clients_for_one_consumer() {
+        let cfg = WorkspaceConfig::parse_toml(
+            r#"
+version = 1
+
+[[clients]]
+callee = "apiClient"
+target_service = "billing"
+
+[[clients]]
+callee = "apiClient"
+consumer_service = "web-b"
+target_service = "users"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.clients_for_consumer("web-a"), cfg.clients[..1]);
+        assert_eq!(cfg.clients_for_consumer("web-b"), cfg.clients[1..]);
     }
 
     #[test]

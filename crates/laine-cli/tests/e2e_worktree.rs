@@ -200,6 +200,7 @@ Route::get('/health', 'HealthController@check');
             },
         ],
         clients: vec![CustomClientConfig {
+            consumer_service: None,
             callee: "getClient().fetch".into(),
             target_service: "laravel-api".into(),
             path_prefix: Some("/api".into()),

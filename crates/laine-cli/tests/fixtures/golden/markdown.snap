@@ -1,0 +1,30 @@
+## Laine Impact Analysis
+
+**Policy:** POLICY BLOCKED (exit code 2) — 1 finding(s) meet or exceed fail_on threshold (Low) | **Target:** `customer-service` (`<SHA>` -> `<SHA>`)
+**Summary:** 1 breaking change(s) | 2 direct consumer ref(s) | 0 indirect consumer(s) | 1 unresolved call(s)
+**Analyzed:** 4 repos | 6 files | 12 graph nodes | 15 graph edges
+
+**Coverage:** COMPLETE | producer base: 1/1 analyzed, 1 read, 0 failed | producer head: 1/1 analyzed, 1 read, 0 failed | consumers: 5/5 analyzed, 5 read, 0 failed
+
+| ID | Severity | Confidence | Endpoint | Change | Consumers |
+| --- | --- | --- | --- | --- | --- |
+| `LAINE-001` | `HIGH` | `CONFIRMED` | `GET /customers/:id` | Removed response field `fullName` (string, HTTP 200) | 2 direct |
+
+<details>
+<summary><strong>LAINE-001</strong> [<code>HIGH</code> | <code>CONFIRMED</code>] <code>GET /customers/:id</code> — Removed response field `fullName` (string, HTTP 200)</summary>
+
+- **Producer:** `customer-service/openapi.yaml:30:19 (/paths/~1customers~1{id}/get/responses/200/content/application~1json/schema/properties/fullName)` (revision `<SHA>`)
+- **Affected consumers (2):**
+  - `billing-service` [`CONFIRMED`] — `billing-service/src/invoices/customer.ts:4` (commit `<SHA>`)
+    - Evidence: `Response field: fullName`
+    - Path: `GET /customers/:id -> HTTP call @ billing-service/src/invoices/customer.ts:2 -> read `fullName` @ billing-service/src/invoices/customer.ts:4`
+  - `notification-service` [`CONFIRMED`] — `notification-service/src/email/welcome.ts:5` (commit `<SHA>`)
+    - Evidence: `Response field: fullName`
+    - Path: `GET /customers/:id -> HTTP call @ notification-service/src/email/welcome.ts:4 -> read `fullName` @ notification-service/src/email/welcome.ts:5`
+
+</details>
+
+### Unresolved Calls (`UNKNOWN`) (1)
+
+- `billing-service/src/legacy/sync.ts:5` — dynamic URL variable `url` cannot be resolved statically (`Unresolved HTTP call`)
+

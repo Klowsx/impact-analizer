@@ -300,6 +300,8 @@ pub struct AnalysisReport {
     pub exit_code: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceIdentity>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub consumer_revisions: BTreeMap<String, String>,
     pub stats: AnalysisStats,
     pub findings: Vec<ImpactFinding>,
     pub unresolved_calls: Vec<UnresolvedCall>,

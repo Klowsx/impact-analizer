@@ -183,6 +183,7 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
         diagnostics: Vec::new(),
         exit_code: None,
         workspace: None,
+        consumer_revisions: BTreeMap::new(),
         stats: input.stats,
         findings,
         unresolved_calls,

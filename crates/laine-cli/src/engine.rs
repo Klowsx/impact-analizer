@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use clap::ValueEnum;
 use laine_core::cache::{IndexCache, compute_config_hash, stable_fingerprint};
 use laine_core::config::{RouteFramework, RouteSourceConfig, WorkspaceConfig};
 use laine_core::error::{LaineError, Result};
-use laine_core::git::GitRepo;
+use laine_core::git::{GitRepo, STAGED_REV, WORKTREE_REV};
 use laine_core::graph::DependencyGraph;
 use laine_core::impact::{ImpactInput, analyze_impact};
 use laine_core::laravel::extract_laravel_routes;
@@ -34,6 +35,25 @@ pub struct AnalyzeRequest {
     pub target_repo: String,
     pub base_rev: String,
     pub head_rev: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum ConsumerRevision {
+    #[default]
+    Head,
+    Staged,
+    Worktree,
+}
+
+impl ConsumerRevision {
+    // Convierte la opción CLI a la revisión de Git o al nombre del snapshot local.
+    fn git_revision(self) -> &'static str {
+        match self {
+            Self::Head => "HEAD",
+            Self::Staged => STAGED_REV,
+            Self::Worktree => WORKTREE_REV,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +101,33 @@ struct CachedConsumerRepo {
     consumes: Vec<CachedConsumeEdge>,
     field_reads: Vec<CachedFieldReadEdge>,
     unresolved_calls: Vec<CachedUnresolvedCall>,
+}
+
+struct ConsumerInputs {
+    all_files: Vec<String>,
+    candidates: Vec<String>,
+    configs: BTreeMap<String, String>,
+    sources: BTreeMap<String, String>,
+}
+
+impl ConsumerInputs {
+    // Identifica un snapshot mutable por los archivos y contenidos usados para extraerlo.
+    fn cache_key(&self, revision: &str) -> Result<String> {
+        let sources = self
+            .all_files
+            .iter()
+            .map(|path| {
+                let contents = self.sources.get(path).or_else(|| self.configs.get(path));
+                (
+                    path,
+                    contents.map(|text| stable_fingerprint(text.as_bytes())),
+                )
+            })
+            .collect::<Vec<_>>();
+        let bytes =
+            serde_json::to_vec(&sources).map_err(|err| LaineError::Cache(err.to_string()))?;
+        Ok(format!("{revision}:{}", stable_fingerprint(&bytes)))
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,11 +211,21 @@ pub fn run_analysis_with_options(req: &AnalyzeRequest, no_cache: bool) -> Result
     run_analysis_with_local_paths(req, no_cache, false)
 }
 
-// Analiza el impacto y agrega el mapa local de repositorios si se solicitó.
+// Conserva la revisión HEAD de los consumidores al pedir solo el mapa local.
 pub fn run_analysis_with_local_paths(
     req: &AnalyzeRequest,
     no_cache: bool,
     include_repo_roots: bool,
+) -> Result<AnalysisReport> {
+    run_analysis_with_consumer_revision(req, no_cache, include_repo_roots, ConsumerRevision::Head)
+}
+
+// Analiza el productor y los consumidores de la revisión elegida, incluido el mismo checkout.
+pub fn run_analysis_with_consumer_revision(
+    req: &AnalyzeRequest,
+    no_cache: bool,
+    include_repo_roots: bool,
+    consumer_revision: ConsumerRevision,
 ) -> Result<AnalysisReport> {
     let config = WorkspaceConfig::load_from_path(&req.config_path)?;
     let config_dir = config_directory(&req.config_path);
@@ -358,18 +415,27 @@ pub fn run_analysis_with_local_paths(
     };
 
     let mut unresolved_calls = Vec::new();
+    let mut consumer_revisions = BTreeMap::new();
     for service in &config.services {
-        if service.name == target_service.name {
-            continue;
-        }
-
         graph.add_repository(&service.name);
         let consumer_path = resolve_repo_path(config_dir, &service.path);
         let consumer_git = GitRepo::new(&consumer_path);
-        let consumer_rev = consumer_git.resolve_revision("HEAD")?;
+        let consumer_rev = consumer_git.resolve_revision(consumer_revision.git_revision())?;
+        consumer_revisions.insert(service.name.clone(), consumer_rev.clone());
+        let mutable_inputs =
+            if cache.is_some() && !matches!(consumer_revision, ConsumerRevision::Head) {
+                Some(load_consumer_inputs(&consumer_git, &consumer_rev)?)
+            } else {
+                None
+            };
+        let cache_key = if let Some(inputs) = &mutable_inputs {
+            inputs.cache_key(&consumer_rev)?
+        } else {
+            consumer_rev.clone()
+        };
 
         let cached_snapshot = if let Some(cache_db) = cache.as_ref() {
-            match cache_db.get_repo_snapshot(&service.name, &consumer_rev, &config_hash)? {
+            match cache_db.get_repo_snapshot(&service.name, &cache_key, &config_hash)? {
                 Some(raw_json) => serde_json::from_str::<CachedConsumerRepo>(&raw_json).ok(),
                 None => None,
             }
@@ -380,13 +446,17 @@ pub fn run_analysis_with_local_paths(
         let snapshot = match cached_snapshot {
             Some(hit) => hit,
             None => {
-                let extracted = extract_consumer_repo(&consumer_git, &consumer_rev, &config)?;
+                let inputs = match mutable_inputs {
+                    Some(inputs) => inputs,
+                    None => load_consumer_inputs(&consumer_git, &consumer_rev)?,
+                };
+                let extracted = extract_consumer_repo(inputs, &config);
                 if let Some(cache_db) = cache.as_ref() {
                     let payload = serde_json::to_string(&extracted)
                         .map_err(|err| LaineError::Cache(err.to_string()))?;
                     cache_db.put_repo_snapshot(
                         &service.name,
-                        &consumer_rev,
+                        &cache_key,
                         &config_hash,
                         &payload,
                     )?;
@@ -466,6 +536,7 @@ pub fn run_analysis_with_local_paths(
         BTreeMap::new()
     };
     report.workspace = Some(WorkspaceIdentity { id, repo_roots });
+    report.consumer_revisions = consumer_revisions;
 
     Ok(report)
 }
@@ -496,7 +567,7 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
         if is_valid_hit {
             cache_hits += 1;
         } else {
-            let snapshot = extract_consumer_repo(&git, &head_sha, &config)?;
+            let snapshot = extract_consumer_repo(load_consumer_inputs(&git, &head_sha)?, &config);
             let payload = serde_json::to_string(&snapshot)
                 .map_err(|err| LaineError::Cache(err.to_string()))?;
             cache.put_repo_snapshot(&service.name, &head_sha, &config_hash, &payload)?;
@@ -514,12 +585,8 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
     })
 }
 
-// Extrae hechos estructurados sin guardar fragmentos del código en los snapshots.
-fn extract_consumer_repo(
-    git: &GitRepo,
-    rev: &str,
-    config: &WorkspaceConfig,
-) -> Result<CachedConsumerRepo> {
+// Enumera y lee una sola vez los recursos que alimentan al analizador de consumidores.
+fn load_consumer_inputs(git: &GitRepo, rev: &str) -> Result<ConsumerInputs> {
     let all_tracked_files = git.list_files(rev)?;
     let candidate_files: Vec<String> = all_tracked_files
         .iter()
@@ -534,9 +601,19 @@ fn extract_consumer_repo(
         .collect();
     let tsconfig_sources = git.read_files_batch(rev, &tsconfig_files)?;
 
-    let contents = git.read_files_batch(rev, &candidate_files)?;
-    let mut extraction = FileExtraction::from_reads(&candidate_files, &contents);
-    let file_contents: Vec<(String, String)> = contents.into_iter().collect();
+    let sources = git.read_files_batch(rev, &candidate_files)?;
+    Ok(ConsumerInputs {
+        all_files: all_tracked_files,
+        candidates: candidate_files,
+        configs: tsconfig_sources,
+        sources,
+    })
+}
+
+// Extrae hechos estructurados de los archivos del snapshot que ya se leyeron.
+fn extract_consumer_repo(inputs: ConsumerInputs, config: &WorkspaceConfig) -> CachedConsumerRepo {
+    let mut extraction = FileExtraction::from_reads(&inputs.candidates, &inputs.sources);
+    let file_contents: Vec<(String, String)> = inputs.sources.into_iter().collect();
 
     // Pass 1 (parallel): build repo-wide TypeScript interface/type & Zod schema registry for
     // generic calls (`fetch<ReserveResponse>`), return-type annotations (`: Promise<UserDTO>`),
@@ -725,7 +802,7 @@ fn extract_consumer_repo(
         .cloned()
         .collect();
     if !ts_files.is_empty() {
-        let resolver = ModuleResolver::from_git_snapshot(&all_tracked_files, &tsconfig_sources);
+        let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
         let cross_reads = analyze_cross_file_dataflow(
             &ts_files,
             ExtractContext {
@@ -796,12 +873,12 @@ fn extract_consumer_repo(
     unresolved_calls
         .sort_by(|a, b| (&a.file, a.line, &a.reason).cmp(&(&b.file, b.line, &b.reason)));
 
-    Ok(CachedConsumerRepo {
+    CachedConsumerRepo {
         extraction,
         consumes,
         field_reads,
         unresolved_calls,
-    })
+    }
 }
 
 // Genera descripciones a partir de los hechos y conserva la ubicación de cada evidencia.

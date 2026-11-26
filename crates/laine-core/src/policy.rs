@@ -167,6 +167,7 @@ mod tests {
             diagnostics: Vec::new(),
             exit_code: None,
             workspace: None,
+            consumer_revisions: Default::default(),
             base_rev: "base".into(),
             head_rev: "head".into(),
             stats: AnalysisStats::default(),

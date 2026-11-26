@@ -8,7 +8,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use laine_cli::engine::{AnalyzeRequest, index_workspace, run_analysis_with_local_paths};
+use laine_cli::engine::{
+    AnalyzeRequest, ConsumerRevision, index_workspace, run_analysis_with_consumer_revision,
+};
 use laine_cli::report::{omit_snippets, render_json, render_markdown, render_terminal};
 use laine_core::config::{
     PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig,
@@ -111,6 +113,9 @@ enum Commands {
         /// Include the local checkout roots in the JSON report
         #[arg(long)]
         include_repo_roots: bool,
+        /// Revision of consumer checkouts, including client code in the producer repo
+        #[arg(long, value_enum, ignore_case = true, default_value_t = ConsumerRevision::Head)]
+        consumer_revision: ConsumerRevision,
     },
     /// Analyze cross-repository impact between two Git revisions
     Analyze {
@@ -138,6 +143,9 @@ enum Commands {
         /// Include the local checkout roots in the JSON report
         #[arg(long)]
         include_repo_roots: bool,
+        /// Revision of consumer checkouts, including client code in the producer repo
+        #[arg(long, value_enum, ignore_case = true, default_value_t = ConsumerRevision::Head)]
+        consumer_revision: ConsumerRevision,
     },
 }
 
@@ -232,6 +240,7 @@ struct AnalysisOutput {
     no_cache: bool,
     no_snippets: bool,
     include_repo_roots: bool,
+    consumer_revision: ConsumerRevision,
 }
 
 const USAGE_EXIT_CODE: u8 = 64;
@@ -332,12 +341,14 @@ fn main() -> ExitCode {
             no_cache,
             no_snippets,
             include_repo_roots,
+            consumer_revision,
         } => {
             let output = AnalysisOutput {
                 format,
                 no_cache,
                 no_snippets,
                 include_repo_roots,
+                consumer_revision,
             };
             let cwd = match env::current_dir() {
                 Ok(dir) => dir,
@@ -394,6 +405,7 @@ fn main() -> ExitCode {
             no_cache,
             no_snippets,
             include_repo_roots,
+            consumer_revision,
         } => execute_analysis(
             AnalyzeRequest {
                 config_path: config,
@@ -406,6 +418,7 @@ fn main() -> ExitCode {
                 no_cache,
                 no_snippets,
                 include_repo_roots,
+                consumer_revision,
             },
         ),
     }
@@ -1017,10 +1030,11 @@ fn filter_selected_repos(
 // Imprime el resultado del análisis o un error estructurado para el formato solicitado.
 fn execute_analysis(req: AnalyzeRequest, output: AnalysisOutput) -> ExitCode {
     let started = Instant::now();
-    match run_analysis_with_local_paths(
+    match run_analysis_with_consumer_revision(
         &req,
         output.no_cache,
         output.include_repo_roots && matches!(output.format, OutputFormat::Json),
+        output.consumer_revision,
     ) {
         Ok(mut report) => {
             if output.no_snippets {

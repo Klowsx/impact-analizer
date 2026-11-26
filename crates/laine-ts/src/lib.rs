@@ -18,7 +18,10 @@ pub use extractor::{
     HttpClientKind, extract_file, extract_file_with_context, extract_file_with_imported_axios,
 };
 pub use module_resolver::ModuleResolver;
-pub use types::{TypeContractDef, TypeFieldDef, extract_type_definitions, resolve_type_fields};
+pub use types::{
+    TypeContractDef, TypeContractModule, TypeContractRegistry, TypeFieldDef,
+    extract_type_definitions, resolve_type_fields,
+};
 pub use url::{
     ServiceEndpointMatch, is_absolute_http_url, normalize_relative_path,
     resolve_url_against_services,

@@ -34,6 +34,7 @@ pub(crate) struct ImportedSymbol {
 #[derive(Debug, Default)]
 pub(crate) struct ModuleSymbols {
     pub imports: BTreeMap<String, ImportedSymbol>,
+    pub namespace_imports: BTreeMap<String, String>,
     exports: BTreeMap<String, String>,
     reexports: BTreeMap<String, ImportedSymbol>,
     stars: Vec<String>,
@@ -60,6 +61,13 @@ impl ModuleSymbols {
                             }
                             ImportDeclarationSpecifier::ImportDefaultSpecifier(default) => {
                                 (&default.local, Some("default"))
+                            }
+                            ImportDeclarationSpecifier::ImportNamespaceSpecifier(namespace)
+                                if include_type_only =>
+                            {
+                                self.namespace_imports
+                                    .insert(namespace.local.name.to_string(), source.into());
+                                continue;
                             }
                             _ => continue,
                         };
@@ -183,17 +191,17 @@ fn export_name<'a>(name: &'a ModuleExportName<'_>) -> Option<&'a str> {
 }
 
 /// Resolves a named or default import to the actual declaring module and local symbol.
-pub(crate) fn resolve_imported_symbol(
+pub(crate) fn resolve_imported_symbol<'a>(
     file: &str,
     import: &ImportedSymbol,
-    modules: &BTreeMap<String, ModuleSymbols>,
+    lookup: &dyn Fn(&str) -> Option<&'a ModuleSymbols>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Option<(String, String)> {
     let target = resolve_import(file, &import.specifier)?;
     resolve_export(
         &target,
         &import.name,
-        modules,
+        lookup,
         resolve_import,
         &mut HashSet::new(),
     )
@@ -202,14 +210,14 @@ pub(crate) fn resolve_imported_symbol(
 }
 
 /// Follows explicit exports and accepts star exports only when their origin is unique.
-fn resolve_export(
+fn resolve_export<'a>(
     file: &str,
     name: &str,
-    modules: &BTreeMap<String, ModuleSymbols>,
+    lookup: &dyn Fn(&str) -> Option<&'a ModuleSymbols>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
     active: &mut HashSet<(String, String)>,
 ) -> Result<Option<(String, String)>, ()> {
-    let Some(module) = modules.get(file) else {
+    let Some(module) = lookup(file) else {
         return Ok(None);
     };
     let key = (file.to_owned(), name.to_owned());
@@ -223,7 +231,7 @@ fn resolve_export(
         let Some(target) = resolve_import(file, &import.specifier) else {
             return Ok(None);
         };
-        resolve_export(&target, &import.name, modules, resolve_import, active)
+        resolve_export(&target, &import.name, lookup, resolve_import, active)
     };
     let result = if let Some(import) = module.reexports.get(name) {
         follow(import, active)
@@ -237,8 +245,7 @@ fn resolve_export(
     } else {
         module.stars.iter().try_fold(None, |found, specifier| {
             if let Some(target) = resolve_import(file, specifier)
-                && let Some(origin) =
-                    resolve_export(&target, name, modules, resolve_import, active)?
+                && let Some(origin) = resolve_export(&target, name, lookup, resolve_import, active)?
             {
                 if found.as_ref().is_some_and(|previous| previous != &origin) {
                     return Err(());

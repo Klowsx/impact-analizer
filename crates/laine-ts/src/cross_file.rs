@@ -422,7 +422,7 @@ pub fn collect_imported_axios_clients(
                     let origin = module_resolver::resolve_imported_symbol(
                         file,
                         import,
-                        &modules,
+                        &|path| modules.get(path),
                         resolve_import,
                     )?;
                     Some((import.clone(), instances.get(&origin)?.clone()))

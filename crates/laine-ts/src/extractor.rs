@@ -42,6 +42,8 @@ pub struct ExtractedHttpCall {
     pub normalized_path: String,
     pub response_type: Option<String>,
     #[serde(default)]
+    pub response_type_is_schema: bool,
+    #[serde(default)]
     pub request: HttpRequestEvidence,
     pub line: usize,
     pub snippet: String,
@@ -696,6 +698,16 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
+    /// Associates a runtime validator with the response when no explicit type is available.
+    fn maybe_backfill_call_schema(&mut self, call_id: usize, schema: String) {
+        if let Some(call) = self.calls.get_mut(call_id)
+            && call.response_type.is_none()
+        {
+            call.response_type = Some(schema);
+            call.response_type_is_schema = true;
+        }
+    }
+
     fn apply_ref_assignment_binding(
         &mut self,
         target_name: &str,
@@ -1203,6 +1215,7 @@ impl<'s> FileExtractor<'s> {
                             method,
                             normalized_path: matched.normalized_path,
                             response_type,
+                            response_type_is_schema: false,
                             request,
                             line,
                             snippet,
@@ -1429,7 +1442,7 @@ impl<'s> FileExtractor<'s> {
                 }
 
                 // Zod `UserSchema.parse(data)` / `UserSchema.safeParse(data)`
-                if let Some(schema_name) = crate::zod::extract_zod_parse_schema_name(call)
+                if let Some(schema_name) = crate::zod::extract_zod_parse_schema_reference(call)
                     && let Some(arg_expr) = call.arguments.first().and_then(Argument::as_expression)
                     && let Some(inner) = self.resolve_binding_from_expr(arg_expr)
                 {
@@ -1445,7 +1458,7 @@ impl<'s> FileExtractor<'s> {
                     } = inner
                     {
                         if prefix.is_empty() {
-                            self.maybe_backfill_call_response_type(call_id, Some(schema_name));
+                            self.maybe_backfill_call_schema(call_id, schema_name);
                         }
                         if is_safe_parse {
                             return Some(VarBinding::AxiosResponse {
@@ -1854,16 +1867,17 @@ impl<'a> Visit<'a> for FileExtractor<'_> {
         walk::walk_assignment_expression(self, it);
     }
 
+    /// Records HTTP calls and associates Zod validators with their response.
     fn visit_call_expression(&mut self, call: &CallExpression<'a>) {
         let _ = self.process_http_call(call);
-        if let Some(schema_name) = crate::zod::extract_zod_parse_schema_name(call)
+        if let Some(schema_name) = crate::zod::extract_zod_parse_schema_reference(call)
             && let Some(arg_expr) = call.arguments.first().and_then(Argument::as_expression)
             && let Some(VarBinding::JsonPayload {
                 call_id, prefix, ..
             }) = self.resolve_binding_from_expr(arg_expr)
             && prefix.is_empty()
         {
-            self.maybe_backfill_call_response_type(call_id, Some(schema_name));
+            self.maybe_backfill_call_schema(call_id, schema_name);
         }
         self.process_helper_call(call);
         walk::walk_call_expression(self, call);

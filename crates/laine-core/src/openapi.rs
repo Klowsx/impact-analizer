@@ -5,10 +5,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{LaineError, Result};
-use crate::model::{ContractChange, EndpointId, HttpMethod, SourceSpan};
+use crate::model::{ContractChange, EndpointId, ExtractionFailure, HttpMethod, SourceSpan};
+
+#[path = "openapi_refs.rs"]
+mod references;
+use references::{Documents, Resolution, VisitedReferences};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContractSource {
+    pub file: String,
     pub pointer: String,
     pub span: Option<SourceSpan>,
 }
@@ -19,6 +24,8 @@ type SourceIndex = HashMap<*const Value, ContractSource>;
 pub struct FieldSchema {
     pub field_type: String,
     pub required: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conditional: bool,
     #[serde(skip)]
     source: Option<ContractSource>,
     #[serde(skip)]
@@ -40,6 +47,8 @@ pub struct ParameterSchema {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct EndpointContract {
     #[serde(skip)]
+    incomplete: bool,
+    #[serde(skip)]
     source: Option<ContractSource>,
     /// HTTP status code (e.g. "200") -> flattened field path (e.g. "fullName", "address.city") -> schema.
     pub responses: BTreeMap<String, BTreeMap<String, FieldSchema>>,
@@ -59,6 +68,14 @@ pub struct EndpointContract {
 pub struct ApiContract {
     /// Ordered map guarantees deterministic diff output across runs.
     pub endpoints: BTreeMap<EndpointId, EndpointContract>,
+    #[serde(skip)]
+    incomplete_paths: HashSet<String>,
+}
+
+pub struct OpenApiExtraction {
+    pub contract: ApiContract,
+    pub diagnostics: Vec<(ContractSource, ExtractionFailure)>,
+    pub loaded_files: usize,
 }
 
 impl ApiContract {
@@ -123,14 +140,15 @@ impl ApiContract {
 }
 
 // Asocia el árbol semántico con las posiciones de claves y elementos del documento original.
-fn index_sources(root: &Value, raw: &str) -> SourceIndex {
-    let marked = MarkedYaml::load_from_str(raw).ok();
+fn index_sources(root: &Value, raw: &str, file: &str) -> SourceIndex {
+    let marked = MarkedYaml::load_from_str(raw.strip_prefix('\u{feff}').unwrap_or(raw)).ok();
     let mut sources = HashMap::new();
     index_source_node(
         root,
         marked.as_ref().and_then(|nodes| nodes.first()),
         None,
         "",
+        file,
         &mut sources,
     );
     sources
@@ -142,6 +160,7 @@ fn index_source_node(
     marked: Option<&MarkedYaml<'_>>,
     key: Option<&MarkedYaml<'_>>,
     pointer: &str,
+    file: &str,
     sources: &mut SourceIndex,
 ) {
     let span = key
@@ -161,6 +180,7 @@ fn index_source_node(
     sources.insert(
         node,
         ContractSource {
+            file: file.to_owned(),
             pointer: pointer.into(),
             span,
         },
@@ -182,13 +202,21 @@ fn index_source_node(
                 pair.map(|(_, value)| value),
                 pair.map(|(key, _)| key),
                 &format!("{pointer}/{escaped}"),
+                file,
                 sources,
             );
         }
     } else if let Some(array) = node.as_array() {
         for (index, value) in array.iter().enumerate() {
             let item = marked.and_then(|node| node.data.as_sequence_get(index));
-            index_source_node(value, item, None, &format!("{pointer}/{index}"), sources);
+            index_source_node(
+                value,
+                item,
+                None,
+                &format!("{pointer}/{index}"),
+                file,
+                sources,
+            );
         }
     }
 }
@@ -241,129 +269,158 @@ pub fn canonical_route_key(normalized_path: &str) -> String {
     }
 }
 
-/// Extrae operaciones y ubicaciones de YAML o JSON, con BOM UTF-8 opcional.
+/// Extrae las operaciones de un único documento OpenAPI YAML o JSON.
 pub fn extract_contract(service: &str, raw_spec: &str) -> Result<ApiContract> {
-    let raw_spec = raw_spec.strip_prefix('\u{feff}').unwrap_or(raw_spec);
-    let root: Value = serde_yaml_ng::from_str(raw_spec)
-        .map_err(|err| LaineError::OpenApiParse(err.to_string()))?;
+    Ok(extract_contract_with_references(service, "", raw_spec, |_| None)?.contract)
+}
 
-    let paths_obj = root
+// Parsea la representación estructurada de un archivo, con BOM UTF-8 opcional.
+fn parse_document(raw: &str) -> Result<Value> {
+    serde_yaml_ng::from_str(raw.strip_prefix('\u{feff}').unwrap_or(raw))
+        .map_err(|err| LaineError::OpenApiParse(err.to_string()))
+}
+
+/// Extrae un contrato con referencias relativas desde el mismo snapshot del archivo principal.
+pub fn extract_contract_with_references(
+    service: &str,
+    file: &str,
+    raw_spec: &str,
+    read: impl FnMut(&str) -> Option<String>,
+) -> Result<OpenApiExtraction> {
+    let documents = Documents::load(file, raw_spec, read)?;
+    let root = documents.root(file);
+    let paths = root
         .get("paths")
         .and_then(Value::as_object)
         .ok_or_else(|| LaineError::OpenApiParse("missing top-level `paths` object".into()))?;
-
-    let mut endpoints = BTreeMap::new();
     let uses_nullable = root
         .get("openapi")
         .and_then(Value::as_str)
         .is_some_and(|version| version.starts_with("3.0."));
-    let sources = index_sources(&root, raw_spec);
+    let mut contract = ApiContract::default();
+    let mut diagnostics = Vec::new();
 
-    for (raw_path, path_item) in paths_obj {
-        let mut path_visited = HashSet::new();
-        let resolved_path_item = resolve_ref(&root, path_item, &mut path_visited);
-        let Some(path_map) = resolved_path_item.as_object() else {
+    for (raw_path, path_item) in paths {
+        let normalized_path = normalize_openapi_path(raw_path);
+        let mut context = documents.context();
+        let mut visited = VisitedReferences::new();
+        let Some(path_item) = context.follow(path_item, &mut visited) else {
+            contract
+                .incomplete_paths
+                .insert(canonical_route_key(&normalized_path));
+            diagnostics.extend(context.diagnostics);
+            continue;
+        };
+        let Some(path_map) = path_item.as_object() else {
             continue;
         };
 
-        let normalized_path = normalize_openapi_path(raw_path);
         let mut path_level_params = BTreeMap::new();
-        if let Some(params) = resolved_path_item
-            .get("parameters")
-            .and_then(Value::as_array)
-        {
+        if let Some(params) = path_item.get("parameters").and_then(Value::as_array) {
             collect_parameters(
-                &root,
+                &mut context,
                 params,
+                &visited,
                 &mut path_level_params,
-                &sources,
                 uses_nullable,
             );
         }
+        let path_parameters_incomplete = !context.diagnostics.is_empty();
+        diagnostics.extend(context.diagnostics);
 
-        for (method_key, operation) in path_map {
-            let Some(method) = HttpMethod::parse(method_key) else {
+        for (method, operation) in path_map {
+            let Some(method) = HttpMethod::parse(method) else {
                 continue;
             };
-
-            let mut endpoint_contract = EndpointContract {
-                source: sources.get(&std::ptr::from_ref(operation)).cloned(),
-                parameters: path_level_params.clone(),
-                ..EndpointContract::default()
-            };
-
-            if let Some(params) = operation.get("parameters").and_then(Value::as_array) {
-                collect_parameters(
-                    &root,
-                    params,
-                    &mut endpoint_contract.parameters,
-                    &sources,
-                    uses_nullable,
-                );
-            }
-
-            if let Some(request_body_val) = operation.get("requestBody") {
-                let mut visited = HashSet::new();
-                let resolved_body = resolve_ref(&root, request_body_val, &mut visited);
-
-                if let Some(schema) = extract_json_schema(resolved_body) {
-                    let resolved_schema = resolve_ref(&root, schema, &mut visited.clone());
-                    endpoint_contract.request_body =
-                        Some(body_schema(resolved_schema, &sources, uses_nullable));
-                    collect_schema_fields(
-                        &root,
-                        schema,
-                        "",
-                        &mut visited,
-                        &mut endpoint_contract.request_fields,
-                        &sources,
-                        uses_nullable,
-                    );
-                }
-            }
-
-            if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
-                for (status_code, response_val) in responses {
-                    if !status_code.starts_with('2') {
-                        continue;
-                    }
-
-                    let mut visited = HashSet::new();
-                    let resolved_response = resolve_ref(&root, response_val, &mut visited);
-
-                    if let Some(schema) = extract_json_schema(resolved_response) {
-                        let resolved_schema = resolve_ref(&root, schema, &mut visited.clone());
-                        endpoint_contract.response_bodies.insert(
-                            status_code.clone(),
-                            body_schema(resolved_schema, &sources, uses_nullable),
-                        );
-                        let mut fields = BTreeMap::new();
-                        collect_schema_fields(
-                            &root,
-                            schema,
-                            "",
-                            &mut visited,
-                            &mut fields,
-                            &sources,
-                            uses_nullable,
-                        );
-                        endpoint_contract
-                            .responses
-                            .insert(status_code.clone(), fields);
-                    }
-                }
-            }
-
-            let endpoint_id = EndpointId {
-                service: service.to_string(),
-                method,
-                normalized_path: normalized_path.clone(),
-            };
-            endpoints.insert(endpoint_id, endpoint_contract);
+            let mut context = documents.context();
+            let endpoint = extract_operation(
+                &mut context,
+                operation,
+                &visited,
+                path_level_params.clone(),
+                uses_nullable,
+                path_parameters_incomplete,
+            );
+            diagnostics.extend(context.diagnostics);
+            contract.endpoints.insert(
+                EndpointId {
+                    service: service.to_owned(),
+                    method,
+                    normalized_path: normalized_path.clone(),
+                },
+                endpoint,
+            );
         }
     }
+    diagnostics.sort_by(|(left, a), (right, b)| {
+        (&left.file, &left.pointer, a).cmp(&(&right.file, &right.pointer, b))
+    });
+    diagnostics.dedup();
+    Ok(OpenApiExtraction {
+        contract,
+        diagnostics,
+        loaded_files: documents.file_count(),
+    })
+}
 
-    Ok(ApiContract { endpoints })
+// Extrae parámetros y cuerpos de una operación y registra cobertura parcial si alguna referencia falla.
+fn extract_operation<'a>(
+    context: &mut Resolution<'a>,
+    operation: &'a Value,
+    visited: &VisitedReferences,
+    parameters: BTreeMap<(String, String), ParameterSchema>,
+    uses_nullable: bool,
+    path_parameters_incomplete: bool,
+) -> EndpointContract {
+    let mut endpoint = EndpointContract {
+        source: context.source(operation).cloned(),
+        parameters,
+        ..EndpointContract::default()
+    };
+    if let Some(params) = operation.get("parameters").and_then(Value::as_array) {
+        collect_parameters(
+            context,
+            params,
+            visited,
+            &mut endpoint.parameters,
+            uses_nullable,
+        );
+    }
+    if let Some(request) = operation.get("requestBody")
+        && let Some((body, fields)) = extract_body(context, request, visited, uses_nullable)
+    {
+        endpoint.request_body = Some(body);
+        endpoint.request_fields = fields;
+    }
+    if let Some(responses) = operation.get("responses").and_then(Value::as_object) {
+        for (status, response) in responses {
+            if status.starts_with('2')
+                && let Some((body, fields)) =
+                    extract_body(context, response, visited, uses_nullable)
+            {
+                endpoint.response_bodies.insert(status.clone(), body);
+                endpoint.responses.insert(status.clone(), fields);
+            }
+        }
+    }
+    endpoint.incomplete = path_parameters_incomplete || !context.diagnostics.is_empty();
+    endpoint
+}
+
+// Resuelve el cuerpo y su esquema con una pila de referencias aislada de otros cuerpos.
+fn extract_body<'a>(
+    context: &mut Resolution<'a>,
+    body: &'a Value,
+    visited: &VisitedReferences,
+    uses_nullable: bool,
+) -> Option<(FieldSchema, BTreeMap<String, FieldSchema>)> {
+    let mut visited = visited.clone();
+    let body = context.follow(body, &mut visited)?;
+    let schema = context.follow(extract_json_schema(body)?, &mut visited)?;
+    let root = body_schema(schema, context.sources(), uses_nullable);
+    let mut fields = BTreeMap::new();
+    collect_schema_fields(context, schema, "", &visited, &mut fields, uses_nullable);
+    Some((root, fields))
 }
 
 /// Compara lo que el request acepta y lo que el response garantiza entre base y head.
@@ -375,11 +432,21 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
 
     for (endpoint_id, base_endpoint) in &base.endpoints {
         let Some(head_endpoint) = find_matching_endpoint(head, endpoint_id) else {
+            if head
+                .incomplete_paths
+                .contains(&canonical_route_key(&endpoint_id.normalized_path))
+            {
+                continue;
+            }
             changes.push(ContractChange::EndpointRemoved {
                 endpoint: endpoint_id.clone(),
             });
             continue;
         };
+
+        if base_endpoint.incomplete || head_endpoint.incomplete {
+            continue;
+        }
 
         for (status_code, base_body) in &base_endpoint.response_bodies {
             if let Some(head_body) = head_endpoint.response_bodies.get(status_code)
@@ -500,52 +567,47 @@ pub fn diff_contracts(base: &ApiContract, head: &ApiContract) -> Vec<ContractCha
     changes
 }
 
-// Extrae cada parámetro y conserva el origen de su declaración resuelta.
-fn collect_parameters(
-    root: &Value,
-    params: &[Value],
+// Extrae los parámetros resueltos y conserva el origen de la declaración y del tipo.
+fn collect_parameters<'a>(
+    context: &mut Resolution<'a>,
+    params: &'a [Value],
+    visited: &VisitedReferences,
     out: &mut BTreeMap<(String, String), ParameterSchema>,
-    sources: &SourceIndex,
     uses_nullable: bool,
 ) {
-    for param_val in params {
-        let mut visited = HashSet::new();
-        let resolved = resolve_ref(root, param_val, &mut visited);
-
+    for parameter in params {
+        let mut visited = visited.clone();
+        let Some(resolved) = context.follow(parameter, &mut visited) else {
+            continue;
+        };
         let Some(location) = resolved.get("in").and_then(Value::as_str) else {
             continue;
         };
-        let Some(name) = resolved.get("name").and_then(Value::as_str) else {
+        let Some(name_value) = resolved.get("name") else {
             continue;
         };
-
+        let Some(name) = name_value.as_str() else {
+            continue;
+        };
         let required = location == "path"
             || resolved
                 .get("required")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-
         let schema = resolved
             .get("schema")
             .or_else(|| extract_json_schema(resolved))
-            .map(|schema| resolve_ref(root, schema, &mut visited.clone()));
-        let param_type = schema.map_or_else(
-            || "unknown".to_string(),
-            |schema| extract_type_label(schema, uses_nullable),
-        );
-
+            .and_then(|schema| context.follow(schema, &mut visited));
         out.insert(
-            (location.to_string(), name.to_string()),
+            (location.to_owned(), name.to_owned()),
             ParameterSchema {
-                param_type,
+                param_type: schema.map_or_else(
+                    || "unknown".to_owned(),
+                    |schema| extract_type_label(schema, uses_nullable),
+                ),
                 required,
-                type_source: schema
-                    .and_then(|node| sources.get(&std::ptr::from_ref(node)))
-                    .cloned(),
-                source: resolved
-                    .get("name")
-                    .and_then(|node| sources.get(&std::ptr::from_ref(node)))
-                    .cloned(),
+                type_source: schema.and_then(|node| context.source(node)).cloned(),
+                source: context.source(name_value).cloned(),
             },
         );
     }
@@ -583,143 +645,158 @@ fn extract_json_schema(response: &Value) -> Option<&Value> {
     media.get("schema")
 }
 
-fn resolve_ref<'a>(root: &'a Value, node: &'a Value, visited: &mut HashSet<String>) -> &'a Value {
-    let Some(ref_str) = node.get("$ref").and_then(Value::as_str) else {
-        return node;
-    };
-
-    if !ref_str.starts_with("#/") || !visited.insert(ref_str.to_string()) {
-        return node;
-    }
-
-    let mut current = root;
-    for part in ref_str.trim_start_matches("#/").split('/') {
-        let unescaped = part.replace("~1", "/").replace("~0", "~");
-        match current.get(&unescaped) {
-            Some(next) => current = next,
-            None => return node,
-        }
-    }
-
-    resolve_ref(root, current, visited)
-}
-
-// Combina las propiedades del esquema y conserva su origen aun cuando provengan de referencias.
-fn collect_schema_fields(
-    root: &Value,
-    schema: &Value,
+// Aplana las propiedades y conserva la diferencia entre intersecciones y alternativas.
+fn collect_schema_fields<'a>(
+    context: &mut Resolution<'a>,
+    schema: &'a Value,
     prefix: &str,
-    visited: &mut HashSet<String>,
+    visited: &VisitedReferences,
     out: &mut BTreeMap<String, FieldSchema>,
-    sources: &SourceIndex,
     uses_nullable: bool,
 ) {
-    let mut local_visited = visited.clone();
-    let resolved = resolve_ref(root, schema, &mut local_visited);
+    let mut visited = visited.clone();
+    let Some(resolved) = context.follow(schema, &mut visited) else {
+        return;
+    };
 
-    // Support `allOf` composition by merging sub-schemas.
     if let Some(all_of) = resolved.get("allOf").and_then(Value::as_array) {
-        for sub in all_of {
-            collect_schema_fields(
-                root,
-                sub,
-                prefix,
-                &mut local_visited,
-                out,
-                sources,
-                uses_nullable,
-            );
+        for child in all_of {
+            collect_schema_fields(context, child, prefix, &visited, out, uses_nullable);
         }
-        // Apply `required` constraints declared in any `allOf` branch to sibling-defined fields.
-        for sub in all_of {
-            let mut sub_visited = local_visited.clone();
-            let resolved_sub = resolve_ref(root, sub, &mut sub_visited);
-            apply_required_flags(resolved_sub, prefix, out, sources);
+        for child in all_of {
+            if let Some(child) = context.follow(child, &mut visited.clone()) {
+                apply_required_flags(child, prefix, out, context.sources());
+            }
         }
     }
 
-    let required_set: HashSet<&str> = resolved
-        .get("required")
-        .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).collect())
-        .unwrap_or_default();
+    for key in ["oneOf", "anyOf"] {
+        if let Some(children) = resolved.get(key).and_then(Value::as_array) {
+            let variants = children
+                .iter()
+                .filter(|child| child.as_bool() != Some(false))
+                .map(|child| {
+                    let mut fields = BTreeMap::new();
+                    collect_schema_fields(
+                        context,
+                        child,
+                        prefix,
+                        &visited,
+                        &mut fields,
+                        uses_nullable,
+                    );
+                    fields
+                })
+                .collect::<Vec<_>>();
+            merge_variants(out, variants);
+        }
+    }
 
     if let Some(props) = resolved.get("properties").and_then(Value::as_object) {
-        for (prop_name, prop_schema) in props {
-            let mut prop_visited = local_visited.clone();
-            let resolved_prop = resolve_ref(root, prop_schema, &mut prop_visited);
-
-            let full_path = if prefix.is_empty() {
-                prop_name.clone()
-            } else {
-                format!("{prefix}.{prop_name}")
+        for (name, schema) in props {
+            let mut visited = visited.clone();
+            let Some(property) = context.follow(schema, &mut visited) else {
+                continue;
             };
-
-            let field_type = extract_type_label(resolved_prop, uses_nullable);
-            let is_required = required_set.contains(prop_name.as_str());
-            let source = sources.get(&std::ptr::from_ref(prop_schema)).cloned();
-            let type_source = if std::ptr::eq(resolved_prop, prop_schema) {
-                None
+            let path = if prefix.is_empty() {
+                name.clone()
             } else {
-                sources.get(&std::ptr::from_ref(resolved_prop)).cloned()
+                format!("{prefix}.{name}")
             };
-            out.entry(full_path.clone())
-                .and_modify(|existing| {
-                    existing.field_type = field_type.clone();
-                    existing.required |= is_required;
-                    existing.source = source.clone();
-                    existing.type_source = type_source.clone();
+            let field_type = extract_type_label(property, uses_nullable);
+            let source = context.source(schema).cloned();
+            let type_source = (!std::ptr::eq(schema, property))
+                .then(|| context.source(property))
+                .flatten()
+                .cloned();
+            out.entry(path.clone())
+                .and_modify(|field| {
+                    if field_type != "unknown" {
+                        field.field_type.clone_from(&field_type);
+                        field.source.clone_from(&source);
+                        field.type_source.clone_from(&type_source);
+                    }
+                    field.conditional = false;
                 })
                 .or_insert(FieldSchema {
                     field_type,
-                    required: is_required,
+                    required: false,
+                    conditional: false,
                     source,
                     type_source,
                     required_source: None,
                 });
-
-            // Recurse into nested objects and arrays of objects.
-            if resolved_prop.get("properties").is_some() || resolved_prop.get("allOf").is_some() {
-                collect_schema_fields(
-                    root,
-                    resolved_prop,
-                    &full_path,
-                    &mut prop_visited,
-                    out,
-                    sources,
-                    uses_nullable,
-                );
-            } else if let Some(items) = resolved_prop.get("items") {
-                let array_prefix = format!("{full_path}[]");
-                collect_schema_fields(
-                    root,
-                    items,
-                    &array_prefix,
-                    &mut prop_visited,
-                    out,
-                    sources,
-                    uses_nullable,
-                );
-            }
+            collect_schema_fields(context, property, &path, &visited, out, uses_nullable);
         }
-    } else if let Some(items) = resolved.get("items") {
-        let array_prefix = if prefix.is_empty() {
-            "[]".to_string()
-        } else {
-            format!("{prefix}[]")
-        };
+    }
+    if let Some(items) = resolved
+        .get("items")
+        .filter(|items| items.is_object() || items.is_boolean())
+    {
         collect_schema_fields(
-            root,
+            context,
             items,
-            &array_prefix,
-            &mut local_visited,
+            &format!("{prefix}[]"),
+            &visited,
             out,
-            sources,
             uses_nullable,
         );
     }
 
-    apply_required_flags(resolved, prefix, out, sources);
+    apply_required_flags(resolved, prefix, out, context.sources());
+}
+
+// Une los tipos de las variantes y conserva como requeridos solo los campos de todas ellas.
+fn merge_variants(
+    out: &mut BTreeMap<String, FieldSchema>,
+    variants: Vec<BTreeMap<String, FieldSchema>>,
+) {
+    let total = variants.len();
+    let mut fields: BTreeMap<String, (usize, FieldSchema)> = BTreeMap::new();
+    for variant in variants {
+        for (path, field) in variant {
+            fields
+                .entry(path)
+                .and_modify(|(count, previous)| {
+                    *count += 1;
+                    previous.required &= field.required;
+                    previous.conditional |= field.conditional;
+                    previous.field_type = union_types(&previous.field_type, &field.field_type);
+                })
+                .or_insert((1, field));
+        }
+    }
+    for (path, (count, mut field)) in fields {
+        field.conditional |= count < total;
+        field.required &= count == total;
+        if !field.required {
+            field.required_source = None;
+        }
+        out.entry(path)
+            .and_modify(|existing| {
+                existing.conditional &= field.conditional;
+                if field.required && !existing.required {
+                    existing.required = true;
+                    existing.required_source.clone_from(&field.required_source);
+                }
+            })
+            .or_insert(field);
+    }
+}
+
+// Une tipos de ramas sin afirmar un conjunto exacto cuando una rama es desconocida.
+fn union_types(a: &str, b: &str) -> String {
+    if a == "unknown" || b == "unknown" {
+        return "unknown".to_owned();
+    }
+    let mut types = a
+        .split(" | ")
+        .chain(b.split(" | "))
+        .collect::<BTreeSet<_>>();
+    if types.contains("number") {
+        types.remove("integer");
+    }
+    types.into_iter().collect::<Vec<_>>().join(" | ")
 }
 
 // Vincula cada restricción required con el nombre exacto en el documento.
@@ -752,6 +829,7 @@ fn body_schema(schema: &Value, sources: &SourceIndex, uses_nullable: bool) -> Fi
     FieldSchema {
         field_type: extract_type_label(schema, uses_nullable),
         required: false,
+        conditional: false,
         source: sources.get(&std::ptr::from_ref(schema)).cloned(),
         type_source: None,
         required_source: None,
@@ -933,6 +1011,106 @@ paths:
         let after =
             extract_contract("api", &spec.replace("integer, 'null'", "'null', integer")).unwrap();
         assert!(diff_contracts(&before, &after).is_empty());
+    }
+
+    // Verifica la unión de campos de variantes, sus garantías y el archivo de origen.
+    #[test]
+    fn resolves_external_openapi_references_and_marks_conditional_fields() {
+        let main = r#"
+openapi: 3.1.0
+paths:
+  /items:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: '../models/item%20model.yaml#/definitions/Item'}
+"#;
+        let model = r#"
+definitions:
+  Item:
+    oneOf:
+      - $ref: '#/definitions/A'
+      - $ref: 'other.json#/B'
+  A:
+    type: object
+    required: [shared, exclusive]
+    properties:
+      shared: {type: string}
+      exclusive: {type: boolean}
+"#;
+        let make = |other: &str| {
+            extract_contract_with_references("api", "specs/api.yaml", main, |file| match file {
+                "models/item model.yaml" => Some(model.to_owned()),
+                "models/other.json" => Some(other.to_owned()),
+                _ => panic!("unexpected file request: {file}"),
+            })
+            .unwrap()
+        };
+        let before = make(
+            r#"{"B":{"anyOf":[{"type":"object","required":["shared"],"properties":{"shared":{"type":"integer"}}},false]}}"#,
+        );
+        assert!(before.diagnostics.is_empty());
+        assert_eq!(before.loaded_files, 3);
+        let endpoint = before.contract.endpoints.values().next().unwrap();
+        let fields = &endpoint.responses["200"];
+        assert!(fields["shared"].required);
+        assert!(!fields["shared"].conditional);
+        assert_eq!(fields["shared"].field_type, "integer | string");
+        assert!(!fields["exclusive"].required);
+        assert!(fields["exclusive"].conditional);
+        assert_eq!(
+            fields["exclusive"].source.as_ref().unwrap().file,
+            "models/item model.yaml"
+        );
+
+        let after = make(r#"{"B":{"type":"object","properties":{"shared":{"type":"integer"}}}}"#);
+        let diff = diff_contracts(&before.contract, &after.contract);
+        assert!(
+            matches!(diff.as_slice(), [ContractChange::ResponseFieldMadeOptional { field_path, .. }] if field_path == "shared")
+        );
+    }
+
+    // Comprueba que los ciclos y los destinos inválidos mantienen parciales solo las rutas afectadas.
+    #[test]
+    fn reports_cycles_and_confines_openapi_reference_paths() {
+        let root = r#"
+paths:
+  /gone: {$ref: './missing.yaml'}
+  /loop:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: 'schemas/loop.yaml#/Cycle'}
+  /outside: {$ref: '%2e%2e/%2e%2e/secret.yaml'}
+  /remote: {$ref: 'https://example.test/remote.yaml'}
+"#;
+        let extraction = extract_contract_with_references("api", "docs/spec.yaml", root, |file| match file {
+            "docs/missing.yaml" => None,
+            "docs/schemas/loop.yaml" => Some("Cycle: {$ref: '../spec.yaml#/paths/~1loop/get/responses/200/content/application~1json/schema'}".into()),
+            _ => panic!("unconfined file read: {file}"),
+        }).unwrap();
+        assert_eq!(extraction.diagnostics.len(), 4);
+        assert_eq!(
+            extraction
+                .diagnostics
+                .iter()
+                .filter(|(_, code)| *code == ExtractionFailure::OpenApiReferenceCycle)
+                .count(),
+            1
+        );
+        let base = extract_contract(
+            "api",
+            "paths:\n  /gone: {get: {}}\n  /unrelated: {get: {}}\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            diff_contracts(&base, &extraction.contract).as_slice(),
+            [ContractChange::EndpointRemoved {endpoint}] if endpoint.normalized_path == "/unrelated"
+        ));
     }
 
     #[test]

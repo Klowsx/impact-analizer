@@ -247,6 +247,9 @@ fn producer_sources(
             ..ProducerEvidence::default()
         };
         if let Some(source) = contract.and_then(|contract| contract.source_for_change(change)) {
+            if !source.file.is_empty() {
+                result.file.clone_from(&source.file);
+            }
             result.json_pointer = Some(source.pointer.clone());
             result.span = source.span.clone();
             result.line = source.span.as_ref().map(|span| span.line);

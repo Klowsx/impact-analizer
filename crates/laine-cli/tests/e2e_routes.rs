@@ -528,3 +528,73 @@ Route::get('/health', 'HealthController@check');\n",
 
     let _ = fs::remove_dir_all(&tmp);
 }
+
+// Prueba que las referencias usan el índice y el disco por separado, y conservan su evidencia.
+#[test]
+fn follows_external_openapi_files_in_the_selected_snapshot() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-external-spec-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let api = tmp.join("api");
+    init_repo(&api);
+    fs::create_dir(api.join("schemas")).unwrap();
+    let path = api.join("schemas/response.yaml");
+    let main = r#"
+openapi: 3.1.0
+paths:
+  /resource:
+    get:
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: {$ref: './schemas/response.yaml'}
+"#;
+    fs::write(api.join("openapi.yaml"), main).unwrap();
+    fs::write(&path, "type: object\nproperties:\n  name: {type: string}\n").unwrap();
+    git(&api, &["add", "."]);
+    git(
+        &api,
+        &["commit", "-m", "test: add external response schema"],
+    );
+    fs::write(&path, "type: object\nproperties: {}\n").unwrap();
+    git(&api, &["add", "schemas/response.yaml"]);
+    fs::remove_file(&path).unwrap();
+
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        "version = 1\n[[services]]\nname = 'api'\npath = './api'\nopenapi = 'openapi.yaml'\n",
+    )
+    .unwrap();
+    let mut request = AnalyzeRequest {
+        config_path,
+        target_repo: "api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "STAGED".into(),
+    };
+    let staged = run_analysis(&request).unwrap();
+    assert!(staged.coverage.unwrap().complete);
+    assert_eq!(staged.findings.len(), 1);
+    let evidence = &staged.findings[0].producer_evidence;
+    assert_eq!(evidence.file, "schemas/response.yaml");
+    assert_eq!(evidence.line, Some(3));
+    assert_eq!(evidence.json_pointer.as_deref(), Some("/properties/name"));
+    request.head_rev = "WORKTREE".into();
+    let worktree = run_analysis(&request).unwrap();
+    assert!(worktree.findings.is_empty());
+    assert!(!worktree.coverage.unwrap().complete);
+    assert_eq!(worktree.diagnostics.len(), 1);
+    assert_eq!(worktree.diagnostics[0].file, "openapi.yaml");
+    assert_eq!(
+        worktree.diagnostics[0].code,
+        laine_core::model::ExtractionFailure::OpenApiReferenceUnresolved
+    );
+    assert!(
+        worktree.diagnostics[0]
+            .json_pointer
+            .as_deref()
+            .unwrap()
+            .ends_with("/$ref")
+    );
+    fs::remove_dir_all(&tmp).unwrap();
+}

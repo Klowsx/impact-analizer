@@ -3,11 +3,14 @@ use std::path::Path;
 
 use laine_core::config::{CustomClientConfig, ServiceConfig, resolve_http_service_url};
 use laine_core::model::HttpMethod;
+use laine_core::request::{
+    Argument as RequestArgument, ArgumentType, HttpRequestEvidence, RequestSection,
+};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, AssignmentOperator, AssignmentTarget, BindingPattern,
-    CallExpression, ChainElement, Expression, Function, ObjectPropertyKind, Program, PropertyKey,
-    Statement, TSTypeAnnotation, TemplateLiteral, VariableDeclarator,
+    CallExpression, ChainElement, Expression, Function, ObjectExpression, ObjectPropertyKind,
+    Program, PropertyKey, Statement, TSTypeAnnotation, TemplateLiteral, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -36,6 +39,8 @@ pub struct ExtractedHttpCall {
     pub method: HttpMethod,
     pub normalized_path: String,
     pub response_type: Option<String>,
+    #[serde(default)]
+    pub request: HttpRequestEvidence,
     pub line: usize,
     pub snippet: String,
 }
@@ -864,6 +869,199 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
+    // Extract arguments from built-in HTTP signatures without saving their values.
+    fn request_evidence(
+        &self,
+        call: &CallExpression<'_>,
+        target: &CallTarget,
+        method: HttpMethod,
+        url: &str,
+        line: usize,
+    ) -> HttpRequestEvidence {
+        let mut request = match target {
+            CallTarget::Fetch(_) | CallTarget::UseFetch(_) => {
+                let nuxt = matches!(target, CallTarget::UseFetch(_));
+                let body = match static_option(call, 1, "body") {
+                    Some(Some(value)) if !nuxt => json_stringify_input(value).map(Some),
+                    body => body,
+                };
+                HttpRequestEvidence {
+                    body: self.request_section(body, false, false),
+                    query: if nuxt {
+                        let mut query =
+                            self.request_section(static_option(call, 1, "query"), true, false);
+                        if query.complete {
+                            let params =
+                                self.request_section(static_option(call, 1, "params"), true, false);
+                            query.complete = params.complete;
+                            for (name, argument) in params.fields {
+                                query.fields.entry(name).or_insert(argument);
+                            }
+                        }
+                        query
+                    } else {
+                        RequestSection::absent()
+                    },
+                    headers: self.request_section(static_option(call, 1, "headers"), true, true),
+                }
+            }
+            CallTarget::Axios(_) | CallTarget::AxiosInstance { .. } => {
+                let data_verb = matches!(
+                    method,
+                    HttpMethod::Post | HttpMethod::Put | HttpMethod::Patch
+                );
+                let index = if data_verb { 2 } else { 1 };
+                let body = if data_verb {
+                    call_argument(call, 1)
+                } else {
+                    static_option(call, index, "data")
+                };
+                let mut headers =
+                    self.request_section(static_option(call, index, "headers"), true, true);
+                headers.complete = false;
+                let mut query =
+                    if matches!(static_option(call, index, "paramsSerializer"), Some(None)) {
+                        self.request_section(static_option(call, index, "params"), true, false)
+                    } else {
+                        RequestSection::default()
+                    };
+                if matches!(target, CallTarget::AxiosInstance { .. }) {
+                    query.complete = false;
+                }
+                HttpRequestEvidence {
+                    body: if matches!(static_option(call, index, "transformRequest"), Some(None)) {
+                        self.request_section(body, false, false)
+                    } else {
+                        RequestSection::default()
+                    },
+                    query,
+                    headers,
+                }
+            }
+            CallTarget::Custom { .. } => return HttpRequestEvidence::default(),
+        };
+        request.query.add_url_query(url, line);
+        request
+    }
+
+    // Classify the argument and inspect properties of object literals.
+    fn request_section(
+        &self,
+        value: Option<Option<&Expression<'_>>>,
+        wire: bool,
+        lowercase: bool,
+    ) -> RequestSection {
+        let Some(value) = value else {
+            return RequestSection::default();
+        };
+        let Some(value) = value else {
+            return RequestSection::absent();
+        };
+        let mut section = RequestSection::absent();
+        section.root = Some(self.argument_type(value, wire));
+        if let Expression::ObjectExpression(object) = unwrap_expr(value) {
+            self.request_fields(object, "", wire, lowercase, &mut section);
+        } else if wire
+            || section
+                .root
+                .as_ref()
+                .is_some_and(|arg| arg.types.is_empty())
+        {
+            section.complete = false;
+        }
+        section
+    }
+
+    // Keep static keys and discard keys an opaque property could overwrite.
+    fn request_fields(
+        &self,
+        object: &ObjectExpression<'_>,
+        prefix: &str,
+        wire: bool,
+        lowercase: bool,
+        section: &mut RequestSection,
+    ) {
+        for property in &object.properties {
+            let named = match property {
+                ObjectPropertyKind::ObjectProperty(property) => property_key_name(&property.key)
+                    .filter(|name| wire || !name.contains(['.', '[', ']']))
+                    .map(|name| (name, &property.value)),
+                ObjectPropertyKind::SpreadProperty(_) => None,
+            };
+            let Some((mut name, value)) = named else {
+                section.complete = false;
+                if prefix.is_empty() {
+                    section.fields.clear();
+                } else {
+                    let children = format!("{prefix}.");
+                    section
+                        .fields
+                        .retain(|path, _| !path.starts_with(&children));
+                }
+                continue;
+            };
+            if lowercase {
+                name.make_ascii_lowercase();
+            }
+            let path = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}.{name}")
+            };
+            let children = format!("{path}.");
+            section
+                .fields
+                .retain(|field, _| !field.starts_with(&children));
+            let mut argument = self.argument_type(value, wire);
+            // Clients can combine headers whose original spelling differs only by case.
+            if lowercase && section.fields.contains_key(&path) {
+                argument.types.clear();
+            }
+            section.fields.insert(path.clone(), argument);
+            if !wire && let Expression::ObjectExpression(child) = unwrap_expr(value) {
+                self.request_fields(child, &path, wire, lowercase, section);
+            }
+        }
+    }
+
+    // Classify JSON and wire literal types without retaining their values.
+    fn argument_type(&self, value: &Expression<'_>, wire: bool) -> RequestArgument {
+        let expr = unwrap_expr(value);
+        let line = self.line_index.line_number(expr.span().start);
+        let kind = match expr {
+            Expression::NullLiteral(_) if !wire => Some(ArgumentType::Null),
+            Expression::BooleanLiteral(literal) if wire => {
+                return RequestArgument::wire_text(
+                    line,
+                    if literal.value { "true" } else { "false" },
+                );
+            }
+            Expression::BooleanLiteral(_) => Some(ArgumentType::Boolean),
+            Expression::NumericLiteral(literal) if wire => {
+                return RequestArgument::wire_text(line, &literal.value.to_string());
+            }
+            Expression::NumericLiteral(literal) if literal.value.fract() == 0.0 => {
+                Some(ArgumentType::Integer)
+            }
+            Expression::NumericLiteral(literal) if literal.value.is_finite() => {
+                Some(ArgumentType::Number)
+            }
+            Expression::StringLiteral(literal) if wire => {
+                return literal.value.as_str().map_or_else(
+                    || RequestArgument::new(line, None),
+                    |value| RequestArgument::wire_text(line, value),
+                );
+            }
+            Expression::StringLiteral(_) | Expression::TemplateLiteral(_) if !wire => {
+                Some(ArgumentType::String)
+            }
+            Expression::ObjectExpression(_) if !wire => Some(ArgumentType::Object),
+            Expression::ArrayExpression(_) if !wire => Some(ArgumentType::Array),
+            _ => None,
+        };
+        RequestArgument::new(line, kind)
+    }
+
     // Extrae llamadas HTTP y conserva diagnósticos para métodos y destinos indeterminados.
     fn process_http_call(&mut self, call: &CallExpression<'_>) -> Option<(CallResultShape, usize)> {
         let target = self.classify_http_call(call)?;
@@ -932,6 +1130,7 @@ impl<'s> FileExtractor<'s> {
 
         match self.eval_url_expr(url_expr) {
             UrlEval::Resolved(url_str) => {
+                let request = self.request_evidence(call, &target, method, &url_str, line);
                 let matched = match &target {
                     CallTarget::Fetch(_) | CallTarget::UseFetch(_) | CallTarget::Axios(_) => {
                         resolve_http_service_url(&url_str, self.ctx.services)
@@ -975,6 +1174,7 @@ impl<'s> FileExtractor<'s> {
                             method,
                             normalized_path: matched.normalized_path,
                             response_type,
+                            request,
                             line,
                             snippet,
                         });
@@ -1925,7 +2125,8 @@ fn extract_env_var_name(expr: &Expression<'_>) -> Option<String> {
     }
 }
 
-fn unwrap_expr<'a>(mut expr: &'a Expression<'a>) -> &'a Expression<'a> {
+// Unwrap syntax that preserves the underlying expression.
+fn unwrap_expr<'a, 'b>(mut expr: &'a Expression<'b>) -> &'a Expression<'b> {
     loop {
         match expr {
             Expression::AwaitExpression(aw) => expr = &aw.argument,
@@ -1937,6 +2138,68 @@ fn unwrap_expr<'a>(mut expr: &'a Expression<'a>) -> &'a Expression<'a> {
             _ => return expr,
         }
     }
+}
+
+// Distinguish missing arguments from positions that could be filled by a spread.
+fn call_argument<'a, 'b>(
+    call: &'a CallExpression<'b>,
+    index: usize,
+) -> Option<Option<&'a Expression<'b>>> {
+    if call
+        .arguments
+        .iter()
+        .take(index + 1)
+        .any(|arg| arg.as_expression().is_none())
+    {
+        return None;
+    }
+    Some(call.arguments.get(index).and_then(Argument::as_expression))
+}
+
+// Find the last definition of an option while accounting for spreads and computed keys.
+fn static_option<'a, 'b>(
+    call: &'a CallExpression<'b>,
+    index: usize,
+    option: &str,
+) -> Option<Option<&'a Expression<'b>>> {
+    let Some(value) = call_argument(call, index)? else {
+        return Some(None);
+    };
+    let options = unwrap_expr(value);
+    if matches!(options, Expression::NullLiteral(_)) {
+        return Some(None);
+    }
+    let Expression::ObjectExpression(object) = options else {
+        return None;
+    };
+    for property in object.properties.iter().rev() {
+        let ObjectPropertyKind::ObjectProperty(property) = property else {
+            return None;
+        };
+        match property_key_name(&property.key) {
+            Some(name) if name == option => return Some(Some(&property.value)),
+            None => return None,
+            _ => {}
+        }
+    }
+    Some(None)
+}
+
+// Recognize direct JSON serialization without a replacer.
+fn json_stringify_input<'a, 'b>(expr: &'a Expression<'b>) -> Option<&'a Expression<'b>> {
+    let Expression::CallExpression(call) = unwrap_expr(expr) else {
+        return None;
+    };
+    let Expression::StaticMemberExpression(member) = unwrap_expr(&call.callee) else {
+        return None;
+    };
+    let Expression::Identifier(object) = unwrap_expr(&member.object) else {
+        return None;
+    };
+    if object.name != "JSON" || member.property.name != "stringify" || call.arguments.len() != 1 {
+        return None;
+    }
+    call.arguments.first()?.as_expression()
 }
 
 // Usa GET para opciones ausentes y conserva como desconocido cualquier método que pueda variar.
@@ -2059,6 +2322,131 @@ mod tests {
             routes: None,
             base_urls: vec!["http://customer-service".into()],
         }]
+    }
+
+    // Verify that static keys after opaque entries remain usable and ambiguous options stay unknown.
+    #[test]
+    fn extracts_static_request_arguments_and_preserves_opaque_sections() {
+        use laine_core::request::ArgumentCompatibility::{Compatible, Incompatible, Unknown};
+
+        let source = r#"import axios from 'axios';
+fetch('http://customer-service/spread', {
+  method: 'POST',
+  body: JSON.stringify({ lost: 'value', ...options, kept: 3, ['fixed']: true }),
+  headers: { 'X-Mode': 'fast' },
+});
+fetch('http://customer-service/computed', {
+  method: 'POST',
+  body: JSON.stringify({ lost: 'value', [key]: value, kept: false }),
+  headers: new Headers({ 'X-Mode': 'fast' }),
+});
+fetch('http://customer-service/opaque', { body: JSON.stringify({ tenant: 3 }), ...opts, method: 'POST' });
+axios.get('http://customer-service/query?limit=3', { params: { limit: 2, page: 1 } });
+useFetch('http://customer-service/nuxt', { query: { limit: 1 }, params: { limit: 'text', page: 2 } });
+fetch(`http://customer-service/dynamic?limit=${value}`);
+fetch('http://customer-service/duplicate', { headers: { 'X-Mode': '1', 'x-mode': 'true' } });
+"#;
+        let result = extract_file("api.ts", source, &customer_services()).unwrap();
+        let [spread, computed, opaque, axios, nuxt, dynamic, duplicate] = result.calls.as_slice()
+        else {
+            panic!("unexpected calls: {:?}", result.calls);
+        };
+        assert_eq!(
+            spread
+                .request
+                .body
+                .compare(Some("lost"), true, "string", spread.line),
+            Unknown(Some(4))
+        );
+        assert_eq!(
+            spread
+                .request
+                .body
+                .compare(Some("kept"), true, "integer", spread.line),
+            Compatible
+        );
+        assert_eq!(
+            spread
+                .request
+                .body
+                .compare(Some("fixed"), true, "boolean", spread.line),
+            Compatible
+        );
+        assert_eq!(
+            spread
+                .request
+                .headers
+                .compare(Some("x-mode"), true, "string", spread.line),
+            Compatible
+        );
+        assert_eq!(
+            computed
+                .request
+                .body
+                .compare(Some("lost"), true, "string", computed.line),
+            Unknown(Some(9))
+        );
+        assert_eq!(
+            computed
+                .request
+                .body
+                .compare(Some("kept"), true, "string", computed.line),
+            Incompatible(9)
+        );
+        assert_eq!(
+            computed
+                .request
+                .headers
+                .compare(Some("x-mode"), true, "string", computed.line),
+            Unknown(Some(10))
+        );
+        assert_eq!(
+            opaque
+                .request
+                .body
+                .compare(Some("tenant"), true, "integer", opaque.line),
+            Unknown(None)
+        );
+        assert_eq!(
+            axios
+                .request
+                .query
+                .compare(Some("limit"), true, "integer", axios.line),
+            Unknown(Some(13))
+        );
+        assert_eq!(
+            axios
+                .request
+                .query
+                .compare(Some("page"), true, "integer", axios.line),
+            Compatible
+        );
+        assert_eq!(
+            nuxt.request
+                .query
+                .compare(Some("limit"), true, "integer", nuxt.line),
+            Compatible
+        );
+        assert_eq!(
+            nuxt.request
+                .query
+                .compare(Some("page"), true, "integer", nuxt.line),
+            Compatible
+        );
+        assert_eq!(
+            dynamic
+                .request
+                .query
+                .compare(Some("limit"), true, "integer", dynamic.line),
+            Unknown(None)
+        );
+        assert_eq!(
+            duplicate
+                .request
+                .headers
+                .compare(Some("x-mode"), true, "boolean", duplicate.line),
+            Unknown(Some(16))
+        );
     }
 
     // Distingue GET por defecto, métodos literales y opciones capaces de sobrescribirlos.

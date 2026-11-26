@@ -6,6 +6,7 @@ use laine_core::config::{
     normalize_relative_path, resolve_http_service_url,
 };
 use laine_core::model::HttpMethod;
+use laine_core::request::{Argument, ArgumentType, HttpRequestEvidence, RequestSection};
 use serde::{Deserialize, Serialize};
 
 use crate::routes::{
@@ -32,6 +33,8 @@ pub struct PyHttpCall {
     pub service: String,
     pub method: HttpMethod,
     pub normalized_path: String,
+    #[serde(default)]
+    pub request: HttpRequestEvidence,
     pub line: usize,
     pub snippet: String,
 }
@@ -964,6 +967,154 @@ impl<'a> PyFileExtractor<'a> {
         None
     }
 
+    // Extract requests and httpx keyword arguments without retaining their values.
+    #[allow(clippy::too_many_arguments)]
+    fn request_evidence(
+        &self,
+        stmt: &LogicalStmt,
+        args: &[CallArg],
+        client: PyHttpClientKind,
+        url: &str,
+        line: usize,
+        url_arg_index: usize,
+        is_instance: bool,
+    ) -> HttpRequestEvidence {
+        let arg = |name| args.iter().find(|arg| arg.name.as_deref() == Some(name));
+        let spread = args
+            .iter()
+            .any(|arg| arg.name.is_none() && arg.value.starts_with('*'));
+        let section = |name, wire, lowercase| {
+            if let Some(arg) = arg(name) {
+                if arg.value == "None" {
+                    return RequestSection::absent();
+                }
+                let mut section = RequestSection::absent();
+                self.request_value(
+                    stmt,
+                    &arg.value,
+                    arg.offset,
+                    "",
+                    wire,
+                    lowercase,
+                    &mut section,
+                );
+                if wire && !arg.value.starts_with('{') {
+                    section.complete = false;
+                }
+                section
+            } else if spread {
+                RequestSection::default()
+            } else {
+                RequestSection::absent()
+            }
+        };
+        let mut request = if client == PyHttpClientKind::Custom {
+            return HttpRequestEvidence::default();
+        } else {
+            let other_body = ["data", "content", "files"]
+                .iter()
+                .any(|name| arg(name).is_some());
+            let uncommon_positional =
+                args.iter().filter(|arg| arg.name.is_none()).count() > url_arg_index + 1;
+            let mut headers = section("headers", true, true);
+            headers.complete = false;
+            HttpRequestEvidence {
+                body: if other_body || uncommon_positional || spread {
+                    RequestSection::default()
+                } else {
+                    section("json", false, false)
+                },
+                query: if uncommon_positional && arg("params").is_none() {
+                    RequestSection::default()
+                } else {
+                    section("params", true, false)
+                },
+                headers,
+            }
+        };
+        // Client defaults or HTTPX params can replace query values embedded in the URL.
+        if is_instance
+            || (client == PyHttpClientKind::Httpx
+                && arg("params").is_some_and(|param| param.value != "None")
+                && url.split('#').next().is_some_and(|base| base.contains('?')))
+        {
+            request.query.complete = false;
+        }
+        request.query.add_url_query(url, line);
+        request
+    }
+
+    // Walk dictionary literals and keep each observed type at its source line.
+    #[allow(clippy::too_many_arguments)]
+    fn request_value(
+        &self,
+        stmt: &LogicalStmt,
+        raw: &str,
+        offset: usize,
+        path: &str,
+        wire: bool,
+        lowercase: bool,
+        section: &mut RequestSection,
+    ) {
+        let trimmed = raw.trim_start();
+        let offset = offset + raw.len() - trimmed.len();
+        let value = trimmed.trim_end();
+        let line = self.line_and_snippet(stmt, offset).0;
+        let argument = python_argument(value, line, wire);
+        if path.is_empty() {
+            section.complete &= !argument.types.is_empty() || (wire && value.starts_with('{'));
+            section.root = Some(argument);
+        } else {
+            let children = format!("{path}.");
+            section
+                .fields
+                .retain(|name, _| !name.starts_with(&children));
+            section.fields.insert(path.to_owned(), argument);
+        }
+        if find_matching_delim(value.as_bytes(), 0, b'{', b'}') != value.len().checked_sub(1)
+            || !value.starts_with('{')
+        {
+            return;
+        }
+        if wire && !path.is_empty() {
+            return;
+        }
+        for (entry, start) in split_top_level_comma(&value[1..value.len() - 1]) {
+            let entry_trimmed = entry.trim_start();
+            if entry_trimmed.is_empty() {
+                continue;
+            }
+            let start = start + entry.len() - entry_trimmed.len();
+            let Some((mut key, child, child_offset)) = python_dict_entry(entry_trimmed)
+                .filter(|(name, _, _)| wire || !name.contains(['.', '[', ']']))
+            else {
+                section.complete = false;
+                if path.is_empty() {
+                    section.fields.clear();
+                } else {
+                    let children = format!("{path}.");
+                    section
+                        .fields
+                        .retain(|name, _| !name.starts_with(&children));
+                }
+                continue;
+            };
+            if lowercase {
+                key.make_ascii_lowercase();
+            }
+            let child_path = join_field_path(path, &key);
+            self.request_value(
+                stmt,
+                child,
+                offset + 1 + start + child_offset,
+                &child_path,
+                wire,
+                lowercase,
+                section,
+            );
+        }
+    }
+
     // Extrae llamadas HTTP y conserva el diagnóstico si la URL apunta a varios servicios.
     fn process_http_call(
         &mut self,
@@ -1027,6 +1178,15 @@ impl<'a> PyFileExtractor<'a> {
 
         match self.eval_url_expr(&url_arg.value) {
             UrlEval::Resolved(url_str) => {
+                let request = self.request_evidence(
+                    stmt,
+                    args,
+                    client_kind,
+                    &url_str,
+                    line,
+                    url_arg_index,
+                    matches!(target, CallTarget::ClientInstance { .. }),
+                );
                 let matched_result: Result<Option<ServiceEndpointMatch>, String> = match &target {
                     CallTarget::Requests { .. } | CallTarget::Httpx { .. } => {
                         resolve_http_service_url(&url_str, self.ctx.services)
@@ -1074,6 +1234,7 @@ impl<'a> PyFileExtractor<'a> {
                             service: matched.service,
                             method,
                             normalized_path: matched.normalized_path,
+                            request,
                             line,
                             snippet,
                         });
@@ -2077,6 +2238,86 @@ fn is_simple_ident(raw: &str) -> bool {
         && bytes[1..].iter().copied().all(is_ident_continue)
 }
 
+// Classify static Python scalars and collections without retaining their values.
+fn python_argument(value: &str, line: usize, wire: bool) -> Argument {
+    if let Some(text) = parse_python_string_literal(value)
+        && detect_string_start(value.as_bytes(), 0)
+            .is_some_and(|(quote, _, _)| !value[..quote].to_ascii_lowercase().contains('b'))
+    {
+        return if wire {
+            Argument::wire_text(line, &text)
+        } else {
+            Argument::new(line, Some(ArgumentType::String))
+        };
+    }
+    if wire {
+        return match value {
+            "True" => Argument::wire_text(line, "True"),
+            "False" => Argument::wire_text(line, "False"),
+            value
+                if is_integer_literal(value) || value.parse::<f64>().is_ok_and(f64::is_finite) =>
+            {
+                Argument::wire_text(line, value)
+            }
+            _ => Argument::new(line, None),
+        };
+    }
+    let kind = match value {
+        "None" => Some(ArgumentType::Null),
+        "True" | "False" => Some(ArgumentType::Boolean),
+        _ if is_integer_literal(value) => Some(ArgumentType::Integer),
+        _ if value.parse::<f64>().is_ok_and(f64::is_finite) => Some(ArgumentType::Number),
+        _ if value.starts_with('{')
+            && find_matching_delim(value.as_bytes(), 0, b'{', b'}')
+                == value.len().checked_sub(1)
+            && (value[1..value.len() - 1].trim().is_empty()
+                || split_top_level_comma(&value[1..value.len() - 1])
+                    .iter()
+                    .any(|(entry, _)| {
+                        entry.trim_start().starts_with("**")
+                            || python_dict_entry(entry.trim_start()).is_some()
+                    })) =>
+        {
+            Some(ArgumentType::Object)
+        }
+        _ if value.starts_with('[')
+            && find_matching_delim(value.as_bytes(), 0, b'[', b']')
+                == value.len().checked_sub(1) =>
+        {
+            Some(ArgumentType::Array)
+        }
+        _ => None,
+    };
+    Argument::new(line, kind)
+}
+
+// Return a static string key and the offset of its dictionary value.
+fn python_dict_entry(entry: &str) -> Option<(String, &str, usize)> {
+    let bytes = entry.as_bytes();
+    let mut pos = 0;
+    while let Some(&byte) = bytes.get(pos) {
+        if let Some(next) = try_skip_string_literal(bytes, pos) {
+            pos = next;
+        } else if byte == b':' {
+            let (quote, _, _) = detect_string_start(bytes, 0)?;
+            if entry[..quote]
+                .bytes()
+                .any(|byte| byte.eq_ignore_ascii_case(&b'b'))
+            {
+                return None;
+            }
+            let key = parse_python_string_literal(&entry[..pos])?;
+            let start = skip_ws(bytes, pos + 1);
+            return Some((key, &entry[start..], start));
+        } else if byte.is_ascii_whitespace() {
+            pos += 1;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
 fn is_integer_literal(raw: &str) -> bool {
     let s = raw.strip_prefix('-').unwrap_or(raw);
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
@@ -2117,6 +2358,134 @@ mod tests {
                 "https://api.internal".into(),
             ],
         }]
+    }
+
+    // Cover static scalar types and ambiguous or unsupported expressions.
+    #[test]
+    fn classifies_python_request_arguments() {
+        use ArgumentType::*;
+        for (value, wire, types) in [
+            ("None", false, vec![Null]),
+            ("True", false, vec![Boolean]),
+            ("-42", false, vec![Integer]),
+            ("2.5e1", false, vec![Number]),
+            ("'hello'", false, vec![String]),
+            ("'TRUE'", true, vec![String, Boolean]),
+            ("42", true, vec![String, Integer]),
+            ("[]", false, vec![Array]),
+            ("{'key': thing}", false, vec![Object]),
+            ("{**kwargs}", false, vec![Object]),
+            ("{thing}", false, vec![]),
+            ("b'hello'", false, vec![]),
+            ("f'{value}'", true, vec![]),
+            ("value", false, vec![]),
+        ] {
+            assert_eq!(python_argument(value, 9, wire), Argument { line: 9, types });
+        }
+    }
+
+    // Verify quoted keys, source offsets, and unknown dictionary entry forms.
+    #[test]
+    fn extracts_only_static_string_keys_from_python_dicts() {
+        assert_eq!(
+            python_dict_entry("'a:b' :  current"),
+            Some(("a:b".into(), "current", 9))
+        );
+        assert_eq!(
+            python_dict_entry(r#""a" 'b': 1"#),
+            Some(("ab".into(), "1", 9))
+        );
+        for entry in [
+            "**kwargs",
+            "key: 1",
+            "'key' + suffix: 1",
+            "f'{key}': 1",
+            "b'key': 1",
+        ] {
+            assert_eq!(python_dict_entry(entry), None);
+        }
+    }
+
+    // Confirm that kwargs and query collisions preserve unverified argument evidence.
+    #[test]
+    fn extracts_keyword_argument_evidence_from_python_clients() {
+        use laine_core::request::ArgumentCompatibility::{Compatible, Unknown};
+        let py = r#"import requests
+import httpx
+requests.post('http://customer-service/orders?limit=3',
+              json={'lost': 'value', **data, 'kept': True},
+              params={'limit': 2}, headers={'X-MODE': 'fast'})
+requests.post('http://customer-service/orders?limit=3', **kwargs)
+httpx.get('http://customer-service/orders?limit=3', params={'page': 1})
+"#;
+        let result = extract_python_file(
+            "app.py",
+            py,
+            PyExtractContext {
+                services: &sample_services(),
+                clients: &[],
+                env: &BTreeMap::new(),
+            },
+        );
+        let [explicit, opaque, httpx] = result.calls.as_slice() else {
+            panic!("unexpected calls: {:?}", result.calls);
+        };
+        assert_eq!(
+            explicit
+                .request
+                .body
+                .compare(Some("lost"), true, "string", explicit.line),
+            Unknown(Some(4))
+        );
+        assert_eq!(
+            explicit
+                .request
+                .body
+                .compare(Some("kept"), true, "boolean", explicit.line),
+            Compatible
+        );
+        assert_eq!(
+            explicit
+                .request
+                .query
+                .compare(Some("limit"), true, "integer", explicit.line),
+            Unknown(Some(5))
+        );
+        assert_eq!(
+            explicit
+                .request
+                .headers
+                .compare(Some("x-mode"), true, "string", explicit.line),
+            Compatible
+        );
+        assert_eq!(
+            opaque
+                .request
+                .body
+                .compare(Some("kept"), true, "boolean", opaque.line),
+            Unknown(None)
+        );
+        assert_eq!(
+            opaque
+                .request
+                .query
+                .compare(Some("limit"), true, "integer", opaque.line),
+            Unknown(Some(6))
+        );
+        assert_eq!(
+            httpx
+                .request
+                .query
+                .compare(Some("limit"), true, "integer", httpx.line),
+            Unknown(Some(7))
+        );
+        assert_eq!(
+            httpx
+                .request
+                .query
+                .compare(Some("page"), true, "integer", httpx.line),
+            Compatible
+        );
     }
 
     // Verifica aliases de módulo, métodos y constructores con ocultamiento de nombres.

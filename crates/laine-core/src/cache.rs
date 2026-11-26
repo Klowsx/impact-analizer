@@ -9,7 +9,8 @@ use serde::Serialize;
 use crate::config::{CustomClientConfig, WorkspaceConfig};
 use crate::error::{LaineError, Result};
 
-pub const CACHE_SCHEMA_VERSION: u32 = 3;
+pub const CACHE_SCHEMA_VERSION: u32 = 4;
+const FIRST_SANITIZED_SNAPSHOT_VERSION: u32 = 4;
 
 const FNV1A_64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -23,6 +24,7 @@ pub struct IndexCache {
 impl IndexCache {
     /// Opens (or creates) the SQLite cache database at `path`, ensuring parent directories
     /// and the `repo_index_cache` table exist.
+    // Abre el caché y retira los snapshots anteriores al saneamiento de evidencias.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -46,6 +48,14 @@ impl IndexCache {
                 payload_json TEXT NOT NULL,
                 PRIMARY KEY (repo, commit_sha, config_hash, schema_version)
             );",
+        )
+        .map_err(|err| LaineError::Cache(err.to_string()))?;
+
+        conn.pragma_update(None, "secure_delete", true)
+            .map_err(|err| LaineError::Cache(err.to_string()))?;
+        conn.execute(
+            "DELETE FROM repo_index_cache WHERE schema_version < ?1",
+            [FIRST_SANITIZED_SNAPSHOT_VERSION],
         )
         .map_err(|err| LaineError::Cache(err.to_string()))?;
 
@@ -167,6 +177,7 @@ mod tests {
     }
 
     #[test]
+    // Verifica la separación de snapshots y la retirada de evidencias de versiones antiguas.
     fn stores_retrieves_and_invalidates_by_sha_or_config_hash() {
         let tmp = std::env::temp_dir().join(format!("laine-cache-unit-{}.db", std::process::id()));
         let _ = fs::remove_file(&tmp);
@@ -234,6 +245,39 @@ mod tests {
             None
         );
 
+        cache
+            .conn
+            .execute(
+                "INSERT INTO repo_index_cache
+                    (repo, commit_sha, config_hash, schema_version, payload_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    "billing-service",
+                    "sha000",
+                    "cfg1",
+                    FIRST_SANITIZED_SNAPSHOT_VERSION - 1,
+                    r#"{"snippet":"FICTITIOUS_LEGACY_SNIPPET"}"#
+                ],
+            )
+            .unwrap();
+        drop(cache);
+
+        let cache = IndexCache::open(&tmp).expect("cache should reopen");
+        let mut query = cache
+            .conn
+            .prepare("SELECT schema_version FROM repo_index_cache ORDER BY schema_version")
+            .unwrap();
+        let versions = query
+            .query_map([], |row| row.get::<_, u32>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(versions, [CACHE_SCHEMA_VERSION, CACHE_SCHEMA_VERSION + 1]);
+        assert!(
+            !String::from_utf8_lossy(&fs::read(&tmp).unwrap())
+                .contains("FICTITIOUS_LEGACY_SNIPPET")
+        );
+        drop(query);
         drop(cache);
         let _ = fs::remove_file(&tmp);
     }

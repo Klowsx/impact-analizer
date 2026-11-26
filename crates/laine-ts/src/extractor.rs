@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use crate::url::{is_absolute_http_url, normalize_relative_path, resolve_url_against_services};
 use crate::vue::{extract_vue_scripts_with_setup, extract_vue_template_expressions};
 
+const UNMAPPED_ENV: &str = "unmapped environment variable (configure under `[env]` in laine.toml)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HttpClientKind {
@@ -1008,6 +1010,7 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
+    // Resuelve las URL de entorno sin incluir en el diagnóstico la clave sin configurar.
     fn eval_url_expr(&self, expr: &Expression<'_>) -> UrlEval {
         match unwrap_expr(expr) {
             Expression::StringLiteral(lit) => match lit.value.as_str() {
@@ -1027,9 +1030,7 @@ impl<'s> FileExtractor<'s> {
                     if let Some(val) = self.ctx.env.get(&env_name) {
                         return UrlEval::Resolved(val.clone());
                     }
-                    return UrlEval::Dynamic(format!(
-                        "unmapped environment variable `{env_name}` (configure under `[env]` in laine.toml)"
-                    ));
+                    return UrlEval::Dynamic(UNMAPPED_ENV.into());
                 }
                 UrlEval::Dynamic("dynamic URL expression cannot be resolved statically".into())
             }
@@ -1052,6 +1053,7 @@ impl<'s> FileExtractor<'s> {
         }
     }
 
+    // Resuelve plantillas de URL y comunica variables ausentes con un mensaje fijo.
     fn eval_template_url(&self, tpl: &TemplateLiteral<'_>) -> UrlEval {
         let mut out = String::new();
 
@@ -1092,9 +1094,7 @@ impl<'s> FileExtractor<'s> {
                             if let Some(val) = self.ctx.env.get(&env_name) {
                                 out.push_str(val);
                             } else if out.is_empty() {
-                                return UrlEval::Dynamic(format!(
-                                    "unmapped environment variable `{env_name}`"
-                                ));
+                                return UrlEval::Dynamic(UNMAPPED_ENV.into());
                             } else {
                                 out.push_str(":param");
                             }
@@ -2072,6 +2072,7 @@ export async function loadAxiosDestructured(id: string) {
     }
 
     #[test]
+    // Verifica el análisis de clientes y el diagnóstico saneado de variables ausentes.
     fn extracts_custom_clients_axios_create_env_vars_and_local_helpers() {
         let services = customer_services();
         let clients = vec![
@@ -2168,7 +2169,7 @@ export const service = {
 
         // Unmapped env var reported as UNKNOWN!
         assert_eq!(extracted.unresolved_calls.len(), 1);
-        assert!(extracted.unresolved_calls[0].reason.contains("UNKNOWN_API"));
+        assert_eq!(extracted.unresolved_calls[0].reason, UNMAPPED_ENV);
     }
 
     #[test]

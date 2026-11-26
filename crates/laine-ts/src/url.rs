@@ -1,4 +1,5 @@
-use laine_core::config::ServiceConfig;
+pub use laine_core::config::is_absolute_http_url;
+use laine_core::config::{ServiceConfig, matching_http_url};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceEndpointMatch {
@@ -10,27 +11,23 @@ pub struct ServiceEndpointMatch {
 /// against the `base_urls` configured in `laine.toml`.
 ///
 /// Chooses the longest matching `base_url` prefix so specific mount prefixes win over broad origins.
+// Compara URL y bases saneadas y conserva la coincidencia más específica.
 pub fn resolve_url_against_services(
     raw_url: &str,
     services: &[ServiceConfig],
 ) -> Option<ServiceEndpointMatch> {
-    let without_fragment = raw_url.split('#').next().unwrap_or(raw_url);
-    let without_query = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment)
-        .trim();
+    let url = matching_http_url(raw_url)?;
 
     let mut best_match: Option<(usize, ServiceEndpointMatch)> = None;
 
     for service in services {
         for base_url in &service.base_urls {
-            let trimmed_base = base_url.trim().trim_end_matches('/');
-            if trimmed_base.is_empty() {
+            let Some(base) = matching_http_url(base_url) else {
                 continue;
-            }
+            };
+            let trimmed_base = base.trim_end_matches('/');
 
-            if let Some(rest) = strip_base_prefix(without_query, trimmed_base) {
+            if let Some(rest) = strip_base_prefix(&url, trimmed_base) {
                 let normalized_path = normalize_consumer_path(rest);
                 let score = trimmed_base.len();
                 let should_replace = best_match
@@ -100,11 +97,6 @@ pub fn normalize_relative_path(raw_path: &str, path_prefix: Option<&str>) -> Str
     normalize_consumer_path(&combined)
 }
 
-pub fn is_absolute_http_url(url: &str) -> bool {
-    let trimmed = url.trim();
-    trimmed.starts_with("http://") || trimmed.starts_with("https://")
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -134,6 +126,28 @@ mod tests {
 
         assert_eq!(matched.service, "customer-service");
         assert_eq!(matched.normalized_path, "/customers/:id");
+    }
+
+    #[test]
+    // Verifica los límites de host, puerto y ruta con credenciales de URL ficticias.
+    fn matches_credentialed_urls_using_origin_and_mount_path() {
+        let mut services = sample_services();
+        services[0].base_urls =
+            vec!["https://user:FICTITIOUS_PASSWORD@api.example:8443/v1/?q=FICTITIOUS_QUERY".into()];
+        let matched = resolve_url_against_services(
+            " https://user:FICTITIOUS_USERINFO@api.example:8443/v1/a@b?q=1#top ",
+            &services,
+        )
+        .unwrap();
+        assert_eq!(matched.normalized_path, "/a@b");
+        for url in [
+            "https://api.example:8444/v1/x",
+            "https://api.example:8443/v10/x",
+            "https://api.example:8443@other.example/v1/x",
+            r"https://other.example\@api.example:8443/v1/x",
+        ] {
+            assert!(resolve_url_against_services(url, &services).is_none());
+        }
     }
 
     #[test]

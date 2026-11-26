@@ -114,6 +114,40 @@ pub struct CustomClientConfig {
     pub path_prefix: Option<String>,
 }
 
+// Identifica el esquema y el contenido de una URL HTTP(S) absoluta.
+fn http_url_parts(value: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = value.trim().split_once("://")?;
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        .then_some((scheme, rest))
+}
+
+// Distingue las URL absolutas de las rutas relativas de clientes configurados.
+pub fn is_absolute_http_url(value: &str) -> bool {
+    http_url_parts(value).is_some()
+}
+
+// Conserva los componentes HTTP necesarios para comparar servicios y rutas de montaje.
+pub fn matching_http_url(value: &str) -> Option<String> {
+    let (scheme, rest) = http_url_parts(value)?;
+
+    // Separa la autoridad antes de quitar el usuario, así un @ en la ruta queda intacto.
+    let rest = rest.split(['?', '#']).next()?.trim_end();
+    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
+    let host = authority.rsplit('@').next()?;
+    if host.is_empty() || authority.contains('\\') || authority.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("{}://{host}{path}", scheme.to_ascii_lowercase()))
+}
+
+// Sanea cualquier URL HTTP(S) al reescribir el TOML y conserva ajustes de otros tipos.
+fn sanitize_config_value(value: &str) -> String {
+    if is_absolute_http_url(value) {
+        return matching_http_url(value).unwrap_or_default();
+    }
+    value.to_owned()
+}
+
 impl WorkspaceConfig {
     pub fn load_from_path(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path).map_err(|source| LaineError::Io {
@@ -138,6 +172,7 @@ impl WorkspaceConfig {
         self.services.iter().find(|svc| svc.name == name)
     }
 
+    // Guarda una copia que solo conserva los componentes de las URL requeridos para el análisis.
     pub fn save_to_path(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -147,7 +182,16 @@ impl WorkspaceConfig {
                 source,
             })?;
         }
-        let serialized = toml::to_string_pretty(self)
+        let mut config = self.clone();
+        for value in config.env.values_mut().chain(
+            config
+                .services
+                .iter_mut()
+                .flat_map(|service| service.base_urls.iter_mut()),
+        ) {
+            *value = sanitize_config_value(value);
+        }
+        let serialized = toml::to_string_pretty(&config)
             .map_err(|err| LaineError::ConfigInvalid(err.to_string()))?;
         fs::write(path, serialized).map_err(|source| LaineError::Io {
             path: path.to_path_buf(),

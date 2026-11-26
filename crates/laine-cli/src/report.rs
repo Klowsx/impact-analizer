@@ -2,6 +2,20 @@ use std::fmt::Write;
 
 use laine_core::model::{AnalysisReport, Confidence, ContractChange, EndpointId, Severity};
 
+// Quita las descripciones de evidencia conservando sus ubicaciones y el contrato JSON.
+pub fn omit_snippets(report: &mut AnalysisReport) {
+    for finding in &mut report.findings {
+        finding.producer_evidence.snippet.clear();
+        for consumer in &mut finding.consumers {
+            consumer.evidence.snippet.clear();
+        }
+    }
+    for call in &mut report.unresolved_calls {
+        call.evidence.snippet.clear();
+    }
+}
+
+// Muestra la evidencia localizada y sus descripciones cuando están disponibles.
 pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
     let mut out = String::new();
 
@@ -165,7 +179,9 @@ pub fn render_terminal(report: &AnalysisReport, elapsed_ms: u128) -> String {
                         consumer.evidence.line,
                         short_sha(&consumer.evidence.revision)
                     );
-                    let _ = writeln!(out, "       Code: {}", consumer.evidence.snippet);
+                    if !consumer.evidence.snippet.is_empty() {
+                        let _ = writeln!(out, "       Evidence: {}", consumer.evidence.snippet);
+                    }
                     let _ = writeln!(
                         out,
                         "       Path: {}",
@@ -249,6 +265,7 @@ pub fn render_json(report: &AnalysisReport) -> Result<String, serde_json::Error>
 }
 
 /// Renders a GitHub-flavored Markdown report designed for pull request comments.
+// Genera un reporte Markdown con descripciones opcionales de la evidencia.
 pub fn render_markdown(report: &AnalysisReport) -> String {
     let mut out = String::new();
 
@@ -376,11 +393,13 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
                         consumer.evidence.line,
                         short_sha(&consumer.evidence.revision)
                     );
-                    let _ = writeln!(
-                        out,
-                        "    - Code: `{}`",
-                        escape_inline_code(&consumer.evidence.snippet)
-                    );
+                    if !consumer.evidence.snippet.is_empty() {
+                        let _ = writeln!(
+                            out,
+                            "    - Evidence: `{}`",
+                            escape_inline_code(&consumer.evidence.snippet)
+                        );
+                    }
                     let _ = writeln!(
                         out,
                         "    - Path: `{}`",
@@ -441,15 +460,15 @@ pub fn render_markdown(report: &AnalysisReport) -> String {
         );
         let _ = writeln!(out);
         for call in &report.unresolved_calls {
-            let _ = writeln!(
+            let _ = write!(
                 out,
-                "- `{}/{}:{}` — {} (`{}`)",
-                call.evidence.repo,
-                call.evidence.file,
-                call.evidence.line,
-                call.reason,
-                escape_inline_code(&call.evidence.snippet)
+                "- `{}/{}:{}` — {}",
+                call.evidence.repo, call.evidence.file, call.evidence.line, call.reason,
             );
+            if !call.evidence.snippet.is_empty() {
+                let _ = write!(out, " (`{}`)", escape_inline_code(&call.evidence.snippet));
+            }
+            let _ = writeln!(out);
         }
         let _ = writeln!(out);
     }

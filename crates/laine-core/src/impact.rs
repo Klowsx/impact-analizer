@@ -24,6 +24,7 @@ pub struct ImpactInput<'a> {
     pub stats: AnalysisStats,
 }
 
+// Traslada al hallazgo las llamadas de la operación con su confianza de resolución.
 fn consumers_for_endpoint(graph: &DependencyGraph, endpoint: &EndpointId) -> Vec<AffectedConsumer> {
     graph
         .consumers_of_endpoint(
@@ -41,7 +42,7 @@ fn consumers_for_endpoint(graph: &DependencyGraph, endpoint: &EndpointId) -> Vec
                 line: hit.line,
                 snippet: hit.snippet,
             },
-            confidence: Confidence::Confirmed,
+            confidence: hit.confidence,
             dependency_path: vec![
                 format!("{} {}", endpoint.method.as_str(), endpoint.normalized_path),
                 format!("HTTP call @ {}/{}:{}", hit.repo, hit.file, hit.line),
@@ -105,7 +106,7 @@ pub fn analyze_impact(graph: &DependencyGraph, input: ImpactInput<'_>) -> Analys
                 let consumers = hits
                     .into_iter()
                     .map(|hit| {
-                        let step_label = if hit.confidence == Confidence::Likely {
+                        let step_label = if hit.source_confidence == Confidence::Likely {
                             "typed contract"
                         } else {
                             "read"

@@ -28,6 +28,96 @@ fn init_repo(dir: &Path) {
     git(dir, &["config", "user.email", "test@laine.local"]);
 }
 
+// Comprueba que la evidencia y las excepciones conservan la identidad de las rutas de base.
+#[test]
+fn keeps_literal_calls_and_policy_ignores_separate_from_removed_templates() {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let tmp = std::env::temp_dir().join(format!(
+        "laine-e2e-route-identity-{}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir(&tmp).unwrap();
+
+    let api = tmp.join("api");
+    init_repo(&api);
+    fs::create_dir(api.join("routes")).unwrap();
+    let routes = api.join("routes/api.php");
+    fs::write(
+        &routes,
+        "<?php\nRoute::get('/users/me', 'Users@me');\nRoute::get('/users/{id}', 'Users@show');\n",
+    )
+    .unwrap();
+    git(&api, &["add", "."]);
+    git(&api, &["commit", "-m", "feat: add user routes"]);
+
+    fs::write(
+        &routes,
+        "<?php\nRoute::get('/users/me', 'Users@me');\nRoute::get('/users/42', 'Users@example');\n",
+    )
+    .unwrap();
+
+    let web = tmp.join("web");
+    init_repo(&web);
+    fs::write(
+        web.join("users.ts"),
+        "fetch('http://api/users/me');\nfetch('http://api/users/42');\nexport const userById = (id: string) => fetch(`http://api/users/${id}`);\n",
+    ).unwrap();
+    git(&web, &["add", "."]);
+    git(&web, &["commit", "-m", "feat: call user routes"]);
+
+    let config_path = tmp.join("laine.toml");
+    fs::write(
+        &config_path,
+        r#"version = 1
+
+[policy]
+ignore_endpoints = ["GET /users/me"]
+
+[[services]]
+name = "api"
+path = "./api"
+base_urls = ["http://api"]
+[services.routes]
+framework = "laravel"
+files = ["routes/api.php"]
+
+[[services]]
+name = "web"
+path = "./web"
+"#,
+    )
+    .unwrap();
+
+    let report = run_analysis(&AnalyzeRequest {
+        config_path,
+        target_repo: "api".into(),
+        base_rev: "HEAD".into(),
+        head_rev: "WORKTREE".into(),
+    })
+    .unwrap();
+
+    assert_eq!(report.findings.len(), 1);
+    let finding = &report.findings[0];
+    assert!(matches!(
+        &finding.change,
+        ContractChange::EndpointRemoved { endpoint } if endpoint.normalized_path == "/users/:id"
+    ));
+    let calls: Vec<_> = finding
+        .consumers
+        .iter()
+        .map(|consumer| (consumer.evidence.line, consumer.confidence))
+        .collect();
+    assert_eq!(
+        calls,
+        [(2, Confidence::Confirmed), (3, Confidence::Possible)]
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn detects_removed_laravel_route_consumed_via_custom_ts_wrapper_without_openapi() {
     let tmp = std::env::temp_dir().join(format!("laine-e2e-laravel-{}", std::process::id()));

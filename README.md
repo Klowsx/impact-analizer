@@ -146,6 +146,8 @@ When Git detects a rename of the configured OpenAPI file, `analyze` compares bot
 
 ## Configuration (`laine.toml`)
 
+The default SQLite cache lives in `~/.laine/cache/`, or under `$LAINE_HOME/cache/` when set. Use `cache_path` to choose an explicit destination. Laine rebuilds incompatible snapshot tables and expires snapshots older than 30 days. `analyze` and `check` continue without persisted snapshots when the cache is unavailable. `index` requires a writable cache.
+
 ```toml
 version = 1
 cache_path = ".cache/laine.sqlite"

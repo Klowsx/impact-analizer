@@ -8,11 +8,12 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use laine_cli::engine::{AnalyzeRequest, index_workspace, run_analysis_with_options};
+use laine_cli::engine::{AnalyzeRequest, index_workspace, run_analysis_with_local_paths};
 use laine_cli::report::{omit_snippets, render_json, render_markdown, render_terminal};
 use laine_core::config::{
     PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig,
 };
+use laine_core::error::LaineError;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::{GitRepo, STAGED_REV};
 use laine_core::workspace::{
@@ -107,6 +108,9 @@ enum Commands {
         /// Suppress evidence snippets and detailed errors in publishable reports
         #[arg(long)]
         no_snippets: bool,
+        /// Include the local checkout roots in the JSON report
+        #[arg(long)]
+        include_repo_roots: bool,
     },
     /// Analyze cross-repository impact between two Git revisions
     Analyze {
@@ -131,6 +135,9 @@ enum Commands {
         /// Suppress evidence snippets and detailed errors in publishable reports
         #[arg(long)]
         no_snippets: bool,
+        /// Include the local checkout roots in the JSON report
+        #[arg(long)]
+        include_repo_roots: bool,
     },
 }
 
@@ -219,6 +226,16 @@ enum OutputFormat {
     Markdown,
 }
 
+#[derive(Clone, Copy)]
+struct AnalysisOutput {
+    format: OutputFormat,
+    no_cache: bool,
+    no_snippets: bool,
+    include_repo_roots: bool,
+}
+
+const USAGE_EXIT_CODE: u8 = 64;
+
 const STARTER_CONFIG: &str = r#"# Laine cross-repository impact analyzer configuration
 version = 1
 
@@ -241,7 +258,10 @@ version = 1
 
 // Interpreta los argumentos y ejecuta el comando seleccionado.
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = match parse_cli() {
+        Ok(cli) => cli,
+        Err(exit) => return exit,
+    };
 
     match cli.command {
         Commands::Init {
@@ -311,18 +331,32 @@ fn main() -> ExitCode {
             format,
             no_cache,
             no_snippets,
+            include_repo_roots,
         } => {
+            let output = AnalysisOutput {
+                format,
+                no_cache,
+                no_snippets,
+                include_repo_roots,
+            };
             let cwd = match env::current_dir() {
                 Ok(dir) => dir,
                 Err(err) => {
-                    eprintln!("Failed to determine current directory: {err}");
+                    print_analysis_error(
+                        "Check",
+                        &LaineError::Io {
+                            path: PathBuf::from("."),
+                            source: err,
+                        },
+                        output,
+                    );
                     return ExitCode::FAILURE;
                 }
             };
             let registry_path = match WorkspaceRegistry::default_path() {
                 Ok(p) => p,
                 Err(err) => {
-                    eprintln!("Workspace registry error: {err}");
+                    print_analysis_error("Check", &err, output);
                     return ExitCode::FAILURE;
                 }
             };
@@ -335,20 +369,20 @@ fn main() -> ExitCode {
             ) {
                 Ok(ctx) => ctx,
                 Err(err) => {
-                    print_analysis_error("Check", &err, no_snippets);
+                    print_analysis_error("Check", &err, output);
                     return ExitCode::FAILURE;
                 }
             };
 
             let effective_head = if staged { STAGED_REV.to_string() } else { head };
             execute_analysis(
-                resolved.config_path,
-                resolved.repo_name,
-                base,
-                effective_head,
-                format,
-                no_cache,
-                no_snippets,
+                AnalyzeRequest {
+                    config_path: resolved.config_path,
+                    target_repo: resolved.repo_name,
+                    base_rev: base,
+                    head_rev: effective_head,
+                },
+                output,
             )
         }
         Commands::Analyze {
@@ -359,7 +393,60 @@ fn main() -> ExitCode {
             format,
             no_cache,
             no_snippets,
-        } => execute_analysis(config, repo, base, head, format, no_cache, no_snippets),
+            include_repo_roots,
+        } => execute_analysis(
+            AnalyzeRequest {
+                config_path: config,
+                target_repo: repo,
+                base_rev: base,
+                head_rev: head,
+            },
+            AnalysisOutput {
+                format,
+                no_cache,
+                no_snippets,
+                include_repo_roots,
+            },
+        ),
+    }
+}
+
+// Conserva la ayuda normal de Clap y distingue el uso inválido del bloqueo de política.
+fn parse_cli() -> Result<Cli, ExitCode> {
+    let args = env::args_os().collect::<Vec<_>>();
+    match Cli::try_parse_from(&args) {
+        Ok(cli) => Ok(cli),
+        Err(error) => {
+            let analysis = args
+                .get(1)
+                .is_some_and(|command| command == "analyze" || command == "check");
+            if !analysis || !error.use_stderr() {
+                let _ = error.print();
+                return Err(ExitCode::from(error.exit_code() as u8));
+            }
+
+            let mut args = args.iter().skip(2).take_while(|arg| *arg != "--");
+            let mut json = false;
+            while let Some(arg) = args.next() {
+                if arg == "--format=json"
+                    || (arg == "--format" && args.next().is_some_and(|value| value == "json"))
+                {
+                    json = true;
+                    break;
+                }
+            }
+            if json {
+                print_json_error(
+                    USAGE_EXIT_CODE,
+                    "invalid_arguments",
+                    "check_command_help",
+                    "Invalid analysis arguments. Run the command with --help.",
+                );
+            } else {
+                let _ = error.print();
+            }
+            Err(ExitCode::from(USAGE_EXIT_CODE))
+        }
     }
 }
 
@@ -927,40 +1014,34 @@ fn filter_selected_repos(
     Ok(selected)
 }
 
-// Imprime el análisis filtrado por privacidad y devuelve el código de su política.
-fn execute_analysis(
-    config: PathBuf,
-    repo: String,
-    base: String,
-    head: String,
-    format: OutputFormat,
-    no_cache: bool,
-    no_snippets: bool,
-) -> ExitCode {
+// Imprime el resultado del análisis o un error estructurado para el formato solicitado.
+fn execute_analysis(req: AnalyzeRequest, output: AnalysisOutput) -> ExitCode {
     let started = Instant::now();
-    let req = AnalyzeRequest {
-        config_path: config,
-        target_repo: repo,
-        base_rev: base,
-        head_rev: head,
-    };
-
-    match run_analysis_with_options(&req, no_cache) {
+    match run_analysis_with_local_paths(
+        &req,
+        output.no_cache,
+        output.include_repo_roots && matches!(output.format, OutputFormat::Json),
+    ) {
         Ok(mut report) => {
-            if no_snippets {
+            if output.no_snippets {
                 omit_snippets(&mut report);
             }
             let elapsed_ms = started.elapsed().as_millis();
-            let exit_code = report.policy.as_ref().map_or(1, |policy| policy.exit_code);
+            let exit_code = report.exit_code.unwrap_or(1);
 
-            match format {
+            match output.format {
                 OutputFormat::Terminal => {
                     print!("{}", render_terminal(&report, elapsed_ms));
                 }
                 OutputFormat::Json => match render_json(&report) {
                     Ok(json) => println!("{json}"),
-                    Err(err) => {
-                        eprintln!("Failed to serialize JSON report: {err}");
+                    Err(_) => {
+                        print_json_error(
+                            1,
+                            "report_serialization_failed",
+                            "verify_laine_installation",
+                            "Analysis succeeded but JSON could not be generated.",
+                        );
                         return ExitCode::FAILURE;
                     }
                 },
@@ -972,17 +1053,64 @@ fn execute_analysis(
             ExitCode::from(exit_code)
         }
         Err(err) => {
-            print_analysis_error("Analysis", &err, no_snippets);
+            print_analysis_error("Analysis", &err, output);
             ExitCode::FAILURE
         }
     }
 }
 
-// Evita que un error con texto de entrada termine en un reporte compartido.
-fn print_analysis_error(command: &str, error: &impl std::fmt::Display, no_snippets: bool) {
-    if no_snippets {
+// Traduce los errores de análisis a un código y una acción estables sin filtrar texto de entrada.
+fn print_analysis_error(command: &str, error: &LaineError, output: AnalysisOutput) {
+    if matches!(output.format, OutputFormat::Json) {
+        let (code, remediation, message) = match error {
+            LaineError::Io { .. } => (
+                "input_io_error",
+                "check_input_paths",
+                "An analysis input could not be read. Verify the configuration path and file access.",
+            ),
+            LaineError::ConfigParse(_) => (
+                "invalid_config_syntax",
+                "repair_workspace_toml",
+                "The workspace TOML could not be parsed.",
+            ),
+            LaineError::ConfigInvalid(_) => (
+                "invalid_workspace_config",
+                "check_workspace_selection",
+                "Verify the workspace configuration and choose a configured producer with --repo.",
+            ),
+            LaineError::Git { .. } => (
+                "git_snapshot_error",
+                "check_git_revisions",
+                "Verify that the repositories and Git revisions are available locally.",
+            ),
+            LaineError::OpenApiParse(_) => (
+                "invalid_openapi_document",
+                "repair_openapi_document",
+                "The producer OpenAPI document could not be analyzed.",
+            ),
+            LaineError::Cache(_) => (
+                "cache_error",
+                "retry_without_cache",
+                "Retry the analysis with --no-cache or check the cache directory.",
+            ),
+        };
+        print_json_error(1, code, remediation, message);
+    } else if output.no_snippets {
         eprintln!("{command} failed. Run locally without --no-snippets for details.");
     } else {
         eprintln!("{command} error: {error}");
     }
+}
+
+// Emite un solo documento JSON en stdout para errores de uso o análisis.
+fn print_json_error(exit_code: u8, code: &str, remediation: &str, message: &str) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": 1,
+            "status": "error",
+            "exit_code": exit_code,
+            "diagnostics": [{ "code": code, "remediation": remediation, "message": message }],
+        })
+    );
 }

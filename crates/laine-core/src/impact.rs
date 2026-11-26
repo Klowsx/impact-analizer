@@ -181,6 +181,8 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
         policy: None,
         coverage: None,
         diagnostics: Vec::new(),
+        exit_code: None,
+        workspace: None,
         stats: input.stats,
         findings,
         unresolved_calls,

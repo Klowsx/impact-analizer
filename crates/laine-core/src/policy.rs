@@ -165,6 +165,8 @@ mod tests {
             policy: None,
             coverage: None,
             diagnostics: Vec::new(),
+            exit_code: None,
+            workspace: None,
             base_rev: "base".into(),
             head_rev: "head".into(),
             stats: AnalysisStats::default(),

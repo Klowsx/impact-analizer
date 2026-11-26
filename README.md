@@ -118,11 +118,13 @@ laine workspace add corporativo ./laine.corporativo.toml
 laine workspace edit corporativo
 laine workspace list
 
-# Run zero-flag impact checks from inside any registered repository (defaults to HEAD -> WORKTREE)
+# Run zero-flag impact checks from inside a registered producer (defaults to HEAD -> WORKTREE)
 cd ./projects/cerebro-web
 laine check
 laine check --staged
 ```
+
+From a consumer-only checkout, `laine check` prints commands for the producers configured in its workspace. For example, run `laine check --workspace corporativo --repo cerebro-web` to check the producer.
 
 You can also configure a workspace manually:
 
@@ -133,6 +135,8 @@ laine repo add ./billing-service --base-url http://billing-service
 laine repo add ./laravel-api --framework laravel --base-url https://api.internal
 laine index --config laine.toml
 ```
+
+`repo add` resolves its path from your current directory and saves the Git checkout root. It accepts a subdirectory of an existing checkout.
 
 ---
 

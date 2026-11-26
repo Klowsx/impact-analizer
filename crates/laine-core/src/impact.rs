@@ -12,7 +12,8 @@ pub struct ImpactInput<'a> {
     pub target_repo: &'a str,
     pub base_rev: &'a str,
     pub head_rev: &'a str,
-    pub source_file: &'a str,
+    pub base_source_file: &'a str,
+    pub head_source_file: &'a str,
     pub base_contract: Option<&'a ApiContract>,
     pub head_contract: Option<&'a ApiContract>,
     /// Optional exact `(file, line)` source locations for code-extracted routes keyed by
@@ -205,15 +206,15 @@ fn producer_sources(
         response_type || matches!(change, ContractChange::RequestFieldTypeChanged { .. });
     let base_first = removed || response_type;
     let evidence = |base| {
-        let (contract, revision) = if base {
-            (input.base_contract, input.base_rev)
+        let (contract, revision, file) = if base {
+            (input.base_contract, input.base_rev, input.base_source_file)
         } else {
-            (input.head_contract, input.head_rev)
+            (input.head_contract, input.head_rev, input.head_source_file)
         };
         let mut result = ProducerEvidence {
             repo: input.target_repo.to_string(),
             revision: revision.to_owned(),
-            file: input.source_file.to_owned(),
+            file: file.to_owned(),
             description: producer_description(change, base),
             ..ProducerEvidence::default()
         };
@@ -344,7 +345,8 @@ paths:
                 target_repo: "customer-service",
                 base_rev: "base000",
                 head_rev: "head111",
-                source_file: "openapi.yaml",
+                base_source_file: "openapi.yaml",
+                head_source_file: "openapi.yaml",
                 base_contract: None,
                 head_contract: Some(&head_contract),
                 route_locations: BTreeMap::new(),

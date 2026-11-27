@@ -27,6 +27,7 @@ use laine_core::routes::{
     ExtractedRoute, detect_openapi_discrepancies, diff_routes, normalize_route_path,
 };
 use laine_core::workspace::{WorkspaceRegistry, normalize_absolute_path};
+use laine_py::routes::flask_unresolved_mounts;
 use laine_py::{
     PyExtractContext, extract_fastapi_snapshot, extract_flask_routes, extract_python_file,
 };
@@ -1327,12 +1328,34 @@ pub fn catalog_workspace_routes(
         .unwrap_or_default()
 }
 
-// Extracts routes and keeps unresolved mounts tied to the analyzed revision.
+/// Collect route snapshot failures, including Flask mounts, for workspace validation.
+pub fn check_workspace_routes(
+    git: &GitRepo,
+    service_name: &str,
+    revision: &str,
+    route_cfg: &RouteSourceConfig,
+) -> Result<Vec<(String, ExtractionFailure)>> {
+    extract_route_snapshot(git, service_name, revision, route_cfg, true)
+        .map(|(_, extraction)| extraction.failures.into_iter().collect())
+}
+
+// Extract routes while preserving the analysis report's established coverage.
 fn extract_producer_routes(
     git: &GitRepo,
     service_name: &str,
     rev: &str,
     route_cfg: &RouteSourceConfig,
+) -> Result<(Vec<ExtractedRoute>, FileExtraction)> {
+    extract_route_snapshot(git, service_name, rev, route_cfg, false)
+}
+
+// Load one snapshot for the framework and keep failures associated with their source files.
+fn extract_route_snapshot(
+    git: &GitRepo,
+    service_name: &str,
+    rev: &str,
+    route_cfg: &RouteSourceConfig,
+    check_flask_mounts: bool,
 ) -> Result<(Vec<ExtractedRoute>, FileExtraction)> {
     let all_files = git.list_files(rev)?;
     let selected = route_cfg.snapshot_files();
@@ -1395,6 +1418,15 @@ fn extract_producer_routes(
                 }
             }
             return Ok((routes, extraction));
+        }
+        RouteFramework::Flask if check_flask_mounts => {
+            for (file, raw) in batch_contents {
+                if !flask_unresolved_mounts(&raw).is_empty() {
+                    extraction
+                        .record_incomplete(&file, ExtractionFailure::RouteDeclarationUnresolved);
+                }
+            }
+            return Ok((Vec::new(), extraction));
         }
         RouteFramework::Flask => {
             let routes = batch_contents

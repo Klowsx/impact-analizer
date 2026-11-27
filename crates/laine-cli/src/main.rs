@@ -9,12 +9,14 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use laine_cli::engine::{
-    AnalyzeRequest, ConsumerRevision, ConsumersRequest, catalog_workspace_routes, index_workspace,
-    query_endpoint_consumers, run_analysis_with_consumer_revision,
+    AnalyzeRequest, ConsumerRevision, ConsumersRequest, catalog_workspace_routes,
+    check_workspace_routes, index_workspace, query_endpoint_consumers,
+    run_analysis_with_consumer_revision,
 };
 use laine_cli::report::{
     omit_consumers_snippets, omit_snippets, render_consumers_json, render_consumers_markdown,
     render_consumers_terminal, render_json, render_markdown, render_terminal,
+    render_workspace_validation_json, render_workspace_validation_text,
 };
 use laine_core::config::{
     CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
@@ -24,6 +26,10 @@ use laine_core::error::LaineError;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::{GitRepo, STAGED_REV};
 use laine_core::model::HttpMethod;
+use laine_core::validate::{
+    RouteHealthCheck, WorkspaceValidationReport, validate_registry_with,
+    validate_workspace_config_with,
+};
 use laine_core::workspace::{
     ClientAmbiguity, DiscoveredRepo, ResolvedContext, WorkspaceRegistry, build_workspace_config,
     discover_workspace_clients_with, infer_workspace_scan_dir, inspect_repo_path,
@@ -202,6 +208,8 @@ struct ConsumersArgs {
 enum WorkspaceAction {
     /// List registered named workspaces
     List,
+    /// Validate workspace configuration and repository inputs without prompting
+    Validate(WorkspaceValidateArgs),
     /// Register an existing laine.toml under a workspace name
     Add {
         /// Short name for the workspace (e.g. `corporativo`)
@@ -231,6 +239,24 @@ enum WorkspaceAction {
         /// Workspace name to remove
         name: String,
     },
+}
+
+#[derive(Debug, Args)]
+struct WorkspaceValidateArgs {
+    /// Registered workspace name
+    name: Option<String>,
+    /// Validate a workspace TOML file directly
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Validate the registry and every registered workspace
+    #[arg(long, conflicts_with_all = ["name", "config"])]
+    all: bool,
+    /// Report format
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    format: OutputFormat,
+    /// Fail validation when warnings are present
+    #[arg(long)]
+    strict: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -461,12 +487,19 @@ fn parse_cli() -> Result<Cli, ExitCode> {
         Ok(cli) => Ok(cli),
         Err(error) => {
             let command = args.get(1).and_then(|command| command.to_str());
-            if !matches!(command, Some("analyze" | "check" | "consumers")) || !error.use_stderr() {
+            let validation = command == Some("workspace")
+                && args.get(2).is_some_and(|action| action == "validate");
+            if !(validation || matches!(command, Some("analyze" | "check" | "consumers")))
+                || !error.use_stderr()
+            {
                 let _ = error.print();
                 return Err(ExitCode::from(error.exit_code() as u8));
             }
 
-            let mut args = args.iter().skip(2).take_while(|arg| *arg != "--");
+            let mut args = args
+                .iter()
+                .skip(if validation { 3 } else { 2 })
+                .take_while(|arg| *arg != "--");
             let mut json = false;
             while let Some(arg) = args.next() {
                 if arg == "--format=json"
@@ -477,7 +510,9 @@ fn parse_cli() -> Result<Cli, ExitCode> {
                 }
             }
             if json {
-                let message = if command == Some("consumers") {
+                let message = if validation {
+                    "Invalid workspace validation arguments. Run the command with --help."
+                } else if command == Some("consumers") {
                     "Invalid consumers arguments. Run the command with --help."
                 } else {
                     "Invalid analysis arguments. Run the command with --help."
@@ -640,41 +675,45 @@ fn handle_init(
     ExitCode::SUCCESS
 }
 
-// Lee el registro y serializa los cambios de nombres entre procesos.
+// Dispatch validation without requiring the registry for direct config targets.
 fn handle_workspace(action: WorkspaceAction) -> ExitCode {
-    let registry_path = match WorkspaceRegistry::default_path() {
-        Ok(p) => p,
-        Err(err) => {
-            eprintln!("Workspace registry error: {err}");
-            return ExitCode::FAILURE;
+    match (action, WorkspaceRegistry::default_path()) {
+        (WorkspaceAction::Validate(options), registry_path) => {
+            handle_workspace_validate(options, registry_path)
         }
-    };
-
-    match action {
-        WorkspaceAction::List => match WorkspaceRegistry::load_from_path(&registry_path) {
-            Ok(reg) => {
-                if reg.workspaces.is_empty() {
-                    println!(
-                        "No workspaces registered yet ({}).",
-                        registry_path.display()
-                    );
-                } else {
-                    for (name, path) in &reg.workspaces {
-                        println!("{name}\t{}", path.display());
+        (_, Err(err)) => {
+            eprintln!("Workspace registry error: {err}");
+            ExitCode::FAILURE
+        }
+        (WorkspaceAction::List, Ok(registry_path)) => {
+            match WorkspaceRegistry::load_from_path(&registry_path) {
+                Ok(reg) => {
+                    if reg.workspaces.is_empty() {
+                        println!(
+                            "No workspaces registered yet ({}).",
+                            registry_path.display()
+                        );
+                    } else {
+                        for (name, path) in &reg.workspaces {
+                            println!("{name}\t{}", path.display());
+                        }
                     }
+                    ExitCode::SUCCESS
                 }
-                ExitCode::SUCCESS
+                Err(err) => {
+                    eprintln!("Failed to read workspace registry: {err}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(err) => {
-                eprintln!("Failed to read workspace registry: {err}");
-                ExitCode::FAILURE
-            }
-        },
-        WorkspaceAction::Add {
-            name,
-            config,
-            replace,
-        } => {
+        }
+        (
+            WorkspaceAction::Add {
+                name,
+                config,
+                replace,
+            },
+            Ok(registry_path),
+        ) => {
             if !config.is_file() {
                 eprintln!("Config file does not exist: {}", config.display());
                 return ExitCode::FAILURE;
@@ -694,13 +733,16 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
                 }
             }
         }
-        WorkspaceAction::Edit {
-            name,
-            scan,
-            select,
-            all,
-        } => handle_workspace_edit(&name, scan, select, all, &registry_path),
-        WorkspaceAction::Remove { name } => {
+        (
+            WorkspaceAction::Edit {
+                name,
+                scan,
+                select,
+                all,
+            },
+            Ok(registry_path),
+        ) => handle_workspace_edit(&name, scan, select, all, &registry_path),
+        (WorkspaceAction::Remove { name }, Ok(registry_path)) => {
             let Ok(_lock) = lock_cli_update(&registry_path) else {
                 return ExitCode::FAILURE;
             };
@@ -723,6 +765,90 @@ fn handle_workspace(action: WorkspaceAction) -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+// Select the requested validation target and print its report without opening a prompt.
+fn handle_workspace_validate(
+    options: WorkspaceValidateArgs,
+    registry_path: Result<PathBuf, LaineError>,
+) -> ExitCode {
+    let strict = options.strict;
+    let check: Option<&RouteHealthCheck<'_>> = Some(&check_workspace_routes);
+    let report = if let Some(config) = options.config.as_deref() {
+        validate_workspace_config_with(config, None, strict, check)
+    } else if options.name.is_some() || options.all {
+        match registry_path {
+            Ok(path) => validate_registry_with(&path, options.name.as_deref(), strict, check),
+            Err(_) => WorkspaceValidationReport::selection_error(
+                Path::new("workspaces.toml"),
+                options.name.as_deref(),
+                strict,
+                "invalid_registry",
+                "The workspace registry path could not be determined.",
+                "Set LAINE_HOME to the directory containing workspaces.toml.",
+            ),
+        }
+    } else {
+        validate_workspace_from_cwd(registry_path.ok().as_deref(), strict, check)
+    };
+    match options.format {
+        OutputFormat::Terminal => print!("{}", render_workspace_validation_text(&report, false)),
+        OutputFormat::Markdown => print!("{}", render_workspace_validation_text(&report, true)),
+        OutputFormat::Json => match render_workspace_validation_json(&report) {
+            Ok(json) => println!("{json}"),
+            Err(_) => {
+                print_json_error(
+                    1,
+                    "report_serialization_failed",
+                    "verify_laine_installation",
+                    "The workspace validation report could not be serialized to JSON.",
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    }
+    ExitCode::from(report.exit_code)
+}
+
+// Prefer the local file, then use the shared resolver to identify the owning workspace.
+fn validate_workspace_from_cwd(
+    registry_path: Option<&Path>,
+    strict: bool,
+    check: Option<&RouteHealthCheck<'_>>,
+) -> WorkspaceValidationReport {
+    if let Ok(cwd) = env::current_dir() {
+        let local = cwd.join("laine.toml");
+        if local.symlink_metadata().is_ok() {
+            return validate_workspace_config_with(&local, None, strict, check);
+        }
+        if let Some(registry_path) = registry_path
+            && let Ok(context) = resolve_context_from_cwd(&cwd, None, None, None, registry_path)
+        {
+            return validate_workspace_config_with(
+                &context.config_path,
+                context.workspace_name.as_deref(),
+                strict,
+                check,
+            );
+        }
+        // Inspect a nearby config even when it failed to load in the ownership resolver.
+        if let Some(path) = cwd
+            .ancestors()
+            .skip(1)
+            .map(|dir| dir.join("laine.toml"))
+            .find(|path| path.symlink_metadata().is_ok())
+        {
+            return validate_workspace_config_with(&path, None, strict, check);
+        }
+    }
+    WorkspaceValidationReport::selection_error(
+        Path::new("laine.toml"),
+        None,
+        strict,
+        "invalid_workspace_config",
+        "No workspace config could be selected from the current directory.",
+        "Pass --config with a workspace config path or specify a registered workspace name.",
+    )
 }
 
 /// Update a workspace's repositories from an explicit selection or the interactive picker.

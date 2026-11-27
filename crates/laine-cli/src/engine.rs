@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use clap::ValueEnum;
-use laine_core::cache::{IndexCache, compute_config_hash, stable_fingerprint};
+use laine_core::cache::{
+    BlobCacheKey, IndexCache, compute_config_hash, fingerprint_json, stable_fingerprint,
+};
 use laine_core::config::{RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig};
 use laine_core::error::{LaineError, Result};
 use laine_core::git::{GitRepo, STAGED_REV, WORKTREE_REV, to_git_posix_path};
@@ -29,11 +32,17 @@ use laine_core::routes::{
 use laine_core::workspace::{WorkspaceRegistry, normalize_absolute_path};
 use laine_py::routes::flask_unresolved_mounts;
 use laine_py::{
-    PyExtractContext, extract_fastapi_snapshot, extract_flask_routes, extract_python_file,
+    PyExtractContext, PyFileExtraction, extract_fastapi_snapshot, extract_flask_routes,
+    extract_python_file,
 };
+use laine_ts::cross_file::{
+    AxiosModuleFacts, FileAxiosImports, ModuleSummary, extract_module_summary, propagate_summaries,
+    resolve_axios_imports,
+};
+use laine_ts::module_resolver::ResolverConfig;
+use laine_ts::types::ResponseContractReferences;
 use laine_ts::{
     ExtractContext, ModuleResolver, TypeContractModule, TypeContractRegistry,
-    analyze_cross_file_dataflow_with_imports, collect_imported_axios_clients,
     extract_express_snapshot, extract_file_with_imported_axios,
 };
 use rayon::prelude::*;
@@ -125,10 +134,16 @@ struct CachedConsumerRepo {
 }
 
 struct ConsumerInputs {
-    all_files: Vec<String>,
+    blobs: BTreeMap<String, Option<String>>,
     candidates: Vec<String>,
-    configs: BTreeMap<String, String>,
-    sources: BTreeMap<String, String>,
+    config_paths: Vec<String>,
+    source_pool: SourcePool,
+}
+
+#[derive(Default)]
+struct SourcePool {
+    contents: BTreeMap<String, String>,
+    attempted: BTreeSet<String>,
 }
 
 // Keep source and parser memory bounded even when the Rayon pool has many threads.
@@ -148,23 +163,119 @@ enum ConsumerRepoWork {
     },
 }
 
+struct ConsumerExtraction<'a> {
+    git: &'a GitRepo,
+    revision: &'a str,
+    consumer: &'a str,
+    config_hash: &'a str,
+    cache: Option<&'a Mutex<IndexCache>>,
+}
+
+#[derive(Serialize, Deserialize)]
+enum InitialBlobFacts {
+    Config(ResolverConfig),
+    Python(PyFileExtraction),
+    TypeScript {
+        axios: AxiosModuleFacts,
+        contracts: Option<Box<TypeContractModule>>,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct TsBlobFacts {
+    extraction: Option<laine_ts::FileExtraction>,
+    summary: Option<ModuleSummary>,
+    response_references: BTreeMap<usize, ResponseContractReferences>,
+}
+
 impl ConsumerInputs {
-    // Identifica un snapshot mutable por los archivos y contenidos usados para extraerlo.
+    // Identifies mutable snapshots by all paths and the relevant content identities.
     fn cache_key(&self, revision: &str) -> Result<String> {
-        let sources = self
-            .all_files
-            .iter()
-            .map(|path| {
-                let contents = self.sources.get(path).or_else(|| self.configs.get(path));
-                (
-                    path,
-                    contents.map(|text| stable_fingerprint(text.as_bytes())),
-                )
+        Ok(format!("{revision}:{}", fingerprint_json(&self.blobs)?))
+    }
+}
+
+impl ConsumerExtraction<'_> {
+    // Loads a stage in two cache batches and reads only the source still needed by its misses.
+    fn blob_stage<'a, T: Serialize + serde::de::DeserializeOwned + Send>(
+        &self,
+        blobs: &'a BTreeMap<String, Option<String>>,
+        plans: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+        sources: &mut SourcePool,
+        extract: impl Fn(&str, &str) -> T + Sync,
+    ) -> Result<BTreeMap<String, T>> {
+        let keys = plans
+            .filter_map(|(file_path, stage, deps_hash)| {
+                Some(BlobCacheKey {
+                    stage,
+                    file_path,
+                    blob_id: blobs.get(file_path)?.as_deref()?,
+                    deps_hash,
+                })
             })
             .collect::<Vec<_>>();
-        let bytes =
-            serde_json::to_vec(&sources).map_err(|err| LaineError::Cache(err.to_string()))?;
-        Ok(format!("{revision}:{}", stable_fingerprint(&bytes)))
+
+        let cached = self
+            .cache
+            .and_then(|db| {
+                db.lock()
+                    .ok()?
+                    .get_blob_entries_batch(self.consumer, self.config_hash, &keys)
+                    .ok()
+            })
+            .unwrap_or_default();
+        let mut cached = cached.into_iter();
+        let mut facts = BTreeMap::new();
+        let mut misses = Vec::new();
+        for key in keys {
+            match cached
+                .next()
+                .flatten()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+            {
+                Some(value) => {
+                    facts.insert(key.file_path.to_owned(), value);
+                }
+                None => misses.push(key),
+            }
+        }
+
+        let needed = misses
+            .iter()
+            .filter(|key| !sources.attempted.contains(key.file_path))
+            .map(|key| key.file_path.to_owned())
+            .collect::<Vec<_>>();
+        let contents = if self.revision == STAGED_REV {
+            self.git.read_staged_blobs(blobs, &needed)?
+        } else {
+            self.git.read_files_batch(self.revision, &needed)?
+        };
+        sources.attempted.extend(needed);
+        sources.contents.extend(contents);
+
+        let extracted = misses
+            .into_par_iter()
+            .filter_map(|key| {
+                let source = sources.contents.get(key.file_path)?;
+                let value = extract(key.file_path, source);
+                Some((key, value))
+            })
+            .collect::<Vec<_>>();
+        if let Some(db) = self.cache {
+            let payloads = extracted
+                .iter()
+                .filter_map(|(key, value)| Some((*key, serde_json::to_string(value).ok()?)))
+                .collect::<Vec<_>>();
+            if let Ok(db) = db.lock() {
+                let _ = db.put_blob_entries_batch(self.consumer, self.config_hash, &payloads);
+            }
+        }
+        facts.extend(
+            extracted
+                .into_iter()
+                .map(|(key, value)| (key.file_path.to_owned(), value)),
+        );
+        Ok(facts)
     }
 }
 
@@ -177,14 +288,19 @@ struct FileExtraction {
 }
 
 impl FileExtraction {
-    // Cuenta los candidatos y detecta cuáles no llegaron de la lectura por lotes.
+    // Counts the candidates that were available in the batch source read.
     fn from_reads(files: &[String], contents: &BTreeMap<String, String>) -> Self {
+        Self::from_read_status(files, |file| contents.contains_key(file))
+    }
+
+    // Counts files whose contents or portable extraction facts were available.
+    fn from_read_status(files: &[String], was_read: impl Fn(&str) -> bool) -> Self {
         let failures = files
             .iter()
-            .filter(|file| !contents.contains_key(*file))
+            .filter(|file| !was_read(file))
             .map(|file| (file.clone(), ExtractionFailure::FileReadFailed))
             .collect::<BTreeMap<_, _>>();
-        let read = contents.len();
+        let read = files.len() - failures.len();
         Self {
             coverage: FileCoverage {
                 discovered: files.len(),
@@ -789,6 +905,7 @@ fn populate_consumers_into_graph(
         resolve_cache_path(config_path, config.cache_path.as_deref())
             .and_then(|path| IndexCache::open(&path))
             .ok()
+            .map(Mutex::new)
     };
 
     let mut extraction = ConsumerGraphExtraction::default();
@@ -812,7 +929,9 @@ fn populate_consumers_into_graph(
                 let cached = cache
                     .as_ref()
                     .and_then(|db| {
-                        db.get_repo_snapshot(&service.name, &cache_key, &config_hash)
+                        db.lock()
+                            .ok()?
+                            .get_repo_snapshot(&service.name, &cache_key, &config_hash)
                             .ok()
                             .flatten()
                     })
@@ -843,7 +962,14 @@ fn populate_consumers_into_graph(
                         Some(inputs) => inputs,
                         None => load_consumer_inputs(&git, &revision)?,
                     };
-                    (extract_consumer_repo(inputs, config, &service.name), true)
+                    let context = ConsumerExtraction {
+                        git: &git,
+                        revision: &revision,
+                        consumer: &service.name,
+                        config_hash: &config_hash,
+                        cache: cache.as_ref(),
+                    };
+                    (extract_consumer_repo(inputs, config, &context)?, true)
                 }
             };
             Ok((revision, cache_key, snapshot, cache_miss))
@@ -870,7 +996,7 @@ fn populate_consumers_into_graph(
         for (service, result) in services.iter().zip(snapshots) {
             let (revision, cache_key, snapshot, cache_miss) = result?;
             if cache_miss
-                && let Some(db) = cache.as_ref()
+                && let Some(db) = cache.as_ref().and_then(|db| db.lock().ok())
                 && let Ok(payload) = serde_json::to_string(&snapshot)
             {
                 let _ = db.put_repo_snapshot(&service.name, &cache_key, &config_hash, &payload);
@@ -926,7 +1052,7 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
     let config = WorkspaceConfig::load_from_path(config_path)?;
     let config_dir = config_directory(config_path);
     let cache_path = resolve_cache_path(config_path, config.cache_path.as_deref())?;
-    let cache = IndexCache::open(&cache_path)?;
+    let cache = Mutex::new(IndexCache::open(&cache_path)?);
     let config_hash = compute_config_hash(&config);
 
     let mut repos_indexed = 0usize;
@@ -939,6 +1065,8 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
         let head_sha = git.resolve_revision("HEAD")?;
 
         let is_valid_hit = cache
+            .lock()
+            .expect("index cache lock is used by this thread only")
             .get_repo_snapshot(&service.name, &head_sha, &config_hash)?
             .and_then(|raw| serde_json::from_str::<CachedConsumerRepo>(&raw).ok())
             .is_some();
@@ -946,14 +1074,21 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
         if is_valid_hit {
             cache_hits += 1;
         } else {
-            let snapshot = extract_consumer_repo(
-                load_consumer_inputs(&git, &head_sha)?,
-                &config,
-                &service.name,
-            );
+            let context = ConsumerExtraction {
+                git: &git,
+                revision: &head_sha,
+                consumer: &service.name,
+                config_hash: &config_hash,
+                cache: Some(&cache),
+            };
+            let snapshot =
+                extract_consumer_repo(load_consumer_inputs(&git, &head_sha)?, &config, &context)?;
             let payload = serde_json::to_string(&snapshot)
                 .map_err(|err| LaineError::Cache(err.to_string()))?;
-            cache.put_repo_snapshot(&service.name, &head_sha, &config_hash, &payload)?;
+            cache
+                .lock()
+                .expect("index cache lock is used by this thread only")
+                .put_repo_snapshot(&service.name, &head_sha, &config_hash, &payload)?;
             cache_misses += 1;
         }
 
@@ -968,136 +1103,170 @@ pub fn index_workspace(config_path: &Path) -> Result<IndexSummary> {
     })
 }
 
-// Enumera y lee una sola vez los recursos que alimentan al analizador de consumidores.
+// Lists snapshot identities and reads mutable worktree sources once for fingerprinting.
 fn load_consumer_inputs(git: &GitRepo, rev: &str) -> Result<ConsumerInputs> {
-    let all_tracked_files = git.list_files(rev)?;
-    let candidate_files: Vec<String> = all_tracked_files
-        .iter()
-        .filter(|f| is_analyzable_ts_or_js(f) || is_analyzable_python(f))
+    let worktree = rev == WORKTREE_REV;
+    let mut blobs = if worktree {
+        git.list_files(rev)?
+            .into_iter()
+            .map(|path| (path, None))
+            .collect()
+    } else {
+        git.list_file_blobs(rev)?
+    };
+    let candidates: Vec<_> = blobs
+        .keys()
+        .filter(|file| is_analyzable_ts_or_js(file) || is_analyzable_python(file))
         .cloned()
         .collect();
-
-    let tsconfig_files: Vec<String> = all_tracked_files
-        .iter()
-        .filter(|f| is_tsconfig_file(f))
+    let config_paths: Vec<_> = blobs
+        .keys()
+        .filter(|file| is_tsconfig_file(file))
         .cloned()
         .collect();
-    let tsconfig_sources = git.read_files_batch(rev, &tsconfig_files)?;
-
-    let sources = git.read_files_batch(rev, &candidate_files)?;
+    let mut source_pool = SourcePool::default();
+    if worktree {
+        let paths = candidates
+            .iter()
+            .chain(&config_paths)
+            .cloned()
+            .collect::<Vec<_>>();
+        source_pool.contents = git.read_files_batch(rev, &paths)?;
+        source_pool.attempted.extend(paths);
+        for (path, source) in &source_pool.contents {
+            blobs.insert(
+                path.clone(),
+                Some(format!("fp:{}", stable_fingerprint(source.as_bytes()))),
+            );
+        }
+    }
     Ok(ConsumerInputs {
-        all_files: all_tracked_files,
-        candidates: candidate_files,
-        configs: tsconfig_sources,
-        sources,
+        blobs,
+        candidates,
+        config_paths,
+        source_pool,
     })
 }
 
-// Share the loaded sources across type, call, and cross-file passes for this repository.
+// Resolves the repository from portable facts, going back to source only for stage misses.
 fn extract_consumer_repo(
     inputs: ConsumerInputs,
     config: &WorkspaceConfig,
-    consumer: &str,
-) -> CachedConsumerRepo {
-    let clients = config.clients_for_consumer(consumer);
-    let mut extraction = FileExtraction::from_reads(&inputs.candidates, &inputs.sources);
-    let file_contents: Vec<_> = inputs.sources.iter().collect();
-    let mut ts_files: Vec<_> = file_contents
-        .iter()
-        .filter(|(file, _)| is_analyzable_ts_or_js(file))
-        .map(|(file, source)| (file.as_str(), source.as_str()))
-        .collect();
-    let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
-    let resolve_import =
-        |importer: &str, specifier: &str| resolver.resolve_import(importer, specifier);
+    context: &ConsumerExtraction<'_>,
+) -> Result<CachedConsumerRepo> {
+    let ConsumerInputs {
+        blobs,
+        candidates,
+        config_paths,
+        mut source_pool,
+    } = inputs;
+    let clients = config.clients_for_consumer(context.consumer);
     let ts_context = ExtractContext {
         services: &config.services,
         clients: &clients,
         env: &config.env,
     };
-    let axios_imports = collect_imported_axios_clients(&ts_files, ts_context, &resolve_import);
+    let py_context = PyExtractContext {
+        services: &config.services,
+        clients: &clients,
+        env: &config.env,
+    };
 
-    // Pass 1: index response contract declarations and module bindings in parallel.
-    let per_file_types: Vec<_> = ts_files
-        .par_iter()
-        .map(|(file, source)| TypeContractModule::extract(file, source))
-        .collect();
+    let plans = config_paths
+        .iter()
+        .map(|file| (file.as_str(), "ts_config", ""))
+        .chain(candidates.iter().map(|file| {
+            let stage = if is_analyzable_python(file) {
+                "py"
+            } else {
+                "ts_l1"
+            };
+            (file.as_str(), stage, "")
+        }));
+    let initial = context.blob_stage(&blobs, plans, &mut source_pool, |file, source| {
+        if is_tsconfig_file(file) {
+            InitialBlobFacts::Config(ResolverConfig::extract(source))
+        } else if is_analyzable_python(file) {
+            let mut facts = extract_python_file(file, source, py_context);
+            facts.clear_snippets();
+            InitialBlobFacts::Python(facts)
+        } else {
+            let contracts = TypeContractModule::extract(file, source)
+                .ok()
+                .map(|mut module| {
+                    module.clear_snippets();
+                    Box::new(module)
+                });
+            InitialBlobFacts::TypeScript {
+                axios: AxiosModuleFacts::extract(file, source, ts_context),
+                contracts,
+            }
+        }
+    })?;
 
+    let mut extraction =
+        FileExtraction::from_read_status(&candidates, |file| initial.contains_key(file));
     let mut type_registry = TypeContractRegistry::default();
-    for ((file, _), module) in ts_files.iter().zip(per_file_types) {
-        match module {
-            Ok(module) => type_registry.insert((*file).to_owned(), module),
-            Err(_) => extraction.record_parse_failure(file),
+    let mut axios_modules = BTreeMap::new();
+    let mut configs = BTreeMap::new();
+    let mut python = BTreeMap::new();
+    for (file, facts) in initial {
+        match facts {
+            InitialBlobFacts::Config(config) => {
+                configs.insert(file, config);
+            }
+            InitialBlobFacts::Python(facts) => {
+                python.insert(file, facts);
+            }
+            InitialBlobFacts::TypeScript { axios, contracts } => {
+                if let Some(module) = contracts {
+                    type_registry.insert(file.clone(), *module);
+                } else {
+                    extraction.record_parse_failure(&file);
+                }
+                axios_modules.insert(file, axios);
+            }
         }
     }
-
-    // Pass 2 (parallel): extract HTTP calls, direct field reads (CONFIRMED), and generic type contracts (LIKELY).
-    let per_file_extracted: Vec<_> = file_contents
-        .par_iter()
-        .map(|&(file_path, source)| {
-            let mut consumes = Vec::new();
-            let mut field_reads = Vec::new();
-            let mut unresolved = Vec::new();
-
-            if is_analyzable_python(file_path) {
-                let extracted = extract_python_file(
-                    file_path,
-                    source,
-                    PyExtractContext {
-                        services: &config.services,
-                        clients: &clients,
-                        env: &config.env,
-                    },
-                );
-
-                for call in &extracted.calls {
-                    consumes.push(CachedConsumeEdge {
-                        file: file_path.clone(),
-                        target_service: call.service.clone(),
-                        method: call.method,
-                        normalized_path: call.normalized_path.clone(),
-                        line: call.line,
-                        request: call.request.clone(),
-                    });
-                }
-
-                for read in &extracted.field_reads {
-                    if let Some(call) = extracted.calls.get(read.call_id) {
-                        field_reads.push(CachedFieldReadEdge {
-                            file: file_path.clone(),
-                            target_service: call.service.clone(),
-                            method: call.method,
-                            normalized_path: call.normalized_path.clone(),
-                            field_path: read.field_path.clone(),
-                            line: read.line,
-                            call_file: file_path.clone(),
-                            call_line: call.line,
-                            confidence: Confidence::Confirmed,
-                            custom_trace: Vec::new(),
-                        });
-                    }
-                }
-
-                for item in extracted.unresolved_calls {
-                    unresolved.push(CachedUnresolvedCall {
-                        file: file_path.clone(),
-                        line: item.line,
-                        reason: item.reason,
-                    });
-                }
-
-                return Some((consumes, field_reads, unresolved));
-            }
-
-            let Ok(extracted) = extract_file_with_imported_axios(
-                file_path,
+    let resolver =
+        ModuleResolver::from_configs(&blobs.keys().cloned().collect::<Vec<_>>(), &configs);
+    let resolve_import =
+        |importer: &str, specifier: &str| resolver.resolve_import(importer, specifier);
+    let axios_imports = resolve_axios_imports(&axios_modules, &resolve_import);
+    let axios_hashes: BTreeMap<_, _> = if context.cache.is_some() {
+        axios_imports
+            .iter()
+            .map(|(file, imports)| (file.as_str(), imports.fingerprint()))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let axios_hash = |file: &str| axios_hashes.get(file).map_or("", String::as_str);
+    let ts_facts = context.blob_stage(
+        &blobs,
+        axios_modules
+            .keys()
+            .map(|file| (file.as_str(), "ts_l2", axios_hash(file))),
+        &mut source_pool,
+        |file, source| {
+            extract_ts_blob(
+                file,
                 source,
                 ts_context,
-                axios_imports.get(file_path),
-            ) else {
-                return None;
-            };
+                axios_imports.get(file),
+                !extraction.failures.contains_key(file),
+            )
+        },
+    )?;
 
+    // Compose per-file evidence and resolve response contracts against the current snapshot.
+    let mut consumes = Vec::new();
+    let mut field_reads = Vec::new();
+    let mut unresolved_calls = Vec::new();
+    let mut summaries = BTreeMap::new();
+    let mut ts_facts = ts_facts;
+    for file_path in &candidates {
+        if let Some(extracted) = python.remove(file_path) {
             for call in &extracted.calls {
                 consumes.push(CachedConsumeEdge {
                     file: file_path.clone(),
@@ -1107,28 +1276,6 @@ fn extract_consumer_repo(
                     line: call.line,
                     request: call.request.clone(),
                 });
-
-                if let Some(ref response_type) = call.response_type {
-                    for (type_file, field_def) in type_registry.resolve_fields(
-                        file_path,
-                        response_type,
-                        call.response_type_is_schema,
-                        &resolver,
-                    ) {
-                        field_reads.push(CachedFieldReadEdge {
-                            file: type_file,
-                            target_service: call.service.clone(),
-                            method: call.method,
-                            normalized_path: call.normalized_path.clone(),
-                            field_path: field_def.field_path,
-                            line: field_def.line,
-                            call_file: file_path.clone(),
-                            call_line: call.line,
-                            confidence: Confidence::Likely,
-                            custom_trace: Vec::new(),
-                        });
-                    }
-                }
             }
 
             for read in &extracted.field_reads {
@@ -1149,58 +1296,134 @@ fn extract_consumer_repo(
             }
 
             for item in extracted.unresolved_calls {
-                unresolved.push(CachedUnresolvedCall {
+                unresolved_calls.push(CachedUnresolvedCall {
                     file: file_path.clone(),
                     line: item.line,
                     reason: item.reason,
                 });
             }
 
-            Some((consumes, field_reads, unresolved))
-        })
-        .collect();
+            continue;
+        }
 
-    let mut consumes = Vec::new();
-    let mut field_reads = Vec::new();
-    let mut unresolved_calls = Vec::new();
+        let Some(facts) = ts_facts.remove(file_path) else {
+            continue;
+        };
+        let Some(extracted) = facts.extraction else {
+            extraction.record_parse_failure(file_path);
+            continue;
+        };
+        if let Some(summary) = facts.summary {
+            summaries.insert(file_path.clone(), summary);
+        }
 
-    for ((file, _), result) in file_contents.iter().zip(per_file_extracted) {
-        if let Some((file_consumes, file_reads, file_unresolved)) = result {
-            consumes.extend(file_consumes);
-            field_reads.extend(file_reads);
-            unresolved_calls.extend(file_unresolved);
-        } else {
-            extraction.record_parse_failure(file);
+        for call in &extracted.calls {
+            consumes.push(CachedConsumeEdge {
+                file: file_path.clone(),
+                target_service: call.service.clone(),
+                method: call.method,
+                normalized_path: call.normalized_path.clone(),
+                line: call.line,
+                request: call.request.clone(),
+            });
+
+            if let Some(references) = facts.response_references.get(&call.id) {
+                for (type_file, field_def) in
+                    type_registry.resolve_references(file_path, references, &resolver)
+                {
+                    field_reads.push(CachedFieldReadEdge {
+                        file: type_file,
+                        target_service: call.service.clone(),
+                        method: call.method,
+                        normalized_path: call.normalized_path.clone(),
+                        field_path: field_def.field_path,
+                        line: field_def.line,
+                        call_file: file_path.clone(),
+                        call_line: call.line,
+                        confidence: Confidence::Likely,
+                        custom_trace: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        for read in &extracted.field_reads {
+            if let Some(call) = extracted.calls.get(read.call_id) {
+                field_reads.push(CachedFieldReadEdge {
+                    file: file_path.clone(),
+                    target_service: call.service.clone(),
+                    method: call.method,
+                    normalized_path: call.normalized_path.clone(),
+                    field_path: read.field_path.clone(),
+                    line: read.line,
+                    call_file: file_path.clone(),
+                    call_line: call.line,
+                    confidence: Confidence::Confirmed,
+                    custom_trace: Vec::new(),
+                });
+            }
+        }
+
+        for item in extracted.unresolved_calls {
+            unresolved_calls.push(CachedUnresolvedCall {
+                file: file_path.clone(),
+                line: item.line,
+                reason: item.reason,
+            });
         }
     }
 
-    // Pass 3: Summary-based cross-file interprocedural dataflow across TS/JS/Vue modules
-    // (`services/` -> `hooks`/`composables`/`stores` -> `components/`, JSX props, `useQuery`, etc.).
-    ts_files.retain(|(file, _)| !extraction.failures.contains_key(*file));
-    if !ts_files.is_empty() {
-        let cross = analyze_cross_file_dataflow_with_imports(
-            &ts_files,
-            ts_context,
-            &resolve_import,
-            &axios_imports,
-        );
-        for file in cross.limited_files {
-            extraction.record_incomplete(&file, ExtractionFailure::DataflowLimitReached);
-        }
-        for item in cross.field_reads {
-            field_reads.push(CachedFieldReadEdge {
-                file: item.read_file,
-                target_service: item.service,
-                method: item.method,
-                normalized_path: item.normalized_path,
-                field_path: item.field_path,
-                line: item.read_line,
-                call_file: item.origin_file,
-                call_line: item.origin_line,
-                confidence: item.confidence,
-                custom_trace: item.trace,
-            });
-        }
+    // Propagate summaries in memory and run the source-dependent pass only on misses.
+    let propagated = propagate_summaries(&summaries, &resolve_import);
+    let pass3_hashes: BTreeMap<_, _> = summaries
+        .iter()
+        .filter(|(_, summary)| summary.has_imports())
+        .map(|(file, summary)| {
+            let hash = if context.cache.is_some() {
+                propagated.consumer_fingerprint(file, summary, axios_hash(file), &resolve_import)
+            } else {
+                String::new()
+            };
+            (file, hash)
+        })
+        .collect();
+    let per_file_reads = context.blob_stage(
+        &blobs,
+        pass3_hashes
+            .iter()
+            .map(|(file, hash)| (file.as_str(), "ts_l3", hash.as_str())),
+        &mut source_pool,
+        |file, source| {
+            let mut reads = propagated.consumer_reads(
+                file,
+                source,
+                ts_context,
+                &summaries[file],
+                &resolve_import,
+            );
+            for read in &mut reads {
+                read.read_snippet.clear();
+            }
+            reads
+        },
+    )?;
+    let cross = propagated.finish(per_file_reads.into_values().flatten().collect());
+    for file in cross.limited_files {
+        extraction.record_incomplete(&file, ExtractionFailure::DataflowLimitReached);
+    }
+    for item in cross.field_reads {
+        field_reads.push(CachedFieldReadEdge {
+            file: item.read_file,
+            target_service: item.service,
+            method: item.method,
+            normalized_path: item.normalized_path,
+            field_path: item.field_path,
+            line: item.read_line,
+            call_file: item.origin_file,
+            call_line: item.origin_line,
+            confidence: item.confidence,
+            custom_trace: item.trace,
+        });
     }
 
     consumes.sort_by(|a, b| {
@@ -1248,15 +1471,55 @@ fn extract_consumer_repo(
     unresolved_calls
         .sort_by(|a, b| (&a.file, a.line, &a.reason).cmp(&(&b.file, b.line, &b.reason)));
 
-    CachedConsumerRepo {
+    Ok(CachedConsumerRepo {
         extraction,
         consumes,
         field_reads,
         unresolved_calls,
+    })
+}
+
+// Extracts Axios-dependent facts and removes original lines and type expressions before caching.
+fn extract_ts_blob(
+    file: &str,
+    source: &str,
+    context: ExtractContext<'_>,
+    axios: Option<&FileAxiosImports>,
+    summarize: bool,
+) -> TsBlobFacts {
+    let mut extraction = extract_file_with_imported_axios(file, source, context, axios).ok();
+    let mut response_references = BTreeMap::new();
+    let mut summary = None;
+    if let Some(facts) = extraction.as_mut() {
+        for call in &mut facts.calls {
+            call.snippet.clear();
+            if let Some(expression) = call.response_type.take() {
+                response_references.insert(
+                    call.id,
+                    ResponseContractReferences::extract(&expression, call.response_type_is_schema),
+                );
+            }
+        }
+        for read in &mut facts.field_reads {
+            read.snippet.clear();
+        }
+        for unresolved in &mut facts.unresolved_calls {
+            unresolved.snippet.clear();
+        }
+        if summarize {
+            let mut module = extract_module_summary(file, source, context, axios);
+            module.clear_snippets();
+            summary = Some(module);
+        }
+    }
+    TsBlobFacts {
+        extraction,
+        summary,
+        response_references,
     }
 }
 
-// Genera descripciones a partir de los hechos y conserva la ubicación de cada evidencia.
+// Builds evidence descriptions from extracted facts and preserves each source location.
 fn apply_cached_consumer_repo(
     service_name: &str,
     consumer_rev: &str,

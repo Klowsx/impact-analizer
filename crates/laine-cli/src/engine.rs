@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use laine_core::cache::{IndexCache, compute_config_hash, stable_fingerprint};
-use laine_core::config::{RouteFramework, RouteSourceConfig, WorkspaceConfig};
+use laine_core::config::{RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig};
 use laine_core::error::{LaineError, Result};
 use laine_core::git::{GitRepo, STAGED_REV, WORKTREE_REV};
 use laine_core::graph::DependencyGraph;
@@ -113,6 +113,23 @@ struct ConsumerInputs {
     candidates: Vec<String>,
     configs: BTreeMap<String, String>,
     sources: BTreeMap<String, String>,
+}
+
+// Keep source and parser memory bounded even when the Rayon pool has many threads.
+const CONSUMER_REPO_BATCH_SIZE: usize = 2;
+
+struct ConsumerRepoJob {
+    revision: String,
+    cache_key: String,
+    work: ConsumerRepoWork,
+}
+
+enum ConsumerRepoWork {
+    Cached(CachedConsumerRepo),
+    Extract {
+        git: GitRepo,
+        inputs: Option<ConsumerInputs>,
+    },
 }
 
 impl ConsumerInputs {
@@ -461,72 +478,107 @@ pub fn run_analysis_with_consumer_revision(
 
     let mut unresolved_calls = Vec::new();
     let mut consumer_revisions = BTreeMap::new();
-    for service in &config.services {
-        graph.add_repository(&service.name);
-        let consumer_path = resolve_repo_path(config_dir, &service.path);
-        let consumer_git = GitRepo::new(&consumer_path);
-        let consumer_rev = consumer_git.resolve_revision(consumer_revision.git_revision())?;
-        consumer_revisions.insert(service.name.clone(), consumer_rev.clone());
-        let mutable_inputs =
-            if cache.is_some() && !matches!(consumer_revision, ConsumerRevision::Head) {
-                Some(load_consumer_inputs(&consumer_git, &consumer_rev)?)
-            } else {
-                None
-            };
-        let cache_key = if let Some(inputs) = &mutable_inputs {
-            inputs.cache_key(&consumer_rev)?
-        } else {
-            consumer_rev.clone()
-        };
-
-        let cached_snapshot = cache
-            .as_ref()
-            .and_then(|cache_db| {
-                cache_db
-                    .get_repo_snapshot(&service.name, &cache_key, &config_hash)
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|raw| serde_json::from_str::<CachedConsumerRepo>(&raw).ok());
-
-        let snapshot = match cached_snapshot {
-            Some(hit) => hit,
-            None => {
-                let inputs = match mutable_inputs {
-                    Some(inputs) => inputs,
-                    None => load_consumer_inputs(&consumer_git, &consumer_rev)?,
+    for services in config.services.chunks(CONSUMER_REPO_BATCH_SIZE) {
+        // Read cache entries on this thread. Mutable snapshots reuse the inputs hashed for their key.
+        let jobs: Vec<_> = services
+            .iter()
+            .map(|service| {
+                let git = GitRepo::new(resolve_repo_path(config_dir, &service.path));
+                let revision = git.resolve_revision(consumer_revision.git_revision())?;
+                let inputs =
+                    if cache.is_some() && !matches!(consumer_revision, ConsumerRevision::Head) {
+                        Some(load_consumer_inputs(&git, &revision)?)
+                    } else {
+                        None
+                    };
+                let cache_key = match &inputs {
+                    Some(inputs) => inputs.cache_key(&revision)?,
+                    None => revision.clone(),
                 };
-                let extracted = extract_consumer_repo(inputs, &config, &service.name);
-                if let Some(cache_db) = cache.as_ref()
-                    && let Ok(payload) = serde_json::to_string(&extracted)
-                {
-                    // Los resultados se pueden usar aunque solo falle su persistencia.
-                    let _ = cache_db.put_repo_snapshot(
-                        &service.name,
-                        &cache_key,
-                        &config_hash,
-                        &payload,
-                    );
+                let cached = cache
+                    .as_ref()
+                    .and_then(|db| {
+                        db.get_repo_snapshot(&service.name, &cache_key, &config_hash)
+                            .ok()
+                            .flatten()
+                    })
+                    .and_then(|raw| serde_json::from_str::<CachedConsumerRepo>(&raw).ok());
+                let work = match cached {
+                    Some(snapshot) => ConsumerRepoWork::Cached(snapshot),
+                    None => ConsumerRepoWork::Extract { git, inputs },
+                };
+                Ok(ConsumerRepoJob {
+                    revision,
+                    cache_key,
+                    work,
+                })
+            })
+            .collect();
+
+        // Indexed Rayon collection keeps results in configuration order.
+        let extract = |(job, service): (Result<ConsumerRepoJob>, &ServiceConfig)| -> Result<_> {
+            let ConsumerRepoJob {
+                revision,
+                cache_key,
+                work,
+            } = job?;
+            let (snapshot, cache_miss) = match work {
+                ConsumerRepoWork::Cached(snapshot) => (snapshot, false),
+                ConsumerRepoWork::Extract { git, inputs } => {
+                    let inputs = match inputs {
+                        Some(inputs) => inputs,
+                        None => load_consumer_inputs(&git, &revision)?,
+                    };
+                    (extract_consumer_repo(inputs, &config, &service.name), true)
                 }
-                extracted
-            }
+            };
+            Ok((revision, cache_key, snapshot, cache_miss))
+        };
+        let misses = jobs
+            .iter()
+            .filter(|job| {
+                matches!(
+                    job,
+                    Ok(ConsumerRepoJob {
+                        work: ConsumerRepoWork::Extract { .. },
+                        ..
+                    })
+                )
+            })
+            .count();
+        let snapshots: Vec<_> = if misses > 1 {
+            jobs.into_par_iter().zip(services).map(extract).collect()
+        } else {
+            jobs.into_iter().zip(services).map(extract).collect()
         };
 
-        apply_cached_consumer_repo(
-            &service.name,
-            &consumer_rev,
-            &snapshot,
-            &mut graph,
-            &mut unresolved_calls,
-        );
-        files_analyzed += snapshot.extraction.coverage.analyzed;
-        consumers.accumulate(snapshot.extraction.coverage);
-        snapshot.extraction.append_diagnostics(
-            &mut diagnostics,
-            &service.name,
-            &consumer_rev,
-            ExtractionStage::Consumer,
-        );
+        // Persist and apply each snapshot in configuration order before loading the next batch.
+        for (service, result) in services.iter().zip(snapshots) {
+            let (revision, cache_key, snapshot, cache_miss) = result?;
+            if cache_miss
+                && let Some(db) = cache.as_ref()
+                && let Ok(payload) = serde_json::to_string(&snapshot)
+            {
+                let _ = db.put_repo_snapshot(&service.name, &cache_key, &config_hash, &payload);
+            }
+            graph.add_repository(&service.name);
+            apply_cached_consumer_repo(
+                &service.name,
+                &revision,
+                &snapshot,
+                &mut graph,
+                &mut unresolved_calls,
+            );
+            files_analyzed += snapshot.extraction.coverage.analyzed;
+            consumers.accumulate(snapshot.extraction.coverage);
+            snapshot.extraction.append_diagnostics(
+                &mut diagnostics,
+                &service.name,
+                &revision,
+                ExtractionStage::Consumer,
+            );
+            consumer_revisions.insert(service.name.clone(), revision);
+        }
     }
 
     let stats = AnalysisStats {
@@ -659,7 +711,7 @@ fn load_consumer_inputs(git: &GitRepo, rev: &str) -> Result<ConsumerInputs> {
     })
 }
 
-// Extract facts from the snapshot with the HTTP client mappings for this repository.
+// Share the loaded sources across type, call, and cross-file passes for this repository.
 fn extract_consumer_repo(
     inputs: ConsumerInputs,
     config: &WorkspaceConfig,
@@ -667,11 +719,11 @@ fn extract_consumer_repo(
 ) -> CachedConsumerRepo {
     let clients = config.clients_for_consumer(consumer);
     let mut extraction = FileExtraction::from_reads(&inputs.candidates, &inputs.sources);
-    let file_contents: Vec<(String, String)> = inputs.sources.into_iter().collect();
+    let file_contents: Vec<_> = inputs.sources.iter().collect();
     let mut ts_files: Vec<_> = file_contents
         .iter()
         .filter(|(file, _)| is_analyzable_ts_or_js(file))
-        .cloned()
+        .map(|(file, source)| (file.as_str(), source.as_str()))
         .collect();
     let resolver = ModuleResolver::from_git_snapshot(&inputs.all_files, &inputs.configs);
     let resolve_import =
@@ -692,7 +744,7 @@ fn extract_consumer_repo(
     let mut type_registry = TypeContractRegistry::default();
     for ((file, _), module) in ts_files.iter().zip(per_file_types) {
         match module {
-            Ok(module) => type_registry.insert(file.clone(), module),
+            Ok(module) => type_registry.insert((*file).to_owned(), module),
             Err(_) => extraction.record_parse_failure(file),
         }
     }
@@ -700,7 +752,7 @@ fn extract_consumer_repo(
     // Pass 2 (parallel): extract HTTP calls, direct field reads (CONFIRMED), and generic type contracts (LIKELY).
     let per_file_extracted: Vec<_> = file_contents
         .par_iter()
-        .map(|(file_path, source)| {
+        .map(|&(file_path, source)| {
             let mut consumes = Vec::new();
             let mut field_reads = Vec::new();
             let mut unresolved = Vec::new();
@@ -842,7 +894,7 @@ fn extract_consumer_repo(
 
     // Pass 3: Summary-based cross-file interprocedural dataflow across TS/JS/Vue modules
     // (`services/` -> `hooks`/`composables`/`stores` -> `components/`, JSX props, `useQuery`, etc.).
-    ts_files.retain(|(file, _)| !extraction.failures.contains_key(file));
+    ts_files.retain(|(file, _)| !extraction.failures.contains_key(*file));
     if !ts_files.is_empty() {
         let cross = analyze_cross_file_dataflow_with_imports(
             &ts_files,

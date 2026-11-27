@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use laine_core::model::{Confidence, HttpMethod};
+use laine_core::url::{resolve_custom_client_url, resolve_url_with_base};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrowFunctionBody, ArrowFunctionExpression, AssignmentExpression, AssignmentOperator,
@@ -22,10 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::extractor::{ExtractContext, options_http_method};
 use crate::module_resolver::{self, ImportedSymbol, ModuleSymbols};
-use crate::url::{
-    ServiceEndpointMatch, is_absolute_http_url, normalize_relative_path,
-    resolve_url_against_services,
-};
+use crate::url::{ServiceEndpointMatch, resolve_url_against_services};
 use crate::vue::{extract_vue_scripts_with_setup, extract_vue_template_expressions};
 use crate::zod::extract_zod_parse_schema_name;
 
@@ -5292,6 +5290,7 @@ fn classify_http_call_with_lookup(
     }
 }
 
+// Resolve the destination before assigning its response projection for cross-file analysis.
 fn resolve_http_call_target(
     target: &CallTarget,
     url_str: &str,
@@ -5325,14 +5324,9 @@ fn resolve_http_call_target(
             ))
         }
         CallTarget::AxiosInstance { base_url, method } => {
-            let full_url = if is_absolute_http_url(url_str) {
-                url_str.to_string()
-            } else {
-                let base = base_url.trim_end_matches('/');
-                let rel = url_str.trim_start_matches('/');
-                format!("{base}/{rel}")
-            };
-            let matched = resolve_url_against_services(&full_url, ctx.services)?;
+            let matched = resolve_url_with_base(url_str, Ok(base_url), ctx.services)
+                .ok()
+                .flatten()?;
             Some((
                 *method,
                 PayloadProjection::Property {
@@ -5348,14 +5342,14 @@ fn resolve_http_call_target(
             method,
             is_use_fetch,
         } => {
-            let matched = if is_absolute_http_url(url_str) {
-                resolve_url_against_services(url_str, ctx.services)?
-            } else {
-                ServiceEndpointMatch {
-                    service: target_service.clone(),
-                    normalized_path: normalize_relative_path(url_str, path_prefix.as_deref()),
-                }
-            };
+            let matched = resolve_custom_client_url(
+                url_str,
+                target_service,
+                path_prefix.as_deref(),
+                ctx.services,
+            )
+            .ok()
+            .flatten()?;
             let projection = if *is_use_fetch {
                 PayloadProjection::Property {
                     prop: "data".to_string(),

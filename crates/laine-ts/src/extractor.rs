@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
-use laine_core::config::{CustomClientConfig, ServiceConfig, resolve_http_service_url};
+use laine_core::config::{CustomClientConfig, ServiceConfig};
 use laine_core::model::HttpMethod;
 use laine_core::request::{
     Argument as RequestArgument, ArgumentType, HttpRequestEvidence, RequestSection,
 };
+use laine_core::url::{resolve_custom_client_url, resolve_http_service_url, resolve_url_with_base};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, AssignmentExpression, AssignmentOperator, AssignmentTarget, BindingPattern,
@@ -20,7 +21,6 @@ use oxc_span::{GetSpan, SourceType, Span};
 use serde::{Deserialize, Serialize};
 
 use crate::cross_file::FileAxiosImports;
-use crate::url::{is_absolute_http_url, normalize_relative_path};
 use crate::vue::{extract_vue_scripts_with_setup, extract_vue_template_expressions};
 
 const UNMAPPED_ENV: &str = "unmapped environment variable (configure under `[env]` in laine.toml)";
@@ -1175,34 +1175,23 @@ impl<'s> FileExtractor<'s> {
                     CallTarget::Fetch(_) | CallTarget::UseFetch(_) | CallTarget::Axios(_) => {
                         resolve_http_service_url(&url_str, self.ctx.services)
                     }
-                    CallTarget::AxiosInstance { base_url, .. } => {
-                        if is_absolute_http_url(&url_str) {
-                            resolve_http_service_url(&url_str, self.ctx.services)
-                        } else if let Some(base_url) = base_url {
-                            let base = base_url.trim_end_matches('/');
-                            let rel = url_str.trim_start_matches('/');
-                            resolve_http_service_url(&format!("{base}/{rel}"), self.ctx.services)
-                        } else {
-                            Err("Axios instance base URL cannot be resolved statically".into())
-                        }
-                    }
+                    CallTarget::AxiosInstance { base_url, .. } => resolve_url_with_base(
+                        &url_str,
+                        base_url
+                            .as_deref()
+                            .ok_or("Axios instance base URL cannot be resolved statically"),
+                        self.ctx.services,
+                    ),
                     CallTarget::Custom {
                         target_service,
                         path_prefix,
                         ..
-                    } => {
-                        if is_absolute_http_url(&url_str) {
-                            resolve_http_service_url(&url_str, self.ctx.services)
-                        } else {
-                            Ok(Some(crate::url::ServiceEndpointMatch {
-                                service: target_service.clone(),
-                                normalized_path: normalize_relative_path(
-                                    &url_str,
-                                    path_prefix.as_deref(),
-                                ),
-                            }))
-                        }
-                    }
+                    } => resolve_custom_client_url(
+                        &url_str,
+                        target_service,
+                        path_prefix.as_deref(),
+                        self.ctx.services,
+                    ),
                 };
 
                 match matched {

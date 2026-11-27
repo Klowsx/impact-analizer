@@ -1,7 +1,8 @@
-use laine_core::config::{ServiceConfig, resolve_http_service_url};
-pub use laine_core::config::{ServiceEndpointMatch, is_absolute_http_url, normalize_relative_path};
+use laine_core::config::ServiceConfig;
+use laine_core::url::resolve_http_service_url;
+pub use laine_core::url::{ServiceEndpointMatch, is_absolute_http_url, normalize_relative_path};
 
-// Devuelve solo coincidencias únicas para las pasadas que no producen diagnósticos.
+// Return unique matches for passes that do not emit diagnostics.
 pub fn resolve_url_against_services(
     raw_url: &str,
     services: &[ServiceConfig],

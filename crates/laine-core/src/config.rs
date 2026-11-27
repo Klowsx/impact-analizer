@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{LaineError, Result};
 use crate::model::Severity;
+pub use crate::url::{
+    ServiceEndpointMatch, is_absolute_http_url, matching_http_url, normalize_relative_path,
+    resolve_http_service_url,
+};
 
 // Adquiere un bloqueo de escritura compartido por todos los procesos que actualizan un TOML.
 pub fn lock_config_update(path: &Path) -> Result<File> {
@@ -211,93 +215,6 @@ impl WorkspaceConfig {
         });
         scoped.iter().copied().chain(global).cloned().collect()
     }
-}
-
-// Identifica el esquema y el contenido de una URL HTTP(S) absoluta.
-fn http_url_parts(value: &str) -> Option<(&str, &str)> {
-    let (scheme, rest) = value.trim().split_once("://")?;
-    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
-        .then_some((scheme, rest))
-}
-
-// Distingue las URL absolutas de las rutas relativas de clientes configurados.
-pub fn is_absolute_http_url(value: &str) -> bool {
-    http_url_parts(value).is_some()
-}
-
-// Conserva los componentes HTTP necesarios para comparar servicios y rutas de montaje.
-pub fn matching_http_url(value: &str) -> Option<String> {
-    let (scheme, rest) = http_url_parts(value)?;
-
-    // Separa la autoridad antes de quitar el usuario, así un @ en la ruta queda intacto.
-    let rest = rest.split(['?', '#']).next()?.trim_end();
-    let (authority, path) = rest.find('/').map_or((rest, ""), |i| rest.split_at(i));
-    let host = authority.rsplit('@').next()?;
-    if host.is_empty() || authority.contains('\\') || authority.contains(char::is_whitespace) {
-        return None;
-    }
-    Some(format!("{}://{host}{path}", scheme.to_ascii_lowercase()))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServiceEndpointMatch {
-    pub service: String,
-    pub normalized_path: String,
-}
-
-// Resuelve el montaje más específico y deja como ambiguos los empates entre servicios.
-pub fn resolve_http_service_url(
-    raw_url: &str,
-    services: &[ServiceConfig],
-) -> std::result::Result<Option<ServiceEndpointMatch>, String> {
-    let Some(url) = matching_http_url(raw_url) else {
-        return Ok(None);
-    };
-    let mut names = BTreeSet::new();
-    let mut longest = 0;
-    for service in services {
-        for base in &service.base_urls {
-            let Some(base) = matching_http_url(base) else {
-                continue;
-            };
-            let base = base.trim_end_matches('/');
-            if base.len() >= longest
-                && url
-                    .strip_prefix(base)
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-            {
-                if base.len() > longest {
-                    longest = base.len();
-                    names.clear();
-                }
-                names.insert(service.name.as_str());
-            }
-        }
-    }
-
-    match names.len() {
-        0 => Ok(None),
-        1 => Ok(names.first().map(|name| ServiceEndpointMatch {
-            service: (*name).to_string(),
-            normalized_path: normalize_relative_path(&url[longest..], None),
-        })),
-        _ => Err(format!(
-            "ambiguous service base URL (candidates: {})",
-            names.into_iter().collect::<Vec<_>>().join(", ")
-        )),
-    }
-}
-
-// Normaliza una ruta de cliente y aplica el prefijo configurado cuando existe.
-pub fn normalize_relative_path(raw_path: &str, path_prefix: Option<&str>) -> String {
-    let path = raw_path.split(['?', '#']).next().unwrap_or(raw_path).trim();
-    let segments = path_prefix
-        .into_iter()
-        .chain([path])
-        .flat_map(|part| part.trim().split('/'))
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    format!("/{}", segments.join("/"))
 }
 
 // Sanea cualquier URL HTTP(S) al reescribir el TOML y conserva ajustes de otros tipos.

@@ -25,7 +25,7 @@ use laine_core::config::{
 use laine_core::error::LaineError;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::{GitRepo, STAGED_REV};
-use laine_core::model::HttpMethod;
+use laine_core::model::{CliErrorDiagnostic, CliErrorReport, HttpMethod};
 use laine_core::validate::{
     RouteHealthCheck, WorkspaceValidationReport, validate_registry_with,
     validate_workspace_config_with,
@@ -1488,15 +1488,20 @@ fn print_analysis_error(command: &str, error: &LaineError, output: AnalysisOutpu
     }
 }
 
-// Emite un solo documento JSON en stdout para errores de uso o análisis.
+// Emit one JSON document on stdout for usage or runtime errors.
 fn print_json_error(exit_code: u8, code: &str, remediation: &str, message: &str) {
-    println!(
-        "{}",
-        serde_json::json!({
-            "schema_version": 1,
-            "status": "error",
-            "exit_code": exit_code,
-            "diagnostics": [{ "code": code, "remediation": remediation, "message": message }],
-        })
-    );
+    let report = CliErrorReport {
+        schema_version: 1,
+        status: "error".into(),
+        exit_code,
+        diagnostics: vec![CliErrorDiagnostic {
+            code: code.into(),
+            remediation: remediation.into(),
+            message: message.into(),
+        }],
+    };
+    // Serialize through a JSON value to preserve the existing object key order.
+    let json =
+        serde_json::to_value(report).expect("CLI errors contain only JSON-compatible fields");
+    println!("{json}");
 }

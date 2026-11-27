@@ -4,6 +4,80 @@ use laine_core::model::{
     AnalysisCoverage, AnalysisReport, Confidence, ContractChange, EndpointConsumersReport,
     ExtractionDiagnostic, ProducerEvidence, Severity,
 };
+use laine_core::validate::{ValidationSeverity, WorkspaceValidationReport};
+
+/// Serialize the workspace validation report as a versioned JSON document.
+pub fn render_workspace_validation_json(
+    report: &WorkspaceValidationReport,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
+}
+
+/// Render validation totals and remediation in terminal or Markdown form.
+pub fn render_workspace_validation_text(
+    report: &WorkspaceValidationReport,
+    markdown: bool,
+) -> String {
+    let mut out = String::new();
+    let title = if markdown { "# " } else { "" };
+    let section = if markdown { "## " } else { "" };
+    let bullet = if markdown { "- " } else { "  " };
+    let status = |valid| if valid { "VALID" } else { "INVALID" };
+    let label = |value: &str| {
+        let value = value.replace(char::is_control, " ");
+        if markdown {
+            format!("`{}`", escape_inline_code(&value))
+        } else {
+            value
+        }
+    };
+    let summary = &report.summary;
+    let _ = writeln!(out, "{title}Workspace Validation\n");
+    let _ = writeln!(
+        out,
+        "{}{}: {} workspace(s), {} service(s), {} error(s), {} warning(s)",
+        status(report.valid),
+        if report.strict { " (strict)" } else { "" },
+        summary.workspaces_checked,
+        summary.services_checked,
+        summary.errors,
+        summary.warnings,
+    );
+    for workspace in &report.workspaces {
+        let path = label(&workspace.config_path);
+        let target = workspace
+            .workspace
+            .as_ref()
+            .map_or_else(|| path.clone(), |name| format!("{} ({path})", label(name)));
+        let _ = writeln!(out, "\n{section}{} {target}\n", status(workspace.valid),);
+        for issue in &workspace.issues {
+            let severity = match issue.severity {
+                ValidationSeverity::Error => "ERROR",
+                ValidationSeverity::Warning => "WARN",
+            };
+            let _ = write!(
+                out,
+                "{bullet}{}",
+                label(&format!("[{severity}] {}", issue.code))
+            );
+            if let Some(service) = &issue.service {
+                let _ = write!(out, " service {}", label(service));
+            }
+            if let Some(field) = &issue.field {
+                let _ = write!(out, " field {}", label(field));
+            }
+            out.push_str(": ");
+            for ch in issue.message.replace(char::is_control, " ").chars() {
+                if markdown && ch.is_ascii_punctuation() {
+                    out.push('\\');
+                }
+                out.push(ch);
+            }
+            let _ = writeln!(out, " Remediation: {}", issue.remediation);
+        }
+    }
+    out
+}
 
 /// Clear evidence snippets while preserving locations and confidence.
 pub fn omit_consumers_snippets(report: &mut EndpointConsumersReport) {

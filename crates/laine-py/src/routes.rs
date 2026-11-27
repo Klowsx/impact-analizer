@@ -148,6 +148,29 @@ pub fn extract_flask_routes(
     routes
 }
 
+/// Report Flask registrations that the single-module extractor cannot resolve.
+pub fn flask_unresolved_mounts(source: &str) -> Vec<usize> {
+    let module = scan_route_module(source, PyRouteStyle::Flask);
+    let known: BTreeSet<_> = module
+        .constructors
+        .iter()
+        .map(|ctor| ctor.name.as_str())
+        .chain(module.decorators.iter().map(|dec| dec.target.as_str()))
+        .collect();
+    module
+        .mounts
+        .into_iter()
+        .filter(|mount| {
+            mount.dynamic_flask_prefix
+                || !mount
+                    .child
+                    .as_deref()
+                    .is_some_and(|child| known.contains(child))
+        })
+        .map(|mount| mount.line)
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PyRouteStyle {
     FastApi,
@@ -187,6 +210,7 @@ struct MountCall {
     parent: String,
     child: Option<String>,
     prefix: Option<String>,
+    dynamic_flask_prefix: bool,
     line: usize,
 }
 
@@ -522,7 +546,7 @@ fn try_parse_router_ctor(
     ))
 }
 
-/// Keeps dynamic FastAPI mount arguments so they can be reported with their source line.
+/// Keeps dynamic mount arguments so validation can report incomplete extraction.
 fn try_parse_mount_call(
     cleaned: &str,
     start: usize,
@@ -559,12 +583,19 @@ fn try_parse_mount_call(
         PyRouteStyle::FastApi => fastapi_prefix(&args),
         PyRouteStyle::Flask => extract_kwarg_string(&args, "url_prefix"),
     };
+    let dynamic_flask_prefix = style == PyRouteStyle::Flask
+        && prefix.is_none()
+        && args.iter().any(|arg| {
+            (arg.name.as_deref() == Some("url_prefix") && arg.value.trim() != "None")
+                || (arg.name.is_none() && arg.value.trim_start().starts_with("**"))
+        });
 
     Some((
         MountCall {
             parent: parent.to_owned(),
             child,
             prefix,
+            dynamic_flask_prefix,
             line,
         },
         close_paren + 1,

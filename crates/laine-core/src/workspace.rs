@@ -94,6 +94,11 @@ impl WorkspaceRegistry {
         if !path.exists() {
             return Ok(Self::empty());
         }
+        Self::read_from_path(path)
+    }
+
+    /// Read an existing registry, including its version check.
+    pub(crate) fn read_from_path(path: &Path) -> Result<Self> {
         let raw = fs::read_to_string(path).map_err(|source| LaineError::Io {
             path: path.to_path_buf(),
             source,

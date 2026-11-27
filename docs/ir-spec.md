@@ -61,14 +61,16 @@ Field matching is prefix-aware: if a parent object field (`address`) is removed 
 
 ## 3. JSON Report Schema (`schema_version: 1`)
 
+The [official IR v1 JSON Schema](../schemas/ir-v1.schema.json) uses Draft 2020-12 and validates both `AnalysisReport` and `CliErrorReport` from `laine analyze` and `laine check`.
+
 ### 3.1 Top-Level Object: `AnalysisReport`
 
 | Field | JSON Type | Required | Serialization Rules | Description |
 |---|---|---|---|---|
 | `schema_version` | `integer` (`u32`) | Yes | Always `1` for this specification | Major schema version for forward/backward compatibility. |
 | `target_repo` | `string` | Yes | — | Name of the producer repository whose diff was analyzed. |
-| `base_rev` | `string` | Yes | Resolved 40-character Git commit SHA, or the `WORKTREE` / `STAGED` pseudo-revision | Base snapshot before the change. |
-| `head_rev` | `string` | Yes | Resolved 40-character Git commit SHA, or the `WORKTREE` / `STAGED` pseudo-revision | Head snapshot after the change. |
+| `base_rev` | `string` | Yes | Resolved Git commit ID or the `WORKTREE` / `STAGED` pseudo-revision | Base snapshot before the change. |
+| `head_rev` | `string` | Yes | Resolved Git commit ID or the `WORKTREE` / `STAGED` pseudo-revision | Head snapshot after the change. |
 | `policy` | `object` | For CLI analysis | Omitted by reports produced without workspace policy | The policy decision for the reported findings and unresolved calls. |
 | `exit_code` | `integer` | For CLI analysis | `0` or `2`, matching the process | The effective exit code of a completed analysis. |
 | `workspace` | `object` | For CLI analysis | `repo_roots` is present only with `--include-repo-roots` | Local workspace identifier and optional checkout map. |
@@ -88,7 +90,7 @@ Coverage counts discovered, read, analyzed, and failed source files. When a know
 
 `workspace.id` is a stable identifier for the resolved configuration path on the local machine. Evidence paths are relative to their repositories. Add `--include-repo-roots` to a JSON analysis to map those repository names to absolute local checkouts.
 
-`base_rev` and `head_rev` contain the revisions resolved by the CLI. Git refs such as `main`, `HEAD`, tags, and abbreviated SHAs are reported as full 40-character commit SHAs. The local pseudo-revisions are preserved as uppercase `WORKTREE` (the current on-disk files) or `STAGED` (the Git index). For example, a local analysis can report a committed base and a `WORKTREE` head, or a committed base and a `STAGED` head.
+`base_rev` and `head_rev` contain the revisions resolved by the CLI. Git refs such as `main`, `HEAD`, tags, and abbreviated SHAs are reported as full lowercase commit IDs (40 hexadecimal characters for SHA-1 and 64 for SHA-256). The local pseudo-revisions are preserved as uppercase `WORKTREE` (the current on-disk files) or `STAGED` (the Git index). Evidence, extraction diagnostics, and `consumer_revisions` use the same revision format.
 
 ### 3.2 `AnalysisStats`
 
@@ -102,7 +104,7 @@ Coverage counts discovered, read, analyzed, and failed source files. When a know
 ### 3.3 Core Enums
 
 #### `HttpMethod` (`UPPERCASE`)
-`"GET"` | `"POST"` | `"PUT"` | `"PATCH"` | `"DELETE"`
+`"GET"` | `"POST"` | `"PUT"` | `"PATCH"` | `"DELETE"` | `"HEAD"` | `"OPTIONS"` | `"TRACE"`
 
 #### `Confidence` (`UPPERCASE`)
 Ordered from weakest to strongest:
@@ -131,7 +133,7 @@ Ordered from lowest to highest:
 | Field | JSON Type | Description |
 |---|---|---|
 | `repo` | `string` | Repository name containing the evidence. |
-| `revision` | `string` | Resolved 40-char Git commit SHA from which the file blob was read. |
+| `revision` | `string` | Resolved Git commit ID, `WORKTREE`, or `STAGED` for the source file. |
 | `file` | `string` | Repository-relative POSIX path (e.g., `"src/invoices/customer.ts"`). |
 | `line` | `integer` (`usize`) | 1-based line number in the source file. |
 | `snippet` | `string` | Trimmed source line or concise contract description at `line`. |
@@ -212,7 +214,7 @@ Emitted when a producer configures both `openapi` and `routes` in `laine.toml`:
 | Field | JSON Type | Description |
 |---|---|---|
 | `endpoint` | [`EndpointId`](#34-endpointid--evidence) | The mismatched endpoint. |
-| `kind` | `"undocumented_in_openapi"` \| `"missing_in_code"` | `undocumented_in_openapi`: route exists in code but is absent from OpenAPI. `missing_in_code`: endpoint is declared in OpenAPI but not found in extracted route code. |
+| `kind` | `"undocumented_in_open_api"` \| `"missing_in_code"` | `undocumented_in_open_api`: route exists in code but is absent from OpenAPI. `missing_in_code`: endpoint is declared in OpenAPI but not found in extracted route code. |
 | `detail` | `string` | Human-readable explanation including code file and line when applicable. |
 
 ---
@@ -367,7 +369,7 @@ Laine strictly separates **how sure we are** (`Confidence`) from **how severe th
         "method": "POST",
         "normalized_path": "/internal/reindex"
       },
-      "kind": "undocumented_in_openapi",
+      "kind": "undocumented_in_open_api",
       "detail": "Route exposed in src/routes/internal.ts:14 is missing from the OpenAPI contract"
     }
   ]
@@ -402,5 +404,19 @@ Laine enforces strict reproducibility for identical Git snapshots, workspace, `l
 
 1. **Ordered Collections:** OpenAPI endpoints (`BTreeMap<EndpointId, EndpointContract>`), response/request schemas, parameters, code route maps, indirect consumer maps, and deduplicated consumer hits (`BTreeMap`) eliminate `HashMap` iteration randomness.
 2. **Explicit Stable Sorting:** `consumers_of_endpoint`, `transitive_dependent_paths`, and `unresolved_calls` are explicitly sorted by `(repo, file, line, ...)` prior to report assembly.
-3. **Immutable Git Snapshots:** Files are read directly from Git objects (`git show` / `git cat-file --batch`) using resolved 40-char commit SHAs without touching working directories or reading uncommitted state.
+3. **Immutable Git Snapshots:** Files in committed snapshots are read directly from Git objects (`git show` / `git cat-file --batch`) using resolved commit IDs.
 4. **No Volatile Fields:** Timestamps, host-specific absolute paths, and wall-clock durations are excluded from JSON serialization.
+
+## 8. Other Version 1 CLI JSON Reports
+
+### 8.1 `laine consumers` (`EndpointConsumersReport`)
+
+`laine consumers --format json` returns `schema_version: 1` and `exit_code: 0` for a completed endpoint lookup. The report identifies the producer snapshot with `service` and `producer_revision`, and records the query in `method`, `queried_path`, `normalized_path`, and optional `field`.
+
+`in_catalog`, `matched_endpoints`, and optional `producer_evidence` describe the producer catalog match. The report includes direct `consumers`, `unresolved_calls`, and optional `indirect_consumers` and `fields_read`. Use `coverage` and optional `diagnostics` to assess source extraction, and `consumer_revisions`, `workspace`, and `stats` to identify the snapshots and scope. An endpoint can be absent from the producer catalog and still have consumer evidence. Runtime or configuration failures and invalid arguments produce a `CliErrorReport` with exit code `1` or `64`, respectively.
+
+### 8.2 `laine workspace validate` (`WorkspaceValidationReport`)
+
+`laine workspace validate --format json` returns `schema_version: 1`, `valid`, `strict`, `exit_code`, aggregate counts in `summary`, and per-target results in `workspaces`. Each entry includes `config_path`, an optional registered `workspace` name, `valid`, `services_checked`, `errors`, `warnings`, and `issues`. Each issue has `severity` (`ERROR` or `WARNING`), `code`, `message`, `remediation`, and optional `service` and `field`.
+
+Validation exits `0` if the selected workspaces pass and `1` if any fail. With `--strict`, warnings also cause failure and retain their `WARNING` severity. Invalid arguments produce a `CliErrorReport` with exit code `64`.

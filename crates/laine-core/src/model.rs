@@ -370,6 +370,23 @@ pub struct AnalysisReport {
     pub discrepancies: Vec<ContractDiscrepancy>,
 }
 
+/// A portable CLI error with a stable code and remediation hint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliErrorDiagnostic {
+    pub code: String,
+    pub remediation: String,
+    pub message: String,
+}
+
+/// The JSON envelope emitted when the CLI cannot produce a command report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliErrorReport {
+    pub schema_version: u32,
+    pub status: String,
+    pub exit_code: u8,
+    pub diagnostics: Vec<CliErrorDiagnostic>,
+}
+
 /// The dependency evidence for an endpoint query against a single producer snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointConsumersReport {

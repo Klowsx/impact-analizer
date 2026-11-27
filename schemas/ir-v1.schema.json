@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Klowsx/impact-analizer/main/schemas/ir-v1.schema.json",
+  "title": "Laine IR v1",
+  "description": "JSON stdout from laine analyze and laine check, including completed analyses and CLI error reports.",
+  "oneOf": [
+    {"$ref": "#/$defs/AnalysisReport"},
+    {"$ref": "#/$defs/CliErrorReport"}
+  ],
+  "$defs": {
+    "AnalysisReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "target_repo",
+        "base_rev",
+        "head_rev",
+        "stats",
+        "findings",
+        "unresolved_calls"
+      ],
+      "properties": {
+        "schema_version": {"const": 1},
+        "target_repo": {"type": "string"},
+        "base_rev": {"$ref": "#/$defs/RevisionIdentifier"},
+        "head_rev": {"$ref": "#/$defs/RevisionIdentifier"},
+        "stats": {"$ref": "#/$defs/AnalysisStats"},
+        "findings": {"type": "array", "items": {"$ref": "#/$defs/ImpactFinding"}},
+        "unresolved_calls": {"type": "array", "items": {"$ref": "#/$defs/UnresolvedCall"}},
+        "policy": {"$ref": "#/$defs/PolicyEvaluation"},
+        "coverage": {"$ref": "#/$defs/AnalysisCoverage"},
+        "diagnostics": {"type": "array", "items": {"$ref": "#/$defs/ExtractionDiagnostic"}},
+        "exit_code": {"enum": [0, 2]},
+        "workspace": {"$ref": "#/$defs/WorkspaceIdentity"},
+        "consumer_revisions": {
+          "type": "object",
+          "additionalProperties": {"$ref": "#/$defs/RevisionIdentifier"}
+        },
+        "discrepancies": {"type": "array", "items": {"$ref": "#/$defs/ContractDiscrepancy"}}
+      }
+    },
+    "CliErrorReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "status", "exit_code", "diagnostics"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "status": {"const": "error"},
+        "exit_code": {"enum": [1, 64]},
+        "diagnostics": {"type": "array", "items": {"$ref": "#/$defs/CliErrorDiagnostic"}, "minItems": 1}
+      }
+    },
+    "CliErrorDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "remediation", "message"],
+      "properties": {
+        "code": {"type": "string"},
+        "remediation": {"type": "string"},
+        "message": {"type": "string"}
+      }
+    },
+    "RevisionIdentifier": {
+      "description": "A full Git commit ID in the repository's object format or a local snapshot identifier.",
+      "oneOf": [
+        {
+          "type": "string",
+          "anyOf": [
+            {"pattern": "^[0-9a-f]{40}$"},
+            {"pattern": "^[0-9a-f]{64}$"}
+          ]
+        },
+        {"enum": ["WORKTREE", "STAGED"]}
+      ]
+    },
+    "HttpMethod": {"enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE"]},
+    "Confidence": {"enum": ["UNKNOWN", "POSSIBLE", "LIKELY", "CONFIRMED"]},
+    "Severity": {"enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+    "DiscrepancyKind": {"enum": ["undocumented_in_open_api", "missing_in_code"]},
+    "ExtractionFailure": {
+      "enum": [
+        "file_read_failed",
+        "file_parse_failed",
+        "dataflow_limit_reached",
+        "route_declaration_unresolved",
+        "open_api_reference_unresolved",
+        "open_api_reference_cycle"
+      ]
+    },
+    "ExtractionStage": {"enum": ["producer_base", "producer_head", "consumer"]},
+    "EndpointId": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["service", "method", "normalized_path"],
+      "properties": {
+        "service": {"type": "string"},
+        "method": {"$ref": "#/$defs/HttpMethod"},
+        "normalized_path": {"type": "string"}
+      }
+    },
+    "Evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "revision", "file", "line", "snippet"],
+      "properties": {
+        "repo": {"type": "string"},
+        "revision": {"$ref": "#/$defs/RevisionIdentifier"},
+        "file": {"type": "string"},
+        "line": {"type": "integer", "minimum": 0},
+        "snippet": {"type": "string"}
+      }
+    },
+    "SourceSpan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["line", "column", "end_line", "end_column"],
+      "properties": {
+        "line": {"type": "integer", "minimum": 0},
+        "column": {"type": "integer", "minimum": 0},
+        "end_line": {"type": "integer", "minimum": 0},
+        "end_column": {"type": "integer", "minimum": 0}
+      }
+    },
+    "ProducerEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "revision", "file", "description", "snippet"],
+      "properties": {
+        "repo": {"type": "string"},
+        "revision": {"$ref": "#/$defs/RevisionIdentifier"},
+        "file": {"type": "string"},
+        "description": {"type": "string"},
+        "snippet": {"type": "string"},
+        "line": {"type": "integer", "minimum": 0},
+        "span": {"$ref": "#/$defs/SourceSpan"},
+        "json_pointer": {"type": "string"}
+      }
+    },
+    "ContractChange": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint"],
+          "properties": {
+            "kind": {"const": "endpoint_removed"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint", "status_code", "field_path", "previous_type"],
+          "properties": {
+            "kind": {"const": "response_field_removed"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"},
+            "status_code": {"type": "string"},
+            "field_path": {"type": "string"},
+            "previous_type": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint", "status_code", "field_path", "previous_type", "new_type"],
+          "properties": {
+            "kind": {"const": "response_field_type_changed"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"},
+            "status_code": {"type": "string"},
+            "field_path": {"type": "string"},
+            "previous_type": {"type": "string"},
+            "new_type": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint", "status_code", "field_path"],
+          "properties": {
+            "kind": {"const": "response_field_made_optional"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"},
+            "status_code": {"type": "string"},
+            "field_path": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint", "previous_type", "new_type"],
+          "properties": {
+            "kind": {"const": "body_type_changed"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"},
+            "previous_type": {"type": "string"},
+            "new_type": {"type": "string"},
+            "status_code": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint", "field_path", "field_type"],
+          "properties": {
+            "kind": {"const": "request_field_added_required"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"},
+            "field_path": {"type": "string"},
+            "field_type": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint", "field_path", "previous_type", "new_type"],
+          "properties": {
+            "kind": {"const": "request_field_type_changed"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"},
+            "field_path": {"type": "string"},
+            "previous_type": {"type": "string"},
+            "new_type": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint", "location", "name", "previous_type", "new_type"],
+          "properties": {
+            "kind": {"const": "request_parameter_type_changed"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"},
+            "location": {"type": "string"},
+            "name": {"type": "string"},
+            "previous_type": {"type": "string"},
+            "new_type": {"type": "string"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "endpoint", "location", "name", "param_type"],
+          "properties": {
+            "kind": {"const": "required_parameter_added"},
+            "endpoint": {"$ref": "#/$defs/EndpointId"},
+            "location": {"type": "string"},
+            "name": {"type": "string"},
+            "param_type": {"type": "string"}
+          }
+        }
+      ]
+    },
+    "AffectedConsumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "evidence", "confidence", "dependency_path"],
+      "properties": {
+        "repo": {"type": "string"},
+        "evidence": {"$ref": "#/$defs/Evidence"},
+        "confidence": {"$ref": "#/$defs/Confidence"},
+        "dependency_path": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "IndirectConsumer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "confidence", "via_repo", "dependency_chain"],
+      "properties": {
+        "repo": {"type": "string"},
+        "confidence": {"$ref": "#/$defs/Confidence"},
+        "via_repo": {"type": "string"},
+        "dependency_chain": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "ImpactFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "change", "severity", "confidence", "producer_evidence", "consumers"],
+      "properties": {
+        "id": {"type": "string"},
+        "change": {"$ref": "#/$defs/ContractChange"},
+        "severity": {"$ref": "#/$defs/Severity"},
+        "confidence": {"$ref": "#/$defs/Confidence"},
+        "producer_evidence": {"$ref": "#/$defs/ProducerEvidence"},
+        "consumers": {"type": "array", "items": {"$ref": "#/$defs/AffectedConsumer"}},
+        "producer_evidence_comparison": {"$ref": "#/$defs/ProducerEvidence"},
+        "indirect_consumers": {"type": "array", "items": {"$ref": "#/$defs/IndirectConsumer"}}
+      }
+    },
+    "UnresolvedCall": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "evidence", "reason"],
+      "properties": {
+        "repo": {"type": "string"},
+        "evidence": {"$ref": "#/$defs/Evidence"},
+        "reason": {"type": "string"}
+      }
+    },
+    "ContractDiscrepancy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint", "kind", "detail"],
+      "properties": {
+        "endpoint": {"$ref": "#/$defs/EndpointId"},
+        "kind": {"$ref": "#/$defs/DiscrepancyKind"},
+        "detail": {"type": "string"}
+      }
+    },
+    "AnalysisStats": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositories", "files_analyzed", "graph_nodes", "graph_edges"],
+      "properties": {
+        "repositories": {"type": "integer", "minimum": 0},
+        "files_analyzed": {"type": "integer", "minimum": 0},
+        "graph_nodes": {"type": "integer", "minimum": 0},
+        "graph_edges": {"type": "integer", "minimum": 0}
+      }
+    },
+    "FileCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["discovered", "read", "analyzed", "failed"],
+      "properties": {
+        "discovered": {"type": "integer", "minimum": 0},
+        "read": {"type": "integer", "minimum": 0},
+        "analyzed": {"type": "integer", "minimum": 0},
+        "failed": {"type": "integer", "minimum": 0}
+      }
+    },
+    "AnalysisCoverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["complete", "producer_base", "producer_head", "consumers"],
+      "properties": {
+        "complete": {"type": "boolean"},
+        "producer_base": {"$ref": "#/$defs/FileCoverage"},
+        "producer_head": {"$ref": "#/$defs/FileCoverage"},
+        "consumers": {"$ref": "#/$defs/FileCoverage"}
+      }
+    },
+    "ExtractionDiagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "revision", "file", "stage", "code", "remediation"],
+      "properties": {
+        "repo": {"type": "string"},
+        "revision": {"$ref": "#/$defs/RevisionIdentifier"},
+        "file": {"type": "string"},
+        "stage": {"$ref": "#/$defs/ExtractionStage"},
+        "code": {"$ref": "#/$defs/ExtractionFailure"},
+        "remediation": {"type": "string"},
+        "line": {"type": "integer", "minimum": 0},
+        "json_pointer": {"type": "string"}
+      }
+    },
+    "WorkspaceIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {"type": "string"},
+        "repo_roots": {
+          "type": "object",
+          "additionalProperties": {"type": "string"}
+        }
+      }
+    },
+    "PolicyEvaluation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["should_fail", "exit_code", "blocking_findings", "blocking_unresolved_calls", "reason"],
+      "properties": {
+        "should_fail": {"type": "boolean"},
+        "exit_code": {"enum": [0, 2]},
+        "blocking_findings": {"type": "integer", "minimum": 0},
+        "blocking_unresolved_calls": {"type": "integer", "minimum": 0},
+        "reason": {"type": "string"}
+      }
+    }
+  }
+}

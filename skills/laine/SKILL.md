@@ -64,6 +64,10 @@ Never claim zero impact when `coverage.complete == false` or `unresolved_calls` 
 
 Use `--no-snippets` in shared pull request comments and CI logs to avoid exposing code context. Use `--include-repo-roots` only locally when you need absolute checkout paths.
 
+## MCP clients
+
+Run `laine mcp --no-cache --no-snippets` as a stdio server to expose workspace validation, endpoint consumers, impact analysis, and policy explanations as read-only tools. Inspect `structuredContent.exit_code` and `policy` for analysis results, including a policy block with `isError: false`. See the [MCP setup and tool reference](../../docs/mcp.md).
+
 ## References
 
 - [IR v1 JSON Schema](../../schemas/ir-v1.schema.json)

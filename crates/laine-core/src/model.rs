@@ -266,6 +266,14 @@ pub struct AnalysisCoverage {
     pub consumers: FileCoverage,
 }
 
+/// Extraction coverage for one producer snapshot and the selected consumer snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsumersCoverage {
+    pub complete: bool,
+    pub producer: FileCoverage,
+    pub consumers: FileCoverage,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExtractionFailure {
@@ -360,4 +368,36 @@ pub struct AnalysisReport {
     pub unresolved_calls: Vec<UnresolvedCall>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discrepancies: Vec<ContractDiscrepancy>,
+}
+
+/// The dependency evidence for an endpoint query against a single producer snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointConsumersReport {
+    pub schema_version: u32,
+    pub service: String,
+    pub method: HttpMethod,
+    pub queried_path: String,
+    pub normalized_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+    pub producer_revision: String,
+    pub in_catalog: bool,
+    pub matched_endpoints: Vec<EndpointId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_evidence: Option<ProducerEvidence>,
+    pub coverage: ConsumersCoverage,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<ExtractionDiagnostic>,
+    pub exit_code: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceIdentity>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub consumer_revisions: BTreeMap<String, String>,
+    pub stats: AnalysisStats,
+    pub consumers: Vec<AffectedConsumer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indirect_consumers: Vec<IndirectConsumer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields_read: Vec<String>,
+    pub unresolved_calls: Vec<UnresolvedCall>,
 }

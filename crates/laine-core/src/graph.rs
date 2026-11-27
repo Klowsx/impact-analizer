@@ -452,6 +452,38 @@ impl DependencyGraph {
         dedup.into_values().collect()
     }
 
+    /// List the distinct fields with read evidence on this endpoint in lexical order.
+    pub fn fields_read_on_endpoint(
+        &self,
+        service: &str,
+        method: HttpMethod,
+        producer_path: &str,
+    ) -> Vec<String> {
+        let key = (
+            service.to_owned(),
+            method,
+            canonical_route_key(producer_path),
+        );
+        let Some(&endpoint) = self.endpoints.get(&key) else {
+            return Vec::new();
+        };
+        self.graph
+            .edges_directed(endpoint, Direction::Outgoing)
+            .filter_map(|edge| {
+                let field = edge.target();
+                let GraphNode::SchemaField { field_path, .. } = &self.graph[field] else {
+                    return None;
+                };
+                self.graph
+                    .edges_directed(field, Direction::Incoming)
+                    .any(|edge| matches!(edge.weight(), GraphEdge::ReadsField { .. }))
+                    .then_some(field_path.clone())
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     /// Busca las llamadas vinculadas a la identidad exacta de la operación.
     // Return one endpoint consumer per source line for endpoint-wide changes.
     pub fn consumers_of_endpoint(

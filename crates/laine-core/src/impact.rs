@@ -26,8 +26,11 @@ pub struct ImpactInput<'a> {
     pub stats: AnalysisStats,
 }
 
-// Traslada al hallazgo las llamadas de la operación con su confianza de resolución.
-fn consumers_for_endpoint(graph: &DependencyGraph, endpoint: &EndpointId) -> Vec<AffectedConsumer> {
+/// Collect call locations and traces for an endpoint, retaining their resolution confidence.
+pub fn consumers_for_endpoint(
+    graph: &DependencyGraph,
+    endpoint: &EndpointId,
+) -> Vec<AffectedConsumer> {
     graph
         .consumers_of_endpoint(
             &endpoint.service,
@@ -154,7 +157,89 @@ fn consumers_for_request_change(
     affected.into_values().collect()
 }
 
-/// Cruza los cambios de contrato con el grafo para producir un informe reproducible.
+/// Collect response reads and preserve their HTTP call and dataflow traces.
+pub fn consumers_for_field(
+    graph: &DependencyGraph,
+    endpoint: &EndpointId,
+    field_path: &str,
+) -> Vec<AffectedConsumer> {
+    let hits = graph.consumers_of_field(
+        &endpoint.service,
+        endpoint.method,
+        &endpoint.normalized_path,
+        field_path,
+    );
+    hits.into_iter()
+        .map(|hit| {
+            let step_label = if hit.source_confidence == Confidence::Likely {
+                "typed contract"
+            } else {
+                "read"
+            };
+            let dependency_path = if !hit.custom_trace.is_empty() {
+                hit.custom_trace
+            } else {
+                vec![
+                    format!("{} {}", endpoint.method.as_str(), endpoint.normalized_path),
+                    format!(
+                        "HTTP call @ {}/{}:{}",
+                        hit.repo, hit.call_file, hit.call_line
+                    ),
+                    format!(
+                        "{step_label} `{}` @ {}/{}:{}",
+                        hit.matched_field, hit.repo, hit.file, hit.line
+                    ),
+                ]
+            };
+            AffectedConsumer {
+                repo: hit.repo.clone(),
+                evidence: Evidence {
+                    repo: hit.repo.clone(),
+                    revision: hit.revision,
+                    file: hit.file.clone(),
+                    line: hit.line,
+                    snippet: hit.snippet,
+                },
+                confidence: hit.confidence,
+                dependency_path,
+            }
+        })
+        .collect::<Vec<_>>()
+}
+
+/// Find indirect dependents with the shortest deterministic chain from a direct consumer.
+pub fn compute_indirect_consumers(
+    graph: &DependencyGraph,
+    target_repo: &str,
+    direct_repos: &HashSet<String>,
+) -> Vec<IndirectConsumer> {
+    let mut indirect_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for direct_repo in direct_repos {
+        for (downstream_repo, chain) in graph.transitive_dependent_paths(direct_repo) {
+            if downstream_repo == target_repo || direct_repos.contains(&downstream_repo) {
+                continue;
+            }
+            // Prioriza la cadena más corta y desempata por orden lexicográfico.
+            if indirect_paths
+                .get(&downstream_repo)
+                .is_none_or(|previous| (chain.len(), &chain) < (previous.len(), previous))
+            {
+                indirect_paths.insert(downstream_repo, chain);
+            }
+        }
+    }
+    indirect_paths
+        .into_iter()
+        .map(|(repo, dependency_chain)| IndirectConsumer {
+            repo,
+            confidence: Confidence::Possible,
+            via_repo: dependency_chain[0].clone(),
+            dependency_chain,
+        })
+        .collect()
+}
+
+/// Match contract changes against the graph to produce a reproducible report.
 pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> AnalysisReport {
     let mut findings = Vec::new();
     for (idx, change) in std::mem::take(&mut input.changes).into_iter().enumerate() {
@@ -174,54 +259,7 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
                 endpoint,
                 field_path,
                 ..
-            } => {
-                let hits = graph.consumers_of_field(
-                    &endpoint.service,
-                    endpoint.method,
-                    &endpoint.normalized_path,
-                    field_path,
-                );
-                hits.into_iter()
-                    .map(|hit| {
-                        let step_label = if hit.source_confidence == Confidence::Likely {
-                            "typed contract"
-                        } else {
-                            "read"
-                        };
-                        let dependency_path = if !hit.custom_trace.is_empty() {
-                            hit.custom_trace
-                        } else {
-                            vec![
-                                format!(
-                                    "{} {}",
-                                    endpoint.method.as_str(),
-                                    endpoint.normalized_path
-                                ),
-                                format!(
-                                    "HTTP call @ {}/{}:{}",
-                                    hit.repo, hit.call_file, hit.call_line
-                                ),
-                                format!(
-                                    "{step_label} `{}` @ {}/{}:{}",
-                                    hit.matched_field, hit.repo, hit.file, hit.line
-                                ),
-                            ]
-                        };
-                        AffectedConsumer {
-                            repo: hit.repo.clone(),
-                            evidence: Evidence {
-                                repo: hit.repo.clone(),
-                                revision: hit.revision,
-                                file: hit.file.clone(),
-                                line: hit.line,
-                                snippet: hit.snippet,
-                            },
-                            confidence: hit.confidence,
-                            dependency_path,
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            }
+            } => consumers_for_field(graph, endpoint, field_path),
             ContractChange::RequestFieldAddedRequired { .. }
             | ContractChange::RequestFieldTypeChanged { .. }
             | ContractChange::RequiredParameterAdded { .. }
@@ -249,32 +287,8 @@ pub fn analyze_impact(graph: &DependencyGraph, mut input: ImpactInput<'_>) -> An
         };
 
         let direct_repo_set: HashSet<String> = consumers.iter().map(|c| c.repo.clone()).collect();
-        let mut indirect_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for direct_repo in &direct_repo_set {
-            for (downstream_repo, chain) in graph.transitive_dependent_paths(direct_repo) {
-                if downstream_repo == input.target_repo
-                    || direct_repo_set.contains(&downstream_repo)
-                {
-                    continue;
-                }
-                // Prioriza la cadena más corta y desempata por orden lexicográfico.
-                if indirect_paths
-                    .get(&downstream_repo)
-                    .is_none_or(|previous| (chain.len(), &chain) < (previous.len(), previous))
-                {
-                    indirect_paths.insert(downstream_repo, chain);
-                }
-            }
-        }
-        let indirect_consumers = indirect_paths
-            .into_iter()
-            .map(|(repo, dependency_chain)| IndirectConsumer {
-                repo,
-                confidence: Confidence::Possible,
-                via_repo: dependency_chain[0].clone(),
-                dependency_chain,
-            })
-            .collect();
+        let indirect_consumers =
+            compute_indirect_consumers(graph, input.target_repo, &direct_repo_set);
 
         findings.push(ImpactFinding {
             id: format!("LAINE-{:03}", idx + 1),

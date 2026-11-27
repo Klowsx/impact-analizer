@@ -14,6 +14,19 @@ pub struct PolicyEvaluation {
     pub reason: String,
 }
 
+/// Return the configured ignore patterns that cover an endpoint, in policy order.
+pub fn matching_ignore_patterns<'a>(
+    endpoint: &EndpointId,
+    policy: &'a PolicyConfig,
+) -> Vec<&'a str> {
+    policy
+        .ignore_endpoints
+        .iter()
+        .map(String::as_str)
+        .filter(|pattern| endpoint_matches_ignore_pattern(endpoint, pattern))
+        .collect()
+}
+
 /// Quita los hallazgos cuando un patrón de `policy.ignore_endpoints` cubre toda la operación.
 ///
 /// Admite rutas literales, parámetros y comodines de segmento, prefijos recursivos con `/**`
@@ -117,6 +130,30 @@ mod tests {
         AnalysisStats, Confidence, Evidence, ImpactFinding, ProducerEvidence, Severity,
         UnresolvedCall,
     };
+
+    // Explain literal, wildcard, and verb-specific matches in configuration order.
+    #[test]
+    fn returns_only_the_ignore_patterns_that_cover_the_endpoint() {
+        let policy = PolicyConfig {
+            ignore_endpoints: ["GET /users/me", "/users/*", "/users/**", "POST /users/me"]
+                .map(String::from)
+                .to_vec(),
+            ..PolicyConfig::default()
+        };
+        for (path, expected) in [
+            ("/users/me", vec!["GET /users/me", "/users/*", "/users/**"]),
+            ("/users/{id}", vec!["/users/*", "/users/**"]),
+            ("/users/me/details", vec!["/users/**"]),
+            ("/usersettings/me", vec![]),
+        ] {
+            let endpoint = EndpointId {
+                service: "api".into(),
+                method: HttpMethod::Get,
+                normalized_path: path.into(),
+            };
+            assert_eq!(matching_ignore_patterns(&endpoint, &policy), expected);
+        }
+    }
 
     // Crea un hallazgo con evidencia de una operación de prueba.
     fn mk_finding(id: &str, method: HttpMethod, path: &str, severity: Severity) -> ImpactFinding {

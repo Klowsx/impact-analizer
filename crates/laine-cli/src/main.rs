@@ -9,14 +9,15 @@ use std::time::Instant;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use laine_cli::engine::{
-    AnalyzeRequest, ConsumerRevision, ConsumersRequest, catalog_workspace_routes,
-    check_workspace_routes, index_workspace, query_endpoint_consumers,
-    run_analysis_with_consumer_revision,
+    AnalyzeRequest, ConsumerRevision, ConsumersRequest, catalog_workspace_routes, index_workspace,
+    query_endpoint_consumers, run_analysis_with_consumer_revision,
 };
+use laine_cli::mcp::{ServerDefaults, serve};
 use laine_cli::report::{
-    omit_consumers_snippets, omit_snippets, render_consumers_json, render_consumers_markdown,
-    render_consumers_terminal, render_json, render_markdown, render_terminal,
-    render_workspace_validation_json, render_workspace_validation_text,
+    classify_laine_error, cli_error_report, omit_consumers_snippets, omit_snippets,
+    render_consumers_json, render_consumers_markdown, render_consumers_terminal, render_json,
+    render_markdown, render_terminal, render_workspace_validation_json,
+    render_workspace_validation_text, workspace_validation_report,
 };
 use laine_core::config::{
     CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
@@ -25,11 +26,7 @@ use laine_core::config::{
 use laine_core::error::LaineError;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::{GitRepo, STAGED_REV};
-use laine_core::model::{CliErrorDiagnostic, CliErrorReport, HttpMethod};
-use laine_core::validate::{
-    RouteHealthCheck, WorkspaceValidationReport, validate_registry_with,
-    validate_workspace_config_with,
-};
+use laine_core::model::HttpMethod;
 use laine_core::workspace::{
     ClientAmbiguity, DiscoveredRepo, ResolvedContext, WorkspaceRegistry, build_workspace_config,
     discover_workspace_clients_with, infer_workspace_scan_dir, inspect_repo_path,
@@ -132,6 +129,21 @@ enum Commands {
     },
     /// List direct and indirect consumers of a service endpoint
     Consumers(ConsumersArgs),
+    /// Serve read-only Laine tools over MCP stdio
+    Mcp {
+        /// Default path to laine.toml
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Default registered workspace name
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Suppress evidence snippets in all tool responses
+        #[arg(long)]
+        no_snippets: bool,
+        /// Disable SQLite cache reads and writes for the session
+        #[arg(long)]
+        no_cache: bool,
+    },
     /// Analyze cross-repository impact between two Git revisions
     Analyze {
         /// Path to laine.toml
@@ -452,6 +464,17 @@ fn main() -> ExitCode {
             )
         }
         Commands::Consumers(args) => execute_consumers(args),
+        Commands::Mcp {
+            config,
+            workspace,
+            no_snippets,
+            no_cache,
+        } => run_mcp(ServerDefaults {
+            config,
+            workspace,
+            no_snippets,
+            no_cache,
+        }),
         Commands::Analyze {
             config,
             repo,
@@ -477,6 +500,23 @@ fn main() -> ExitCode {
                 consumer_revision,
             },
         ),
+    }
+}
+
+// Keep Git snapshot reads and transport diagnostics separate from the MCP stream.
+fn run_mcp(defaults: ServerDefaults) -> ExitCode {
+    // SAFETY: This startup branch runs before any threads or analysis libraries are started.
+    unsafe {
+        // Prevent optional index refreshes and object downloads in partial clones.
+        env::set_var("GIT_OPTIONAL_LOCKS", "0");
+        env::set_var("GIT_NO_LAZY_FETCH", "1");
+    }
+    match serve(std::io::stdin().lock(), std::io::stdout().lock(), &defaults) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("MCP transport error: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -772,25 +812,14 @@ fn handle_workspace_validate(
     options: WorkspaceValidateArgs,
     registry_path: Result<PathBuf, LaineError>,
 ) -> ExitCode {
-    let strict = options.strict;
-    let check: Option<&RouteHealthCheck<'_>> = Some(&check_workspace_routes);
-    let report = if let Some(config) = options.config.as_deref() {
-        validate_workspace_config_with(config, None, strict, check)
-    } else if options.name.is_some() || options.all {
-        match registry_path {
-            Ok(path) => validate_registry_with(&path, options.name.as_deref(), strict, check),
-            Err(_) => WorkspaceValidationReport::selection_error(
-                Path::new("workspaces.toml"),
-                options.name.as_deref(),
-                strict,
-                "invalid_registry",
-                "The workspace registry path could not be determined.",
-                "Set LAINE_HOME to the directory containing workspaces.toml.",
-            ),
-        }
-    } else {
-        validate_workspace_from_cwd(registry_path.ok().as_deref(), strict, check)
-    };
+    let report = workspace_validation_report(
+        options.config.as_deref(),
+        options.name.as_deref(),
+        options.all,
+        env::current_dir().ok().as_deref(),
+        registry_path.ok().as_deref(),
+        options.strict,
+    );
     match options.format {
         OutputFormat::Terminal => print!("{}", render_workspace_validation_text(&report, false)),
         OutputFormat::Markdown => print!("{}", render_workspace_validation_text(&report, true)),
@@ -808,47 +837,6 @@ fn handle_workspace_validate(
         },
     }
     ExitCode::from(report.exit_code)
-}
-
-// Prefer the local file, then use the shared resolver to identify the owning workspace.
-fn validate_workspace_from_cwd(
-    registry_path: Option<&Path>,
-    strict: bool,
-    check: Option<&RouteHealthCheck<'_>>,
-) -> WorkspaceValidationReport {
-    if let Ok(cwd) = env::current_dir() {
-        let local = cwd.join("laine.toml");
-        if local.symlink_metadata().is_ok() {
-            return validate_workspace_config_with(&local, None, strict, check);
-        }
-        if let Some(registry_path) = registry_path
-            && let Ok(context) = resolve_context_from_cwd(&cwd, None, None, None, registry_path)
-        {
-            return validate_workspace_config_with(
-                &context.config_path,
-                context.workspace_name.as_deref(),
-                strict,
-                check,
-            );
-        }
-        // Inspect a nearby config even when it failed to load in the ownership resolver.
-        if let Some(path) = cwd
-            .ancestors()
-            .skip(1)
-            .map(|dir| dir.join("laine.toml"))
-            .find(|path| path.symlink_metadata().is_ok())
-        {
-            return validate_workspace_config_with(&path, None, strict, check);
-        }
-    }
-    WorkspaceValidationReport::selection_error(
-        Path::new("laine.toml"),
-        None,
-        strict,
-        "invalid_workspace_config",
-        "No workspace config could be selected from the current directory.",
-        "Pass --config with a workspace config path or specify a registered workspace name.",
-    )
 }
 
 /// Update a workspace's repositories from an explicit selection or the interactive picker.
@@ -1443,43 +1431,7 @@ fn execute_consumers(args: ConsumersArgs) -> ExitCode {
 // Translate report failures to stable error codes without including raw input in JSON.
 fn print_analysis_error(command: &str, error: &LaineError, output: AnalysisOutput) {
     if matches!(output.format, OutputFormat::Json) {
-        let (code, remediation, message) = match error {
-            LaineError::Io { .. } => (
-                "input_io_error",
-                "check_input_paths",
-                "An analysis input could not be read. Verify the configuration path and file access.",
-            ),
-            LaineError::ConfigParse(_) => (
-                "invalid_config_syntax",
-                "repair_workspace_toml",
-                "The workspace TOML could not be parsed.",
-            ),
-            LaineError::ConfigInvalid(_) if command == "Consumers" => (
-                "invalid_workspace_config",
-                "check_workspace_selection",
-                "Verify the workspace configuration and choose a configured producer with --service.",
-            ),
-            LaineError::ConfigInvalid(_) => (
-                "invalid_workspace_config",
-                "check_workspace_selection",
-                "Verify the workspace configuration and choose a configured producer with --repo.",
-            ),
-            LaineError::Git { .. } => (
-                "git_snapshot_error",
-                "check_git_revisions",
-                "Verify that the repositories and Git revisions are available locally.",
-            ),
-            LaineError::OpenApiParse(_) => (
-                "invalid_openapi_document",
-                "repair_openapi_document",
-                "The producer OpenAPI document could not be analyzed.",
-            ),
-            LaineError::Cache(_) => (
-                "cache_error",
-                "retry_without_cache",
-                "Retry the analysis with --no-cache or check the cache directory.",
-            ),
-        };
+        let (code, remediation, message) = classify_laine_error(command, error);
         print_json_error(1, code, remediation, message);
     } else if output.no_snippets {
         eprintln!("{command} failed. Run locally without --no-snippets for details.");
@@ -1490,16 +1442,7 @@ fn print_analysis_error(command: &str, error: &LaineError, output: AnalysisOutpu
 
 // Emit one JSON document on stdout for usage or runtime errors.
 fn print_json_error(exit_code: u8, code: &str, remediation: &str, message: &str) {
-    let report = CliErrorReport {
-        schema_version: 1,
-        status: "error".into(),
-        exit_code,
-        diagnostics: vec![CliErrorDiagnostic {
-            code: code.into(),
-            remediation: remediation.into(),
-            message: message.into(),
-        }],
-    };
+    let report = cli_error_report(exit_code, code, remediation, message);
     // Serialize through a JSON value to preserve the existing object key order.
     let json =
         serde_json::to_value(report).expect("CLI errors contain only JSON-compatible fields");

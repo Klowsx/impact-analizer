@@ -1,10 +1,152 @@
 use std::fmt::Write;
+use std::path::Path;
 
+use laine_core::error::LaineError;
 use laine_core::model::{
-    AnalysisCoverage, AnalysisReport, Confidence, ContractChange, EndpointConsumersReport,
-    ExtractionDiagnostic, ProducerEvidence, Severity,
+    AnalysisCoverage, AnalysisReport, CliErrorDiagnostic, CliErrorReport, Confidence,
+    ContractChange, EndpointConsumersReport, ExtractionDiagnostic, ProducerEvidence, Severity,
 };
-use laine_core::validate::{ValidationSeverity, WorkspaceValidationReport};
+use laine_core::validate::{
+    RouteHealthCheck, ValidationSeverity, WorkspaceValidationReport, validate_registry_with,
+    validate_workspace_config_with,
+};
+use laine_core::workspace::resolve_context_from_cwd;
+
+use crate::engine::check_workspace_routes;
+
+/// Classify runtime failures without exposing paths or raw input in their messages.
+pub fn classify_laine_error(
+    command: &str,
+    error: &LaineError,
+) -> (&'static str, &'static str, &'static str) {
+    match error {
+        LaineError::Io { .. } => (
+            "input_io_error",
+            "check_input_paths",
+            "An analysis input could not be read. Verify the configuration path and file access.",
+        ),
+        LaineError::ConfigParse(_) => (
+            "invalid_config_syntax",
+            "repair_workspace_toml",
+            "The workspace TOML could not be parsed.",
+        ),
+        LaineError::ConfigInvalid(_) if command == "Consumers" => (
+            "invalid_workspace_config",
+            "check_workspace_selection",
+            "Verify the workspace configuration and choose a configured producer with --service.",
+        ),
+        LaineError::ConfigInvalid(_) => (
+            "invalid_workspace_config",
+            "check_workspace_selection",
+            "Verify the workspace configuration and choose a configured producer with --repo.",
+        ),
+        LaineError::Git { .. } => (
+            "git_snapshot_error",
+            "check_git_revisions",
+            "Verify that the repositories and Git revisions are available locally.",
+        ),
+        LaineError::OpenApiParse(_) => (
+            "invalid_openapi_document",
+            "repair_openapi_document",
+            "The producer OpenAPI document could not be analyzed.",
+        ),
+        LaineError::Cache(_) => (
+            "cache_error",
+            "retry_without_cache",
+            "Retry the analysis with --no-cache or check the cache directory.",
+        ),
+    }
+}
+
+/// Build the versioned error envelope shared by CLI and MCP reports.
+pub fn cli_error_report(
+    exit_code: u8,
+    code: &str,
+    remediation: &str,
+    message: &str,
+) -> CliErrorReport {
+    CliErrorReport {
+        schema_version: 1,
+        status: "error".into(),
+        exit_code,
+        diagnostics: vec![CliErrorDiagnostic {
+            code: code.into(),
+            remediation: remediation.into(),
+            message: message.into(),
+        }],
+    }
+}
+
+/// Select and check the same workspace target for CLI and MCP callers.
+pub fn workspace_validation_report(
+    config: Option<&Path>,
+    name: Option<&str>,
+    all: bool,
+    cwd: Option<&Path>,
+    registry_path: Option<&Path>,
+    strict: bool,
+) -> WorkspaceValidationReport {
+    let check: Option<&RouteHealthCheck<'_>> = Some(&check_workspace_routes);
+    if let Some(config) = config {
+        validate_workspace_config_with(config, None, strict, check)
+    } else if name.is_some() || all {
+        match registry_path {
+            Some(path) => validate_registry_with(path, name, strict, check),
+            None => WorkspaceValidationReport::selection_error(
+                Path::new("workspaces.toml"),
+                name,
+                strict,
+                "invalid_registry",
+                "The workspace registry path could not be determined.",
+                "Set LAINE_HOME to the directory containing workspaces.toml.",
+            ),
+        }
+    } else {
+        validate_workspace_from_cwd(cwd, registry_path, strict, check)
+    }
+}
+
+// Prefer the local file, then use the shared resolver to identify the owning workspace.
+fn validate_workspace_from_cwd(
+    cwd: Option<&Path>,
+    registry_path: Option<&Path>,
+    strict: bool,
+    check: Option<&RouteHealthCheck<'_>>,
+) -> WorkspaceValidationReport {
+    if let Some(cwd) = cwd {
+        let local = cwd.join("laine.toml");
+        if local.symlink_metadata().is_ok() {
+            return validate_workspace_config_with(&local, None, strict, check);
+        }
+        if let Some(registry_path) = registry_path
+            && let Ok(context) = resolve_context_from_cwd(cwd, None, None, None, registry_path)
+        {
+            return validate_workspace_config_with(
+                &context.config_path,
+                context.workspace_name.as_deref(),
+                strict,
+                check,
+            );
+        }
+        // Inspect a nearby config even when it failed to load in the ownership resolver.
+        if let Some(path) = cwd
+            .ancestors()
+            .skip(1)
+            .map(|dir| dir.join("laine.toml"))
+            .find(|path| path.symlink_metadata().is_ok())
+        {
+            return validate_workspace_config_with(&path, None, strict, check);
+        }
+    }
+    WorkspaceValidationReport::selection_error(
+        Path::new("laine.toml"),
+        None,
+        strict,
+        "invalid_workspace_config",
+        "No workspace config could be selected from the current directory.",
+        "Pass --config with a workspace config path or specify a registered workspace name.",
+    )
+}
 
 /// Serialize the workspace validation report as a versioned JSON document.
 pub fn render_workspace_validation_json(

@@ -282,7 +282,7 @@ jobs:
 ## Performance & Determinism
 
 - **Batched Git object reads (`git cat-file --batch`):** Reading 182 source files from a real repository dropped from **15.5 s** (per-file `git show` spawning) to **840 ms** in unoptimized debug builds—an **18.5× speedup** before release optimizations.
-- **Parallel extraction & incremental caching:** Consumer repositories and files are analyzed in parallel with `rayon`, and per-repository extraction snapshots are cached by `(repo, commit_sha, config_hash, schema_version)` in an embedded SQLite database (`rusqlite`) populated by `laine index` or `laine analyze`.
+- **Parallel extraction & incremental caching:** `laine analyze` processes cache misses in batches of up to two consumer repositories using Rayon. File-level parallel passes use the same Rayon pool. SQLite reads and writes and report assembly run in configured service order. `laine index` precomputes the same snapshots one repository at a time. Snapshots are keyed by repository, revision (with a content fingerprint for mutable snapshots), configuration hash, and cache schema version.
 - **Byte-for-byte deterministic JSON:** All contract maps, findings, and consumer hits use ordered `BTreeMap` structures and explicit stable sorting with zero wall-clock fields inside `schema_version: 1` JSON output.
 
 ---

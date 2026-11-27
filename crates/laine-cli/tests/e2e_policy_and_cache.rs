@@ -8,6 +8,58 @@ use laine_core::config::WorkspaceConfig;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::model::Severity;
 
+// Compare serialized results across Rayon schedules and an analysis-populated cache.
+#[test]
+fn multi_repo_analysis_is_byte_identical_across_workers_and_cache_states() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-parallel-cache-{}", std::process::id()));
+    let paths = create_demo_workspace(&tmp).unwrap();
+    let mut config = WorkspaceConfig::load_from_path(&paths.config_path).unwrap();
+    config.cache_path = Some("parallel.sqlite3".into());
+    config.save_to_path(&paths.config_path).unwrap();
+
+    let analyze = |threads, no_cache| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_laine"));
+        command
+            .env("RAYON_NUM_THREADS", threads)
+            .args(["analyze", "--config"])
+            .arg(&paths.config_path)
+            .args([
+                "--repo",
+                "customer-service",
+                "--base",
+                "main",
+                "--head",
+                "feature/split-customer-name",
+                "--format=json",
+            ]);
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        output.stdout
+    };
+
+    let baseline = analyze("1", true);
+    let report: serde_json::Value = serde_json::from_slice(&baseline).unwrap();
+    let consumers = report["findings"][0]["consumers"].as_array().unwrap();
+    let consumer_repos: Vec<_> = consumers
+        .iter()
+        .map(|consumer| consumer["repo"].as_str().unwrap())
+        .collect();
+    assert_eq!(consumer_repos, ["billing-service", "notification-service"]);
+    for _ in 0..3 {
+        assert_eq!(analyze("4", true), baseline);
+    }
+    assert!(!tmp.join("parallel.sqlite3").exists());
+    assert_eq!(analyze("4", false), baseline);
+    assert_eq!(analyze("4", false), baseline);
+    let summary = index_workspace(&paths.config_path).unwrap();
+    assert_eq!(summary.cache_hits, 4);
+    assert_eq!(summary.cache_misses, 0);
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
 // Comprueba la ubicación del caché por defecto y el análisis cuando SQLite no está disponible.
 #[test]
 fn stores_default_cache_in_user_state_and_falls_back_when_unavailable() {

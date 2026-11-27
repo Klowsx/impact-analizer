@@ -61,6 +61,21 @@ pub struct PyFileExtraction {
     pub unresolved_calls: Vec<PyUnresolvedCall>,
 }
 
+impl PyFileExtraction {
+    /// Removes original source lines before persisting extracted consumer facts.
+    pub fn clear_snippets(&mut self) {
+        for call in &mut self.calls {
+            call.snippet.clear();
+        }
+        for read in &mut self.field_reads {
+            read.snippet.clear();
+        }
+        for unresolved in &mut self.unresolved_calls {
+            unresolved.snippet.clear();
+        }
+    }
+}
+
 /// Workspace context passed to the Python HTTP consumer extractor.
 #[derive(Debug, Clone, Copy)]
 pub struct PyExtractContext<'a> {

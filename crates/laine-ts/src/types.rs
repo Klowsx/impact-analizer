@@ -36,7 +36,7 @@ pub struct TypeContractDef {
 }
 
 /// Local type declarations and schema values collected from one module.
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct TypeContractModule {
     symbols: ModuleSymbols,
     types: BTreeMap<String, TypeContractDef>,
@@ -44,13 +44,22 @@ pub struct TypeContractModule {
     schemas: BTreeMap<String, TypeContractDef>,
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 enum ReferenceKind {
     Type,
     Schema,
 }
 
 impl TypeContractModule {
+    /// Removes original declaration lines from the portable type and schema facts.
+    pub fn clear_snippets(&mut self) {
+        for definition in self.types.values_mut().chain(self.schemas.values_mut()) {
+            for field in &mut definition.fields {
+                field.snippet.clear();
+            }
+        }
+    }
+
     /// Parses each script once and keeps type aliases and schema values in separate namespaces.
     pub fn extract(file: &str, source: &str) -> Result<Self, Vec<String>> {
         let mut module = Self::default();
@@ -86,6 +95,21 @@ impl TypeContractModule {
     }
 }
 
+/// Structured type and schema names referenced by a response annotation.
+#[derive(Serialize, Deserialize)]
+pub struct ResponseContractReferences(Vec<(String, ReferenceKind)>);
+
+impl ResponseContractReferences {
+    /// Extracts references so a cache hit needs neither the annotation text nor a parser.
+    pub fn extract(expression: &str, is_schema: bool) -> Self {
+        Self(if is_schema {
+            vec![(expression.to_string(), ReferenceKind::Schema)]
+        } else {
+            collect_response_references(expression)
+        })
+    }
+}
+
 /// A snapshot index keyed by declaring module and symbol.
 #[derive(Default)]
 pub struct TypeContractRegistry {
@@ -106,13 +130,21 @@ impl TypeContractRegistry {
         is_schema: bool,
         resolver: &ModuleResolver,
     ) -> Vec<(String, TypeFieldDef)> {
-        let references = if is_schema {
-            vec![(expression.to_string(), ReferenceKind::Schema)]
-        } else {
-            collect_response_references(expression)
-        };
+        let references = ResponseContractReferences::extract(expression, is_schema);
+        self.resolve_references(file, &references, resolver)
+    }
+
+    /// Resolves previously extracted references against the current snapshot's declarations.
+    pub fn resolve_references(
+        &self,
+        file: &str,
+        references: &ResponseContractReferences,
+        resolver: &ModuleResolver,
+    ) -> Vec<(String, TypeFieldDef)> {
         let mut pending: Vec<_> = references
-            .into_iter()
+            .0
+            .iter()
+            .cloned()
             .map(|(name, kind)| (file.to_string(), name, kind))
             .collect();
         let mut visited = HashSet::new();

@@ -6,6 +6,8 @@ use oxc_ast::ast::{
     ImportDeclarationSpecifier, ImportOrExportKind, ModuleExportName, Program, Statement,
 };
 
+use serde::{Deserialize, Serialize};
+
 const PROBE_EXTENSIONS: &[&str] = &[
     ".ts", ".tsx", ".vue", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs",
 ];
@@ -25,13 +27,13 @@ const MAX_EXTENDS_DEPTH: usize = 32;
 const MAX_EXPORT_DEPTH: usize = 32;
 const MAX_JSON_DEPTH: usize = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) struct ImportedSymbol {
     pub specifier: String,
     pub name: String,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub(crate) struct ModuleSymbols {
     pub imports: BTreeMap<String, ImportedSymbol>,
     pub namespace_imports: BTreeMap<String, String>,
@@ -259,6 +261,60 @@ fn resolve_export<'a>(
     result
 }
 
+/// Structured compiler options used by Laine's module resolver.
+#[derive(Default, Serialize, Deserialize)]
+pub struct ResolverConfig {
+    extends: Vec<String>,
+    base_url: Option<String>,
+    paths: BTreeMap<String, Vec<String>>,
+}
+
+impl ResolverConfig {
+    /// Parses JSONC and keeps only the options used for import resolution.
+    pub fn extract(source: &str) -> Self {
+        let Some(JsonValue::Object(root)) = parse_jsonc(source) else {
+            return Self::default();
+        };
+        let extends = match root.get("extends") {
+            Some(JsonValue::String(path)) => vec![path.clone()],
+            Some(JsonValue::Array(items)) => {
+                items.iter().filter_map(config_string).cloned().collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut config = Self {
+            extends,
+            ..Self::default()
+        };
+        if let Some(JsonValue::Object(options)) = root.get("compilerOptions") {
+            config.base_url = options.get("baseUrl").and_then(config_string).cloned();
+            if let Some(JsonValue::Object(paths)) = options.get("paths") {
+                config.paths = paths
+                    .iter()
+                    .filter_map(|(pattern, value)| {
+                        let JsonValue::Array(items) = value else {
+                            return None;
+                        };
+                        Some((
+                            pattern.clone(),
+                            items.iter().filter_map(config_string).cloned().collect(),
+                        ))
+                    })
+                    .collect();
+            }
+        }
+        config
+    }
+}
+
+// A scalar string is the only value accepted as a config path.
+fn config_string(value: &JsonValue) -> Option<&String> {
+    match value {
+        JsonValue::String(value) => Some(value),
+        _ => None,
+    }
+}
+
 /// Fast, deterministic, zero-disk-I/O TypeScript/JavaScript/Vue module resolver
 /// operating purely over tracked POSIX file paths and config files from a Git snapshot.
 #[derive(Debug, Clone)]
@@ -277,6 +333,18 @@ impl ModuleResolver {
         tracked_files: &[String],
         tsconfig_sources: &BTreeMap<String, String>,
     ) -> Self {
+        let configs = tsconfig_sources
+            .iter()
+            .map(|(path, source)| (path.clone(), ResolverConfig::extract(source)))
+            .collect();
+        Self::from_configs(tracked_files, &configs)
+    }
+
+    /// Builds a snapshot resolver from structured configs, including cached blob facts.
+    pub fn from_configs(
+        tracked_files: &[String],
+        configs: &BTreeMap<String, ResolverConfig>,
+    ) -> Self {
         let mut files = HashSet::with_capacity(tracked_files.len());
         for path in tracked_files {
             if let Some(normalized) = normalize_posix_path(path)
@@ -286,14 +354,14 @@ impl ModuleResolver {
             }
         }
 
-        let normalized_configs: BTreeMap<String, &str> = tsconfig_sources
+        let normalized_configs: BTreeMap<String, &ResolverConfig> = configs
             .iter()
             .filter_map(|(path, content)| {
                 let normalized = normalize_posix_path(path)?;
                 if normalized.is_empty() {
                     None
                 } else {
-                    Some((normalized, content.as_str()))
+                    Some((normalized, content))
                 }
             })
             .collect();
@@ -458,7 +526,7 @@ struct MergedTsConfig {
 
 fn build_tsconfig_rules(
     root_key: &str,
-    configs: &BTreeMap<String, &str>,
+    configs: &BTreeMap<String, &ResolverConfig>,
 ) -> (Option<String>, Vec<(String, Vec<String>)>) {
     let root_config_dir = parent_dir(root_key);
     let mut active = HashSet::new();
@@ -509,7 +577,7 @@ fn build_tsconfig_rules(
 fn load_tsconfig_recursive(
     config_path: &str,
     root_config_dir: &str,
-    configs: &BTreeMap<String, &str>,
+    configs: &BTreeMap<String, &ResolverConfig>,
     active: &mut HashSet<String>,
     depth: usize,
 ) -> MergedTsConfig {
@@ -518,92 +586,50 @@ fn load_tsconfig_recursive(
     }
 
     let mut result = MergedTsConfig::default();
-    let Some(raw_source) = configs.get(config_path).copied() else {
+    let Some(config) = configs.get(config_path) else {
         active.remove(config_path);
         return result;
     };
-
-    let Some(JsonValue::Object(root_obj)) = parse_jsonc(raw_source) else {
-        active.remove(config_path);
-        return result;
-    };
-
     let current_dir = parent_dir(config_path);
 
-    // 1. Follow `extends` (single string or TS 5.0+ array of strings).
-    if let Some(extends_val) = root_obj.get("extends") {
-        let extends_specs: Vec<&str> = match extends_val {
-            JsonValue::String(s) => vec![s.as_str()],
-            JsonValue::Array(items) => items
-                .iter()
-                .filter_map(|item| match item {
-                    JsonValue::String(s) => Some(s.as_str()),
-                    _ => None,
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
-
-        for spec in extends_specs {
-            if let Some(parent_key) = resolve_extends_key(current_dir, spec, configs) {
-                let parent_cfg = load_tsconfig_recursive(
-                    &parent_key,
-                    root_config_dir,
-                    configs,
-                    active,
-                    depth + 1,
-                );
-                if let Some(parent_base) = parent_cfg.base_url {
-                    result.base_url = Some(parent_base);
-                }
-                for (pattern, targets) in parent_cfg.paths {
-                    result.paths.insert(pattern, targets);
-                }
+    // Merge inherited configs in precedence order before applying the child's options.
+    for spec in &config.extends {
+        if let Some(parent_key) = resolve_extends_key(current_dir, spec, configs) {
+            let parent =
+                load_tsconfig_recursive(&parent_key, root_config_dir, configs, active, depth + 1);
+            if parent.base_url.is_some() {
+                result.base_url = parent.base_url;
             }
+            result.paths.extend(parent.paths);
         }
     }
 
-    // 2. Apply this config's own `compilerOptions` (child overrides parent).
-    if let Some(JsonValue::Object(compiler_opts)) = root_obj.get("compilerOptions") {
-        if let Some(JsonValue::String(raw_base)) = compiler_opts.get("baseUrl") {
-            let (expanded, anchored) = expand_config_dir(raw_base.trim(), root_config_dir);
-            let normalized = if anchored {
-                normalize_posix_path(&expanded)
-            } else {
-                join_and_normalize(current_dir, &expanded)
-            };
-            if let Some(base) = normalized {
-                result.base_url = Some(if base.is_empty() {
-                    ".".to_string()
-                } else {
-                    base
-                });
-            }
+    if let Some(raw_base) = &config.base_url {
+        let (expanded, anchored) = expand_config_dir(raw_base.trim(), root_config_dir);
+        let normalized = if anchored {
+            normalize_posix_path(&expanded)
+        } else {
+            join_and_normalize(current_dir, &expanded)
+        };
+        if let Some(base) = normalized {
+            result.base_url = Some(if base.is_empty() { ".".into() } else { base });
         }
-
-        if let Some(JsonValue::Object(paths_obj)) = compiler_opts.get("paths") {
-            for (pattern, targets_val) in paths_obj {
-                let JsonValue::Array(items) = targets_val else {
-                    continue;
-                };
-                let mut targets = Vec::new();
-                for item in items {
-                    if let JsonValue::String(raw_target) = item {
-                        let trimmed = raw_target.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-                        let (expanded, anchored) = expand_config_dir(trimmed, root_config_dir);
-                        targets.push(RawPathTarget {
-                            target: expanded,
-                            declaring_dir: current_dir.to_string(),
-                            anchored_to_config_dir: anchored,
-                        });
-                    }
+    }
+    for (pattern, targets) in &config.paths {
+        let targets = targets
+            .iter()
+            .map(|target| target.trim())
+            .filter(|target| !target.is_empty())
+            .map(|target| {
+                let (target, anchored_to_config_dir) = expand_config_dir(target, root_config_dir);
+                RawPathTarget {
+                    target,
+                    declaring_dir: current_dir.to_string(),
+                    anchored_to_config_dir,
                 }
-                result.paths.insert(pattern.clone(), targets);
-            }
-        }
+            })
+            .collect();
+        result.paths.insert(pattern.clone(), targets);
     }
 
     active.remove(config_path);
@@ -613,7 +639,7 @@ fn load_tsconfig_recursive(
 fn resolve_extends_key(
     current_dir: &str,
     extends_spec: &str,
-    configs: &BTreeMap<String, &str>,
+    configs: &BTreeMap<String, &ResolverConfig>,
 ) -> Option<String> {
     let trimmed = extends_spec.trim();
     if trimmed.is_empty() {

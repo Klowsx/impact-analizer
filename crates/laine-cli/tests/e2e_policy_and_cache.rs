@@ -4,8 +4,10 @@ use std::process::Command;
 
 use laine_cli::engine::{AnalyzeRequest, index_workspace, run_analysis, run_analysis_with_options};
 use laine_cli::report::{render_json, render_markdown};
+use laine_core::cache::{BlobCacheKey, IndexCache, compute_config_hash};
 use laine_core::config::WorkspaceConfig;
 use laine_core::fixtures::create_demo_workspace;
+use laine_core::git::GitRepo;
 use laine_core::model::Severity;
 
 // Compare serialized results across Rayon schedules and an analysis-populated cache.
@@ -58,6 +60,222 @@ fn multi_repo_analysis_is_byte_identical_across_workers_and_cache_states() {
     assert_eq!(summary.cache_hits, 4);
     assert_eq!(summary.cache_misses, 0);
     fs::remove_dir_all(&tmp).unwrap();
+}
+
+// Verifies the cache against cold CLI output and makes unchanged sources unavailable for a leaf edit.
+#[test]
+fn incremental_blob_cache_matches_cold_reports_across_consumer_edits() {
+    const SECRET: &str = "SECRET_SOURCE_LINE_DO_NOT_CACHE_9f8a7b";
+    const CLIENT: &str = "import axios from 'axios';\nexport const api = axios.create({ baseURL: 'http://user:SECRET_SOURCE_LINE_DO_NOT_CACHE_9f8a7b@customer-service?token=SECRET_SOURCE_LINE_DO_NOT_CACHE_9f8a7b' });\n";
+    const SERVICE: &str = "export async function load(id: string) {\n  const response = await fetch('http://customer-service/customers/123');\n  return response.json();\n}\n";
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-blob-cache-{}", std::process::id()));
+    let paths = create_demo_workspace(&tmp).unwrap();
+    let repo = &paths.billing_service;
+    let git = GitRepo::new(repo);
+    let database = tmp.join("blobs.sqlite3");
+    let mut config = WorkspaceConfig::load_from_path(&paths.config_path).unwrap();
+    config.cache_path = Some(database.clone());
+    config.save_to_path(&paths.config_path).unwrap();
+
+    let leaf = format!(
+        "import {{ load }} from '@app/shared';\nexport async function render(id: string) {{\n  const user = await load(id);\n  return user.fullName; // {SECRET}\n}}\n"
+    );
+    let py = format!(
+        "import requests\n\ndef render():\n    response = requests.get('http://customer-service/customers/123')  # {SECRET}\n    return response.json()['fullName']  # {SECRET}\n"
+    );
+    for (path, contents) in [
+        ("httpClient.ts", CLIENT),
+        ("shared.ts", SERVICE),
+        ("Leaf.ts", &leaf),
+        (
+            "Stable.ts",
+            &leaf.replace("function render", "function stable"),
+        ),
+        ("consumer.py", &py),
+        (
+            "helper.ts",
+            &format!(
+                "export function take(customer: {{ fullName: string }}) {{\n  return customer.fullName; // {SECRET}\n}}\n"
+            ),
+        ),
+        (
+            "typed.ts",
+            &format!(
+                "import {{ api }} from './httpClient';\nimport {{ take }} from './helper';\ntype Payload = {{\n  fullName: string; // {SECRET}\n}};\nconst result = await api.get<Payload | '{SECRET}'>('/customers/123');\ntake(result.data);\nconst name = result.data.fullName; // {SECRET}\n"
+            ),
+        ),
+        (
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@app/*":["./*"]}}}"#,
+        ),
+    ] {
+        fs::write(repo.join(path), contents).unwrap();
+    }
+    commit_consumer_edit(repo, "Add cache test consumers");
+
+    let analyze = |revision, no_cache| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_laine"));
+        command
+            .env("RAYON_NUM_THREADS", "4")
+            .args(["analyze", "--config"])
+            .arg(&paths.config_path)
+            .args([
+                "--repo",
+                "customer-service",
+                "--base",
+                "main",
+                "--head",
+                "feature/split-customer-name",
+                "--format=json",
+                "--consumer-revision",
+                revision,
+            ]);
+        if no_cache {
+            command.arg("--no-cache");
+        }
+        let output = command.output().unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let cold = analyze("head", true);
+    assert!(cold.contains("Leaf.ts"), "{cold}");
+    assert!(cold.contains("Stable.ts"));
+    assert!(cold.contains("consumer.py"));
+    assert!(cold.contains("read \x60fullName\x60 @ billing-service/typed.ts:8"));
+    assert!(cold.contains("read \x60fullName\x60 @ helper.ts:2"));
+    assert_eq!(analyze("head", false), cold);
+    assert_eq!(analyze("head", false), cold);
+
+    // Check that the persisted facts, including source-adjacent type syntax, omit the sentinel.
+    let assert_sanitized = || {
+        assert!(
+            !fs::read(&database)
+                .unwrap()
+                .windows(SECRET.len())
+                .any(|bytes| bytes == SECRET.as_bytes())
+        );
+    };
+    assert_sanitized();
+
+    fs::write(repo.join("Leaf.ts"), leaf.replace("  return", "\n  return")).unwrap();
+    commit_consumer_edit(repo, "Edit one leaf");
+    let leaf_cold = analyze("head", true);
+    assert_ne!(leaf_cold, cold);
+
+    // A loose blob listing still exposes the OIDs when the objects cannot be opened.
+    // The incremental report must retain all unchanged TypeScript, config, and Python facts.
+    let blobs = git.list_file_blobs("HEAD").unwrap();
+    let objects = repo.join(".git/objects");
+    let hidden_dir = tmp.join("hidden-objects");
+    fs::create_dir(&hidden_dir).unwrap();
+    let hidden: Vec<_> = blobs
+        .iter()
+        .filter(|(path, _)| path.as_str() != "Leaf.ts")
+        .filter_map(|(_, oid)| oid.as_deref())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(|oid| {
+            let original = objects.join(&oid[..2]).join(&oid[2..]);
+            let hidden = hidden_dir.join(oid);
+            fs::rename(&original, &hidden).unwrap();
+            (original, hidden)
+        })
+        .collect();
+    let leaf_incremental = analyze("head", false);
+    for (original, hidden) in hidden {
+        fs::rename(hidden, original).unwrap();
+    }
+    assert_eq!(leaf_incremental, leaf_cold);
+
+    // A moved origin line changes the evidence in the unchanged importers.
+    fs::write(
+        repo.join("shared.ts"),
+        SERVICE.replace("  const response", "\n  const response"),
+    )
+    .unwrap();
+    commit_consumer_edit(repo, "Move the shared HTTP call");
+    let service_cold = analyze("head", true);
+    assert_ne!(service_cold, leaf_cold);
+    assert!(service_cold.contains("HTTP call @ shared.ts:3"));
+    assert_eq!(analyze("head", false), service_cold);
+    assert_eq!(analyze("head", false), service_cold);
+
+    // Moving the exported client off the producer invalidates both the caller and propagated reads.
+    fs::write(
+        repo.join("httpClient.ts"),
+        CLIENT.replace("customer-service", "different-host"),
+    )
+    .unwrap();
+    commit_consumer_edit(repo, "Change exported Axios base URL");
+    let axios_cold = analyze("head", true);
+    assert_ne!(axios_cold, service_cold);
+    assert!(axios_cold.contains("Stable.ts"));
+    assert!(!axios_cold.contains("read \x60fullName\x60 @ billing-service/typed.ts:8"));
+    assert!(!axios_cold.contains("read \x60fullName\x60 @ helper.ts:2"));
+    assert_eq!(analyze("head", false), axios_cold);
+    assert_eq!(analyze("head", false), axios_cold);
+
+    fs::write(
+        repo.join("consumer.py"),
+        py.replace("    return", "\n    return"),
+    )
+    .unwrap();
+    commit_consumer_edit(repo, "Edit one Python consumer");
+    let py_cold = analyze("head", true);
+    assert_ne!(py_cold, axios_cold);
+    assert!(py_cold.contains("consumer.py"));
+    assert_eq!(analyze("head", false), py_cold);
+    assert_eq!(analyze("head", false), py_cold);
+
+    fs::write(repo.join("consumer.py"), py).unwrap();
+    assert_git(repo, &["add", "consumer.py"]);
+    let staged_cold = analyze("staged", true);
+    assert_eq!(analyze("staged", false), staged_cold);
+    assert_eq!(analyze("staged", false), staged_cold);
+
+    let py_blob = git
+        .list_file_blobs("HEAD")
+        .unwrap()
+        .remove("consumer.py")
+        .unwrap()
+        .unwrap();
+    let cache = IndexCache::open(&database).unwrap();
+    let facts = cache
+        .get_blob_entries_batch(
+            "billing-service",
+            &compute_config_hash(&config),
+            &[BlobCacheKey {
+                stage: "py",
+                file_path: "consumer.py",
+                blob_id: &py_blob,
+                deps_hash: "",
+            }],
+        )
+        .unwrap();
+    assert!(
+        facts[0]
+            .as_ref()
+            .is_some_and(|payload| payload.contains("fullName"))
+    );
+    drop(cache);
+    assert_sanitized();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+// Stages a complete fixture edit so production reads use committed blob identities.
+fn commit_consumer_edit(repo: &Path, message: &str) {
+    assert_git(repo, &["add", "."]);
+    assert_git(repo, &["-c", "gc.auto=0", "commit", "-m", message]);
+}
+
+// Runs a fixture Git command and surfaces its diagnostic on failure.
+fn assert_git(repo: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
 }
 
 // Comprueba la ubicación del caché por defecto y el análisis cuando SQLite no está disponible.

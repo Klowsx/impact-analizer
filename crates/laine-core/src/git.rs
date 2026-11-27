@@ -4,6 +4,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::cache::stable_fingerprint;
 use crate::error::{LaineError, Result};
 
 /// Pseudo-revision representing uncommitted files on disk (working tree).
@@ -152,10 +153,43 @@ impl GitRepo {
                 results.insert(path.clone(), raw);
             }
         }
-        if line_paths.is_empty() {
+        let prefix = if is_staged_rev(rev) { "" } else { rev };
+        let specs = line_paths
+            .into_iter()
+            .map(|path| {
+                (
+                    path.as_str(),
+                    format!("{prefix}:{}", to_git_posix_path(Path::new(path))),
+                )
+            })
+            .collect::<Vec<_>>();
+        results.extend(self.read_blob_specs(&specs)?);
+        Ok(results)
+    }
+
+    /// Reads the staged objects captured during listing, even if the index changes in the meantime.
+    pub fn read_staged_blobs(
+        &self,
+        identities: &BTreeMap<String, Option<String>>,
+        paths: &[String],
+    ) -> Result<BTreeMap<String, String>> {
+        let specs = paths
+            .iter()
+            .filter_map(|path| {
+                let oid = identities.get(path)?.as_ref()?;
+                (matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                    .then(|| (path.as_str(), oid.clone()))
+            })
+            .collect::<Vec<_>>();
+        self.read_blob_specs(&specs)
+    }
+
+    // Reads line-safe revision specs or object IDs and associates each response with its path.
+    fn read_blob_specs(&self, specs: &[(&str, String)]) -> Result<BTreeMap<String, String>> {
+        let mut results = BTreeMap::new();
+        if specs.is_empty() {
             return Ok(results);
         }
-
         let mut child = Command::new("git")
             .current_dir(&self.root)
             .args(["cat-file", "--batch"])
@@ -177,17 +211,12 @@ impl GitRepo {
             message: "failed to open stdout pipe".into(),
         })?;
 
-        let staged = is_staged_rev(rev);
-        let prefix = if staged { "" } else { rev };
-
         // Write specs on a scoped thread so large batches never deadlock the pipe buffer.
         let read_result: Result<()> = std::thread::scope(|scope| {
-            let write_paths = &line_paths;
             let writer = scope.spawn(move || {
                 let mut stdin = BufWriter::new(stdin);
-                for path in write_paths {
-                    let posix = to_git_posix_path(Path::new(path));
-                    if writeln!(stdin, "{prefix}:{posix}").is_err() {
+                for (_, spec) in specs {
+                    if writeln!(stdin, "{spec}").is_err() {
                         break;
                     }
                 }
@@ -198,7 +227,7 @@ impl GitRepo {
             let mut reader = BufReader::new(stdout);
             let mut header = String::new();
 
-            for path in line_paths.iter().copied() {
+            for &(path, _) in specs {
                 header.clear();
                 let n = reader
                     .read_line(&mut header)
@@ -252,7 +281,7 @@ impl GitRepo {
                     // Retain only the source text's capacity for the rest of the snapshot.
                     bytes.shrink_to_fit();
                     if let Ok(source) = decode_source(bytes, Path::new(path)) {
-                        results.insert(path.clone(), source);
+                        results.insert(path.to_owned(), source);
                     }
                 }
             }
@@ -275,6 +304,56 @@ impl GitRepo {
         }
 
         Ok(results)
+    }
+
+    /// Lists snapshot paths and identities without opening committed or staged blob contents.
+    /// Symlinks, submodules, unreadable worktree files, and unmerged index entries have no identity.
+    pub fn list_file_blobs(&self, rev: &str) -> Result<BTreeMap<String, Option<String>>> {
+        if is_worktree_rev(rev) {
+            let links = self.git_link_paths(STAGED_REV, None)?;
+            let root = self.canonical_worktree_root()?;
+            return Ok(self
+                .list_files(rev)?
+                .into_iter()
+                .map(|path| {
+                    let blob = read_worktree_bytes(&root, &path, &links)
+                        .ok()
+                        .map(|bytes| format!("fp:{}", stable_fingerprint(&bytes)));
+                    (path, blob)
+                })
+                .collect());
+        }
+
+        let staged = is_staged_rev(rev);
+        let output = if staged {
+            self.run_git_utf8(&["ls-files", "-z", "--stage"])?
+        } else {
+            self.run_git_utf8(&["ls-tree", "-rz", rev])?
+        };
+        let mut entries = BTreeMap::new();
+        for entry in output.split_terminator('\0') {
+            let Some((object, path)) = entry.split_once('\t') else {
+                continue;
+            };
+            let mut fields = object.split_whitespace();
+            let (Some(mode), Some(second), Some(third)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let regular = mode.starts_with("100");
+            let value = if staged {
+                if third != "0" {
+                    entries.entry(path.to_owned()).or_insert(None);
+                    continue;
+                }
+                (regular && second.bytes().any(|byte| byte != b'0')).then(|| second.to_owned())
+            } else {
+                (regular && second == "blob").then(|| third.to_owned())
+            };
+            entries.insert(path.to_owned(), value);
+        }
+        Ok(entries)
     }
 
     /// Enumera archivos de un commit, índice o árbol local con rutas delimitadas por NUL.
@@ -384,12 +463,22 @@ impl GitRepo {
     }
 }
 
-// Rechaza enlaces y rutas externas antes de abrir el archivo local como UTF-8.
+// Decodes regular worktree files using the same UTF-8 rules as Git blobs.
 fn read_worktree_file(
     root: &Path,
     relative_path: &str,
     indexed_links: &BTreeSet<String>,
 ) -> Result<String> {
+    let bytes = read_worktree_bytes(root, relative_path, indexed_links)?;
+    decode_source(bytes, Path::new(relative_path))
+}
+
+// Reads local bytes only after rejecting links and paths outside the checkout.
+fn read_worktree_bytes(
+    root: &Path,
+    relative_path: &str,
+    indexed_links: &BTreeSet<String>,
+) -> Result<Vec<u8>> {
     let normalized = to_git_posix_path(Path::new(relative_path));
     let relative = Path::new(&normalized);
     if indexed_links.contains(&normalized) {
@@ -422,7 +511,7 @@ fn read_worktree_file(
             "expected a regular file",
         )));
     }
-    decode_source(fs::read(path).map_err(io_error)?, relative)
+    fs::read(path).map_err(io_error)
 }
 
 // Detecta enlaces y puntos de reanálisis de Windows como junctions.
@@ -501,7 +590,7 @@ mod tests {
         fs::remove_dir_all(&tmp).unwrap();
     }
 
-    // Verifica que commits, índice y disco rechacen bytes y entradas de enlace no analizables.
+    // Checks that snapshots reject invalid UTF-8 and never follow indexed links.
     #[test]
     fn rejects_non_utf8_and_indexed_links_in_every_snapshot() {
         let tmp = std::env::temp_dir().join(format!("laine-git-unreadable-{}", std::process::id()));
@@ -527,6 +616,24 @@ mod tests {
         ];
 
         for snapshot in [rev.as_str(), STAGED_REV, WORKTREE_REV] {
+            let blobs = repo.list_file_blobs(snapshot).unwrap();
+            assert!(blobs["binary.ts"].is_some());
+            assert_eq!(blobs["link.ts"], None);
+            if snapshot == WORKTREE_REV {
+                assert_eq!(
+                    blobs["binary.ts"],
+                    Some(format!("fp:{}", stable_fingerprint(&[0x66, 0x80])))
+                );
+            } else {
+                assert_eq!(
+                    blobs["binary.ts"].as_deref(),
+                    Some(
+                        repo.run_git_utf8(&["rev-parse", "HEAD:binary.ts"])
+                            .unwrap()
+                            .trim()
+                    )
+                );
+            }
             assert!(
                 matches!(repo.read_file(snapshot, Path::new("binary.ts")), Err(LaineError::Io { source, .. }) if source.kind() == io::ErrorKind::InvalidData)
             );

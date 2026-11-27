@@ -173,6 +173,24 @@ pub struct RouteSourceConfig {
     pub prefix: Option<String>,
 }
 
+impl RouteSourceConfig {
+    /// Return normalized snapshot paths, with the conventional Laravel defaults.
+    pub fn snapshot_files(&self) -> BTreeSet<String> {
+        if self.files.is_empty() && self.framework == RouteFramework::Laravel {
+            return ["routes/api.php".into(), "routes/web.php".into()].into();
+        }
+        self.files
+            .iter()
+            .map(|path| {
+                path.to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_start_matches("./")
+                    .to_owned()
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServiceConfig {
     pub name: String,

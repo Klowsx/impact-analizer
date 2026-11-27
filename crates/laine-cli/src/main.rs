@@ -14,15 +14,15 @@ use laine_cli::engine::{
 };
 use laine_cli::report::{omit_snippets, render_json, render_markdown, render_terminal};
 use laine_core::config::{
-    PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig,
-    lock_config_update, write_config_atomically,
+    CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
+    WorkspaceConfig, lock_config_update, write_config_atomically,
 };
 use laine_core::error::LaineError;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::{GitRepo, STAGED_REV};
 use laine_core::workspace::{
     ClientAmbiguity, DiscoveredRepo, WorkspaceRegistry, build_workspace_config,
-    discover_workspace_clients, infer_workspace_scan_dir, inspect_repo_path,
+    discover_workspace_clients_with, infer_workspace_scan_dir, inspect_repo_path,
     merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
     same_repository_path, scan_directory, validate_workspace_name, workspace_service_path,
 };
@@ -469,7 +469,7 @@ fn parse_cli() -> Result<Cli, ExitCode> {
     }
 }
 
-/// Inicializa la configuración y valida el terminal antes de escanear si pide selección.
+/// Initialize the workspace, checking terminal support before interactive selection.
 fn handle_init(
     path: Option<PathBuf>,
     force: bool,
@@ -558,8 +558,7 @@ fn handle_init(
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let mut cfg = build_workspace_config(&selected, config_dir, false);
-        let ambiguities =
-            discover_workspace_clients(&mut cfg, config_dir, catalog_workspace_routes);
+        let ambiguities = discover_clients(&mut cfg, config_dir);
         if let Err(err) =
             persist_initialized_workspace(&dest, workspace.as_deref(), force, Some(&cfg))
         {
@@ -575,7 +574,7 @@ fn handle_init(
         for repo in &selected {
             println!("  - {} ({})", repo.name, repo.detected_kind);
         }
-        print_workspace_clients(&cfg, "Auto-detected", &ambiguities);
+        print_workspace_clients(&cfg.clients, "Auto-detected", &ambiguities);
         if !cfg.env.is_empty() {
             println!("Auto-detected {} API URL env var(s).", cfg.env.len());
         }
@@ -797,7 +796,7 @@ fn handle_workspace_edit(
             return ExitCode::FAILURE;
         }
     }
-    let ambiguities = discover_workspace_clients(&mut updated, cfg_dir, catalog_workspace_routes);
+    let ambiguities = discover_clients(&mut updated, cfg_dir);
     if let Err(err) = updated.save_to_path(cfg_path) {
         eprintln!("Failed to save {}: {err}", cfg_path.display());
         return ExitCode::FAILURE;
@@ -811,15 +810,24 @@ fn handle_workspace_edit(
     for svc in &updated.services {
         println!("  - {}", svc.name);
     }
-    print_workspace_clients(&updated, "Configured", &ambiguities);
+    print_workspace_clients(&updated.clients, "Configured", &ambiguities);
     ExitCode::SUCCESS
 }
 
+// Discover missing clients with the same framework extractors used by analysis.
+fn discover_clients(config: &mut WorkspaceConfig, config_dir: &Path) -> Vec<ClientAmbiguity> {
+    discover_workspace_clients_with(config, config_dir, catalog_workspace_routes)
+}
+
 // Print scoped mappings and show the producer choices for unresolved ties.
-fn print_workspace_clients(config: &WorkspaceConfig, verb: &str, ambiguities: &[ClientAmbiguity]) {
-    if !config.clients.is_empty() {
+fn print_workspace_clients(
+    clients: &[CustomClientConfig],
+    verb: &str,
+    ambiguities: &[ClientAmbiguity],
+) {
+    if !clients.is_empty() {
         println!("{verb} HTTP client wrapper(s):");
-        for client in &config.clients {
+        for client in clients {
             let consumer = client
                 .consumer_service
                 .as_deref()
@@ -845,7 +853,7 @@ fn print_workspace_clients(config: &WorkspaceConfig, verb: &str, ambiguities: &[
     }
 }
 
-// Update repositories under a config write lock and prune client references on removal.
+// Update repositories and client mappings under the same config write lock.
 fn handle_repo(action: RepoAction) -> ExitCode {
     match action {
         RepoAction::Add {
@@ -929,11 +937,22 @@ fn handle_repo(action: RepoAction) -> ExitCode {
                 base_urls,
             });
 
+            let config_dir = target_cfg_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let existing_clients = cfg.clients.len();
+            let ambiguities = discover_clients(&mut cfg, config_dir);
             match cfg.save_to_path(&target_cfg_path) {
                 Ok(()) => {
                     println!(
                         "Added service '{service_name}' to {}",
                         target_cfg_path.display()
+                    );
+                    print_workspace_clients(
+                        &cfg.clients[existing_clients..],
+                        "Configured",
+                        &ambiguities,
                     );
                     ExitCode::SUCCESS
                 }

@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::Path;
 
 use saphyr::{LoadableYamlNode, MarkedYaml, Scalar, YamlData};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{LaineError, Result};
+use crate::git::GitRepo;
 use crate::model::{ContractChange, EndpointId, ExtractionFailure, HttpMethod, SourceSpan};
 
 #[path = "openapi_refs.rs"]
@@ -76,6 +78,33 @@ pub struct OpenApiExtraction {
     pub contract: ApiContract,
     pub diagnostics: Vec<(ContractSource, ExtractionFailure)>,
     pub loaded_files: usize,
+}
+
+pub struct OpenApiSnapshot {
+    pub file: String,
+    contents: String,
+}
+
+impl OpenApiSnapshot {
+    /// Read an OpenAPI document by its repository-relative path in a single snapshot.
+    pub fn read(git: &GitRepo, revision: &str, path: &str) -> Result<Self> {
+        Ok(Self {
+            file: path.to_owned(),
+            contents: git.read_file(revision, Path::new(path))?,
+        })
+    }
+
+    /// Extract the contract and resolve external references from the same snapshot.
+    pub fn extract(
+        &self,
+        git: &GitRepo,
+        revision: &str,
+        service: &str,
+    ) -> Result<OpenApiExtraction> {
+        extract_contract_with_references(service, &self.file, &self.contents, |path| {
+            git.read_file(revision, Path::new(path)).ok()
+        })
+    }
 }
 
 impl ApiContract {

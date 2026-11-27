@@ -1,12 +1,10 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use laine_core::config::{
-    CustomClientConfig, ServiceConfig, ServiceEndpointMatch, is_absolute_http_url,
-    normalize_relative_path, resolve_http_service_url,
-};
+use laine_core::config::{CustomClientConfig, ServiceConfig};
 use laine_core::model::HttpMethod;
 use laine_core::request::{Argument, ArgumentType, HttpRequestEvidence, RequestSection};
+use laine_core::url::{resolve_custom_client_url, resolve_http_service_url, resolve_url_with_base};
 use serde::{Deserialize, Serialize};
 
 use crate::routes::{
@@ -1115,7 +1113,7 @@ impl<'a> PyFileExtractor<'a> {
         }
     }
 
-    // Extrae llamadas HTTP y conserva el diagnóstico si la URL apunta a varios servicios.
+    // Record HTTP calls and keep diagnostics for unresolved destinations.
     fn process_http_call(
         &mut self,
         stmt: &LogicalStmt,
@@ -1187,42 +1185,28 @@ impl<'a> PyFileExtractor<'a> {
                     url_arg_index,
                     matches!(target, CallTarget::ClientInstance { .. }),
                 );
-                let matched_result: Result<Option<ServiceEndpointMatch>, String> = match &target {
+                let matched_result = match &target {
                     CallTarget::Requests { .. } | CallTarget::Httpx { .. } => {
                         resolve_http_service_url(&url_str, self.ctx.services)
                     }
                     CallTarget::ClientInstance { base_url, .. } => {
-                        if is_absolute_http_url(&url_str) {
-                            resolve_http_service_url(&url_str, self.ctx.services)
-                        } else {
-                            match base_url {
-                                Some(UrlEval::Resolved(base)) => {
-                                    let combined = join_base_and_relative(base, &url_str);
-                                    resolve_http_service_url(&combined, self.ctx.services)
-                                }
-                                Some(UrlEval::Dynamic(reason)) => Err(reason.clone()),
-                                None => Err("relative URL on HTTP client without static base_url"
-                                    .to_string()),
-                            }
-                        }
+                        let base = match base_url {
+                            Some(UrlEval::Resolved(base)) => Ok(base.as_str()),
+                            Some(UrlEval::Dynamic(reason)) => Err(reason.as_str()),
+                            None => Err("relative URL on HTTP client without static base_url"),
+                        };
+                        resolve_url_with_base(&url_str, base, self.ctx.services)
                     }
                     CallTarget::Custom {
                         target_service,
                         path_prefix,
                         ..
-                    } => {
-                        if is_absolute_http_url(&url_str) {
-                            resolve_http_service_url(&url_str, self.ctx.services)
-                        } else {
-                            Ok(Some(ServiceEndpointMatch {
-                                service: target_service.clone(),
-                                normalized_path: normalize_relative_path(
-                                    &url_str,
-                                    path_prefix.as_deref(),
-                                ),
-                            }))
-                        }
-                    }
+                    } => resolve_custom_client_url(
+                        &url_str,
+                        target_service,
+                        path_prefix.as_deref(),
+                        self.ctx.services,
+                    ),
                 };
 
                 match matched_result {
@@ -2328,16 +2312,6 @@ fn join_field_path(prefix: &str, segment: &str) -> String {
         segment.to_string()
     } else {
         format!("{prefix}.{segment}")
-    }
-}
-
-fn join_base_and_relative(base: &str, rel: &str) -> String {
-    let b = base.trim().trim_end_matches('/');
-    let r = rel.trim().trim_start_matches('/');
-    if r.is_empty() {
-        b.to_string()
-    } else {
-        format!("{b}/{r}")
     }
 }
 

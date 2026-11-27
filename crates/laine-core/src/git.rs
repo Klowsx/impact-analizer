@@ -459,7 +459,8 @@ fn decode_source(bytes: Vec<u8>, path: &Path) -> Result<String> {
 }
 
 // Convierte separadores de Windows y conserva una barra invertida literal en Unix.
-fn to_git_posix_path(path: &Path) -> String {
+/// Convert a repository-relative path to the spelling used by Git.
+pub fn to_git_posix_path(path: &Path) -> String {
     let raw = if cfg!(windows) {
         path.to_string_lossy().replace('\\', "/")
     } else {

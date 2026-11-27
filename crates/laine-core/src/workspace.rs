@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{
     CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
-    WorkspaceConfig, matching_http_url, normalize_relative_path, write_config_atomically,
+    WorkspaceConfig, write_config_atomically,
 };
 use crate::error::{LaineError, Result};
-use crate::git::GitRepo;
+use crate::git::{GitRepo, WORKTREE_REV, to_git_posix_path};
 use crate::graph::routes_match;
+use crate::laravel::extract_laravel_routes;
 use crate::model::Severity;
-use crate::openapi::{canonical_route_key, extract_contract};
+use crate::openapi::{OpenApiSnapshot, canonical_route_key};
+use crate::url::{matching_http_url, normalize_relative_path};
 
 /// Registry mapping named workspaces (e.g. `corporativo`, `proyecto-b`) to their
 /// `laine.toml` file paths so developers can maintain multiple isolated ecosystems
@@ -455,11 +457,22 @@ pub struct ClientAmbiguity {
     pub candidates: Vec<String>,
 }
 
-/// Infer missing mappings per consumer using the workspace's final service names and overrides.
+/// Infer missing client mappings using the core OpenAPI and Laravel extractors.
 pub fn discover_workspace_clients(
     config: &mut WorkspaceConfig,
     config_dir: &Path,
-    framework_routes: impl Fn(&Path, &str, &RouteSourceConfig) -> Vec<String>,
+) -> Vec<ClientAmbiguity> {
+    discover_workspace_clients_with(config, config_dir, catalog_laravel_routes)
+}
+
+/// Infer missing mappings per consumer using the workspace's final names and overrides.
+///
+/// The callback extracts framework routes from the supplied Git snapshot and returns
+/// normalized endpoint paths. OpenAPI contracts are extracted separately by core.
+pub fn discover_workspace_clients_with(
+    config: &mut WorkspaceConfig,
+    config_dir: &Path,
+    framework_routes: impl Fn(&GitRepo, &str, &str, &RouteSourceConfig) -> Vec<String>,
 ) -> Vec<ClientAmbiguity> {
     let producers: Vec<_> = config
         .services
@@ -518,41 +531,76 @@ pub fn discover_workspace_clients(
     ambiguities
 }
 
-// Prefer committed contract evidence and fall back to a local OpenAPI file.
-fn read_repo_file_preferring_head(repo_root: &Path, rel: &Path) -> Option<String> {
-    let git = GitRepo::new(repo_root);
-    if let Ok(committed) = git.read_file("HEAD", rel) {
-        return Some(committed);
+// Extract Laravel routes when no language adapters are available.
+fn catalog_laravel_routes(
+    git: &GitRepo,
+    service_name: &str,
+    revision: &str,
+    config: &RouteSourceConfig,
+) -> Vec<String> {
+    if config.framework != RouteFramework::Laravel {
+        return Vec::new();
     }
-    fs::read(repo_root.join(rel))
-        .ok()
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    let Ok(files) = git.list_files(revision) else {
+        return Vec::new();
+    };
+    let selected = config.snapshot_files();
+    let candidates = files
+        .into_iter()
+        .filter(|file| selected.contains(file))
+        .collect::<Vec<_>>();
+    git.read_files_batch(revision, &candidates)
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|(file, raw)| {
+            extract_laravel_routes(service_name, &file, &raw, config.prefix.as_deref())
+        })
+        .map(|route| route.endpoint.normalized_path)
+        .collect()
 }
 
-// Combine the configured OpenAPI spec with the same framework routes used for analysis.
+// Combine contracts and framework routes from the producer's preferred snapshot.
 fn build_producer_catalog<'a>(
     service: &'a ServiceConfig,
     config_dir: &Path,
-    framework_routes: &impl Fn(&Path, &str, &RouteSourceConfig) -> Vec<String>,
+    framework_routes: &impl Fn(&GitRepo, &str, &str, &RouteSourceConfig) -> Vec<String>,
 ) -> ProducerCatalog<'a> {
-    let root = workspace_service_path(config_dir, service);
+    let git = GitRepo::new(workspace_service_path(config_dir, service));
+    let head = git.resolve_revision("HEAD").ok();
+    let revision = head.as_deref().unwrap_or(WORKTREE_REV);
     let mut canonical_routes = BTreeSet::new();
 
-    if let Some(openapi_rel) = service.openapi.as_deref()
-        && let Some(raw) = read_repo_file_preferring_head(&root, openapi_rel)
-        && let Ok(contract) = extract_contract(&service.name, &raw)
-    {
-        canonical_routes.extend(
-            contract
-                .endpoints
-                .keys()
-                .map(|ep| canonical_route_key(&ep.normalized_path)),
-        );
+    if let Some(openapi_rel) = service.openapi.as_deref() {
+        let path = to_git_posix_path(openapi_rel);
+        // Preserve discovery of a newly added spec, with references from its own snapshot.
+        let document = head
+            .as_deref()
+            .and_then(|rev| {
+                OpenApiSnapshot::read(&git, rev, &path)
+                    .ok()
+                    .map(|doc| (rev, doc))
+            })
+            .or_else(|| {
+                OpenApiSnapshot::read(&git, WORKTREE_REV, &path)
+                    .ok()
+                    .map(|doc| (WORKTREE_REV, doc))
+            });
+        if let Some((rev, document)) = document
+            && let Ok(extraction) = document.extract(&git, rev, &service.name)
+        {
+            canonical_routes.extend(
+                extraction
+                    .contract
+                    .endpoints
+                    .keys()
+                    .map(|ep| canonical_route_key(&ep.normalized_path)),
+            );
+        }
     }
 
     if let Some(routes) = &service.routes {
         canonical_routes.extend(
-            framework_routes(&root, &service.name, routes)
+            framework_routes(&git, &service.name, revision, routes)
                 .iter()
                 .map(|path| canonical_route_key(path)),
         );
@@ -1145,25 +1193,6 @@ mod tests {
 
     use super::*;
     use crate::config::ServiceConfig;
-    use crate::laravel::extract_laravel_routes;
-
-    // Supply Laravel route evidence for the core scanner tests.
-    fn laravel_catalog(root: &Path, name: &str, config: &RouteSourceConfig) -> Vec<String> {
-        config
-            .files
-            .iter()
-            .filter_map(|file| read_repo_file_preferring_head(root, file).map(|raw| (file, raw)))
-            .flat_map(|(file, raw)| {
-                extract_laravel_routes(
-                    name,
-                    &file.to_string_lossy(),
-                    &raw,
-                    config.prefix.as_deref(),
-                )
-            })
-            .map(|route| route.endpoint.normalized_path)
-            .collect()
-    }
 
     fn init_git_repo(dir: &Path) {
         fs::create_dir_all(dir).unwrap();
@@ -1472,7 +1501,7 @@ export function reset() {
 
         let repos = scan_directory(&tmp).expect("scan should succeed");
         let mut cfg = build_workspace_config(&repos, &tmp, false);
-        assert!(discover_workspace_clients(&mut cfg, &tmp, laravel_catalog).is_empty());
+        assert!(discover_workspace_clients(&mut cfg, &tmp).is_empty());
 
         assert_eq!(
             cfg.env.get("NUXT_PUBLIC_API").map(String::as_str),
@@ -1585,7 +1614,7 @@ export function reset() {
 
         let config_dir = tmp.join("configs");
         let mut merged = merge_workspace_config(&existing, &selected, &config_dir);
-        assert!(discover_workspace_clients(&mut merged, &config_dir, laravel_catalog).is_empty());
+        assert!(discover_workspace_clients(&mut merged, &config_dir).is_empty());
         assert_eq!(merged.policy.fail_on, Severity::Critical);
         assert_eq!(merged.policy.ignore_endpoints, vec!["/health".to_string()]);
         assert_eq!(merged.cache_path, Some(".cache/custom.sqlite".into()));
@@ -1724,7 +1753,7 @@ target_service = "backend"
 
         let repos = scan_directory(&tmp).unwrap();
         let mut cfg = build_workspace_config(&repos, &tmp, false);
-        assert!(discover_workspace_clients(&mut cfg, &tmp, laravel_catalog).is_empty());
+        assert!(discover_workspace_clients(&mut cfg, &tmp).is_empty());
 
         assert_eq!(cfg.clients.len(), 1);
         assert_eq!(cfg.clients[0].callee, "getClient().fetch");

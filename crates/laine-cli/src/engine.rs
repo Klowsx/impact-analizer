@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
 use laine_core::cache::{IndexCache, compute_config_hash, stable_fingerprint};
 use laine_core::config::{RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig};
 use laine_core::error::{LaineError, Result};
-use laine_core::git::{GitRepo, STAGED_REV, WORKTREE_REV};
+use laine_core::git::{GitRepo, STAGED_REV, WORKTREE_REV, to_git_posix_path};
 use laine_core::graph::DependencyGraph;
 use laine_core::impact::{ImpactInput, analyze_impact};
 use laine_core::laravel::analyze_laravel_routes;
@@ -15,7 +15,7 @@ use laine_core::model::{
     FileCoverage, HttpMethod, UnresolvedCall, WorkspaceIdentity,
 };
 use laine_core::openapi::{
-    OpenApiExtraction, canonical_route_key, diff_contracts, extract_contract_with_references,
+    OpenApiExtraction, OpenApiSnapshot, canonical_route_key, diff_contracts,
 };
 use laine_core::policy::{evaluate_policy, filter_ignored_findings};
 use laine_core::request::HttpRequestEvidence;
@@ -152,11 +152,6 @@ impl ConsumerInputs {
     }
 }
 
-struct OpenApiSnapshot {
-    file: String,
-    contents: String,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct FileExtraction {
     coverage: FileCoverage,
@@ -258,7 +253,7 @@ pub fn run_analysis_with_local_paths(
     run_analysis_with_consumer_revision(req, no_cache, include_repo_roots, ConsumerRevision::Head)
 }
 
-// Analiza los snapshots elegidos y reconstruye la extracción si el caché falla.
+// Analyze the selected snapshots and rebuild extraction on cache misses.
 pub fn run_analysis_with_consumer_revision(
     req: &AnalyzeRequest,
     no_cache: bool,
@@ -333,18 +328,8 @@ pub fn run_analysis_with_consumer_revision(
     if let Some(openapi_rel) = target_service.openapi.as_deref() {
         let (base_document, head_document) =
             read_openapi_snapshots(&producer_git, &base_sha, &head_sha, openapi_rel)?;
-        let before = extract_contract_with_references(
-            &target_service.name,
-            &base_document.file,
-            &base_document.contents,
-            |path| producer_git.read_file(&base_sha, Path::new(path)).ok(),
-        )?;
-        let after = extract_contract_with_references(
-            &target_service.name,
-            &head_document.file,
-            &head_document.contents,
-            |path| producer_git.read_file(&head_sha, Path::new(path)).ok(),
-        )?;
+        let before = base_document.extract(&producer_git, &base_sha, &target_service.name)?;
+        let after = head_document.extract(&producer_git, &head_sha, &target_service.name)?;
         producer_base = record_openapi_coverage(
             &before,
             &mut diagnostics,
@@ -1029,17 +1014,14 @@ fn apply_cached_consumer_repo(
     }
 }
 
-/// Build the workspace scan's route catalog from the same extractors used by analysis.
+/// Supply discovery with the framework paths from the analysis engine's snapshot extractor.
 pub fn catalog_workspace_routes(
-    root: &Path,
+    git: &GitRepo,
     service_name: &str,
+    revision: &str,
     route_cfg: &RouteSourceConfig,
 ) -> Vec<String> {
-    let git = GitRepo::new(root);
-    let rev = git
-        .resolve_revision("HEAD")
-        .unwrap_or_else(|_| WORKTREE_REV.to_owned());
-    extract_producer_routes(&git, service_name, &rev, route_cfg)
+    extract_producer_routes(git, service_name, revision, route_cfg)
         .map(|(routes, _)| {
             routes
                 .into_iter()
@@ -1057,16 +1039,7 @@ fn extract_producer_routes(
     route_cfg: &RouteSourceConfig,
 ) -> Result<(Vec<ExtractedRoute>, FileExtraction)> {
     let all_files = git.list_files(rev)?;
-    let selected: BTreeSet<_> = route_cfg
-        .files
-        .iter()
-        .map(|path| {
-            path.to_string_lossy()
-                .replace('\\', "/")
-                .trim_start_matches("./")
-                .to_owned()
-        })
-        .collect();
+    let selected = route_cfg.snapshot_files();
     // Look for mounts and imports outside the configured files in the same revision.
     let candidate_files: Vec<_> = all_files
         .iter()
@@ -1075,10 +1048,7 @@ fn extract_producer_routes(
                 return true;
             }
             match route_cfg.framework {
-                RouteFramework::Laravel => {
-                    selected.is_empty()
-                        && matches!(file.as_str(), "routes/api.php" | "routes/web.php")
-                }
+                RouteFramework::Laravel => false,
                 RouteFramework::Express => {
                     is_analyzable_ts_or_js(file)
                         && (selected.is_empty() || !file.to_ascii_lowercase().ends_with(".vue"))
@@ -1148,21 +1118,16 @@ fn extract_producer_routes(
     Ok((snapshot.routes, extraction))
 }
 
-// Conserva archivos ilegibles como errores de lectura y sigue renombres detectados por Git.
+// Preserve read failures and follow Git renames between the compared snapshots.
 fn read_openapi_snapshots(
     git: &GitRepo,
     base: &str,
     head: &str,
     configured: &Path,
 ) -> Result<(OpenApiSnapshot, OpenApiSnapshot)> {
-    let path = configured.to_string_lossy();
-    let path = if cfg!(windows) {
-        path.replace('\\', "/")
-    } else {
-        path.into_owned()
-    };
-    let path = path.trim_start_matches("./");
-    let read = |revision| match read_openapi_snapshot(git, revision, path) {
+    let path = to_git_posix_path(configured);
+    let path = path.as_str();
+    let read = |revision| match OpenApiSnapshot::read(git, revision, path) {
         Ok(snapshot) => Ok(Some(snapshot)),
         Err(_)
             if git
@@ -1183,7 +1148,7 @@ fn read_openapi_snapshots(
                 .into_iter()
                 .find(|(source, _)| source == path)
             {
-                return Ok((before, read_openapi_snapshot(git, head, &destination)?));
+                return Ok((before, OpenApiSnapshot::read(git, head, &destination)?));
             }
             Err(openapi_missing(path, head))
         }
@@ -1193,7 +1158,7 @@ fn read_openapi_snapshots(
                 .into_iter()
                 .find(|(_, destination)| destination == path)
             {
-                return Ok((read_openapi_snapshot(git, base, &source)?, after));
+                return Ok((OpenApiSnapshot::read(git, base, &source)?, after));
             }
             Err(openapi_missing(path, base))
         }
@@ -1230,14 +1195,6 @@ fn record_openapi_coverage(
         analyzed: extraction.loaded_files - failed,
         failed,
     }
-}
-
-// Lee el contrato y conserva la ruta exacta del archivo en su revisión.
-fn read_openapi_snapshot(git: &GitRepo, revision: &str, path: &str) -> Result<OpenApiSnapshot> {
-    Ok(OpenApiSnapshot {
-        file: path.to_owned(),
-        contents: git.read_file(revision, Path::new(path))?,
-    })
 }
 
 // Propone verificar la ruta o añadir el renombre al índice cuando falta el documento.

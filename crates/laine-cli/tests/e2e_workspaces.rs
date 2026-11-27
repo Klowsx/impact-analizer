@@ -207,6 +207,147 @@ fn workspace_scan_uses_framework_routes_and_reports_ambiguous_wrappers() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+// Check that discovery and analysis agree on committed mounts and referenced OpenAPI paths.
+#[test]
+fn workspace_discovery_uses_mounted_and_referenced_snapshot_routes() {
+    let tmp = std::env::temp_dir().join(format!("laine-e2e-mounted-scan-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&tmp);
+    let projects = tmp.join("projects");
+    let home = tmp.join("home");
+    let express = projects.join("express-api");
+    let fastapi = projects.join("fastapi-api");
+    let openapi = projects.join("openapi-api");
+    let portal = projects.join("portal");
+    let added = projects.join("added");
+    for repo in [&express, &fastapi, &openapi, &portal, &added] {
+        init_repo(repo);
+    }
+
+    let express_app = "import express from 'express';\nimport { router } from './router';\nconst app = express();\napp.use('/node', router);\n";
+    fs::write(
+        express.join("package.json"),
+        r#"{"dependencies":{"express":"5"}}"#,
+    )
+    .unwrap();
+    fs::write(express.join("app.ts"), express_app).unwrap();
+    fs::write(
+        express.join("router.ts"),
+        "import { Router } from 'express';\nexport const router = Router();\nrouter.get('/items', handler);\n",
+    )
+    .unwrap();
+
+    let fastapi_app = "from fastapi import FastAPI\nfrom router import items\napp = FastAPI()\napp.include_router(items, prefix='/python')\n";
+    fs::write(fastapi.join("requirements.txt"), "fastapi\n").unwrap();
+    fs::write(fastapi.join("app.py"), fastapi_app).unwrap();
+    fs::write(
+        fastapi.join("router.py"),
+        "from fastapi import APIRouter\nitems = APIRouter(prefix='/v1')\n@items.get('/items')\ndef list_items():\n    return []\n",
+    )
+    .unwrap();
+
+    fs::create_dir_all(openapi.join("parts")).unwrap();
+    fs::write(
+        openapi.join("openapi.yaml"),
+        "openapi: 3.1.0\ninfo: {title: API, version: '1'}\npaths:\n  /documented: {$ref: './parts/item.yaml'}\n",
+    )
+    .unwrap();
+    fs::write(
+        openapi.join("parts/item.yaml"),
+        "get:\n  responses:\n    '200': {description: ok}\n",
+    )
+    .unwrap();
+    let calls = "nodeTransport.get('/node/items');\npythonTransport.get('/python/v1/items');\nspecTransport.get('/documented');\n";
+    fs::write(portal.join("calls.ts"), calls).unwrap();
+    fs::write(added.join("calls.ts"), calls).unwrap();
+    for repo in [&express, &fastapi, &openapi, &portal, &added] {
+        git(repo, &["add", "."]);
+        git(
+            repo,
+            &["commit", "-m", "store producer and consumer sources"],
+        );
+    }
+
+    // Move both mounts locally so discovery must read committed routes to infer either target.
+    fs::write(
+        express.join("app.ts"),
+        express_app.replace("/node", "/moved"),
+    )
+    .unwrap();
+    fs::write(
+        fastapi.join("app.py"),
+        fastapi_app.replace("/python", "/moved"),
+    )
+    .unwrap();
+    let laine = |cwd: &Path, args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_laine"))
+            .current_dir(cwd)
+            .env("LAINE_HOME", &home)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let initialized = laine(
+        &projects,
+        &[
+            "init",
+            "--scan",
+            "--select",
+            "express-api,fastapi-api,openapi-api,portal",
+            "--workspace",
+            "mounted",
+        ],
+    );
+    assert!(initialized.status.success(), "{initialized:?}");
+    let config_path = home.join("configs/mounted.toml");
+    let assert_mappings = |config: &WorkspaceConfig, service| {
+        let mappings = config.clients_for_consumer(service);
+        assert_eq!(
+            mappings
+                .iter()
+                .map(|mapping| (mapping.callee.as_str(), mapping.target_service.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("nodeTransport", "express-api"),
+                ("pythonTransport", "fastapi-api"),
+                ("specTransport", "openapi-api"),
+            ]
+        );
+        assert!(mappings.iter().all(|mapping| mapping.path_prefix.is_none()));
+    };
+    let config = WorkspaceConfig::load_from_path(&config_path).unwrap();
+    assert_mappings(&config, "portal");
+    assert!(config.find_service("added").is_none());
+
+    let result = laine(
+        &projects,
+        &["repo", "add", "added", "--workspace", "mounted"],
+    );
+    assert!(result.status.success(), "{result:?}");
+    let mut config = WorkspaceConfig::load_from_path(&config_path).unwrap();
+    assert_mappings(&config, "added");
+    config.clients.clear();
+    config.save_to_path(&config_path).unwrap();
+
+    let result = laine(&projects, &["workspace", "edit", "mounted", "--all"]);
+    assert!(result.status.success(), "{result:?}");
+    let config = WorkspaceConfig::load_from_path(&config_path).unwrap();
+    assert_mappings(&config, "portal");
+    assert_mappings(&config, "added");
+
+    // Analyze the mount moves and verify the discovered client mappings produce findings.
+    for (producer, line) in [(&express, 1), (&fastapi, 2)] {
+        let result = laine(producer, &["check"]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            stdout.contains(&format!("portal/calls.ts:{line}")),
+            "{stdout}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// Verifica que el selector rechaza la entrada no interactiva aunque la tubería siga abierta.
 fn assert_selector_rejects_open_stdin(command: &mut Command) {
     let mut child = command

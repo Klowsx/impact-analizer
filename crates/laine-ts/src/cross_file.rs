@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
@@ -80,9 +81,9 @@ pub fn analyze_cross_file_dataflow_with_limits(
     analyze_cross_file_dataflow_with_imports(files, ctx, resolve_import, &axios_imports)
 }
 
-/// Runs the dataflow passes using the same imported clients as local HTTP extraction.
+/// Runs the dataflow passes over shared sources using the imported clients from local HTTP extraction.
 pub fn analyze_cross_file_dataflow_with_imports(
-    files: &[(String, String)],
+    files: &[(impl AsRef<str>, impl AsRef<str>)],
     ctx: ExtractContext<'_>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
     axios_imports: &BTreeMap<String, FileAxiosImports>,
@@ -90,7 +91,7 @@ pub fn analyze_cross_file_dataflow_with_imports(
     // Canonical deterministic ordering regardless of caller input order.
     let mut file_map: BTreeMap<&str, &str> = BTreeMap::new();
     for (path, source) in files {
-        file_map.insert(path.as_str(), source.as_str());
+        file_map.insert(path.as_ref(), source.as_ref());
     }
 
     // Pass 1: Extract per-file module summaries.
@@ -303,8 +304,8 @@ impl FrameworkHookKind {
     }
 }
 
-struct ParsedBlock {
-    code: String,
+struct ParsedBlock<'a> {
+    code: Cow<'a, str>,
     source_type: SourceType,
     is_vue_setup: bool,
 }
@@ -346,12 +347,13 @@ impl LineIndex {
 // Parsing Utilities
 // ---------------------------------------------------------------------------
 
-fn extract_parse_blocks(file_path: &str, source: &str) -> Vec<ParsedBlock> {
+// Borrow ordinary scripts and keep Vue's line-padded script blocks owned.
+fn extract_parse_blocks<'a>(file_path: &str, source: &'a str) -> Vec<ParsedBlock<'a>> {
     if file_path.to_ascii_lowercase().ends_with(".vue") {
         return extract_vue_scripts_with_setup(source)
             .into_iter()
             .map(|(block, is_setup)| ParsedBlock {
-                code: block.code,
+                code: Cow::Owned(block.code),
                 source_type: block.lang.source_type(),
                 is_vue_setup: is_setup,
             })
@@ -361,7 +363,7 @@ fn extract_parse_blocks(file_path: &str, source: &str) -> Vec<ParsedBlock> {
     let source_type =
         SourceType::from_path(Path::new(file_path)).unwrap_or_else(|_| SourceType::tsx());
     vec![ParsedBlock {
-        code: source.to_string(),
+        code: Cow::Borrowed(source),
         source_type,
         is_vue_setup: false,
     }]
@@ -391,17 +393,18 @@ fn parse_program<'a>(
 // Pass 1: Per-File ModuleSummary Extraction
 // ---------------------------------------------------------------------------
 
-/// Collects Axios instances and resolves imports through named, default, and barrel exports.
+/// Scans shared sources for Axios instances and resolves named, default, and barrel imports.
 pub fn collect_imported_axios_clients(
-    files: &[(String, String)],
+    files: &[(impl AsRef<str>, impl AsRef<str>)],
     ctx: ExtractContext<'_>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
 ) -> BTreeMap<String, FileAxiosImports> {
     let mut modules = BTreeMap::new();
     let mut instances = BTreeMap::new();
     for (file, source) in files {
+        let file = file.as_ref();
         let mut symbols = ModuleSymbols::default();
-        for block in extract_parse_blocks(file, source) {
+        for block in extract_parse_blocks(file, source.as_ref()) {
             let allocator = Allocator::default();
             let Some(program) = parse_program(&allocator, &block.code, block.source_type) else {
                 continue;
@@ -409,12 +412,12 @@ pub fn collect_imported_axios_clients(
             symbols.collect(&program, false);
             collect_axios_instances(file, &program, ctx, &mut instances);
         }
-        modules.insert(file.clone(), symbols);
+        modules.insert(file, symbols);
     }
 
     modules
         .iter()
-        .filter_map(|(file, symbols)| {
+        .filter_map(|(&file, symbols)| {
             let imports: BTreeMap<_, _> = symbols
                 .imports
                 .values()
@@ -428,7 +431,7 @@ pub fn collect_imported_axios_clients(
                     Some((import.clone(), instances.get(&origin)?.clone()))
                 })
                 .collect();
-            (!imports.is_empty()).then(|| (file.clone(), FileAxiosImports(imports)))
+            (!imports.is_empty()).then(|| (file.to_owned(), FileAxiosImports(imports)))
         })
         .collect()
 }

@@ -292,13 +292,25 @@ jobs:
 - [`crates/laine-core`](./crates/laine-core) — Domain model, normalized IR, `laine.toml` & policy engine, Git batch reader, OpenAPI diffing, Laravel PHP route scanner, `petgraph` dependency graph, SQLite cache, and impact engine.
 - [`crates/laine-ts`](./crates/laine-ts) — TypeScript, JavaScript, Vue SFC, and Express analyzer built on `oxc`.
 - [`crates/laine-py`](./crates/laine-py) — Python FastAPI/Flask route extractor and `requests`/`httpx` consumer analyzer.
-- [`crates/laine-cli`](./crates/laine-cli) — `laine` binary (`init`, `repo add`, `index`, `demo-setup`, `analyze`) and terminal/JSON/Markdown reporters.
+- [`crates/laine-cli`](./crates/laine-cli) — `laine` binary (`init`, `workspace` including `validate`, `repo add`, `index`, `demo-setup`, `analyze`, `check`, and `consumers`) and terminal/JSON/Markdown reporters.
+
+## AI Agent Skill
+
+The [Laine agent skill](./skills/laine/SKILL.md) gives AI coding agents a verified workflow for validating workspaces, checking endpoint consumers before API edits, and interpreting impact reports. Provide the skill to your agent before asking it to change a backend route or OpenAPI contract.
+
+```sh
+laine workspace validate --format json
+laine consumers --service <svc> --method <METHOD> --path <PATH> --format json
+laine check --format json
+```
 
 ---
 
 ## Documentation
 
 - [IR & JSON Report Specification (`schema_version: 1`)](./docs/ir-spec.md)
+- [IR v1 JSON Schema](./schemas/ir-v1.schema.json)
+- [Laine AI Agent Skill](./skills/laine/SKILL.md)
 - [ADR-001: Choosing Rust + Oxc](./docs/adr/001-rust-and-oxc.md)
 - [ADR-002: Deterministic IR and Certainty vs. Severity Model](./docs/adr/002-deterministic-ir-and-certainty.md)
 - [ADR-003: Multi-Language Architecture](./docs/adr/003-multi-language-architecture.md)

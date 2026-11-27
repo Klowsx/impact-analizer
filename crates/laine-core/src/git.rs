@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -115,7 +115,7 @@ impl GitRepo {
             .collect())
     }
 
-    /// Lee archivos de un commit, del índice o del árbol local, conservando sus rutas.
+    /// Reads files from a commit, the index, or the worktree, keeping their paths.
     ///
     /// For committed and staged revisions, uses a single `git cat-file --batch` process
     /// to avoid per-file process spawn overhead. Missing or non-blob paths are skipped cleanly.
@@ -140,7 +140,7 @@ impl GitRepo {
             return Ok(results);
         }
 
-        // El protocolo batch usa líneas. Las rutas con saltos se pasan como argumentos separados.
+        // The batch protocol uses lines. Pass paths with line breaks as separate arguments.
         let links = self.git_link_paths(rev, None)?;
         let (line_paths, unusual_paths): (Vec<_>, Vec<_>) = relative_paths
             .iter()
@@ -168,7 +168,7 @@ impl GitRepo {
                 source,
             })?;
 
-        let mut stdin = child.stdin.take().ok_or_else(|| LaineError::Git {
+        let stdin = child.stdin.take().ok_or_else(|| LaineError::Git {
             command: "git cat-file --batch".into(),
             message: "failed to open stdin pipe".into(),
         })?;
@@ -178,23 +178,18 @@ impl GitRepo {
         })?;
 
         let staged = is_staged_rev(rev);
-        let specs: Vec<String> = line_paths
-            .iter()
-            .map(|p| {
-                let posix = to_git_posix_path(Path::new(p));
-                if staged {
-                    format!(":{posix}")
-                } else {
-                    format!("{rev}:{posix}")
-                }
-            })
-            .collect();
+        let prefix = if staged { "" } else { rev };
 
         // Write specs on a scoped thread so large batches never deadlock the pipe buffer.
         let read_result: Result<()> = std::thread::scope(|scope| {
+            let write_paths = &line_paths;
             let writer = scope.spawn(move || {
-                for spec in &specs {
-                    let _ = writeln!(stdin, "{spec}");
+                let mut stdin = BufWriter::new(stdin);
+                for path in write_paths {
+                    let posix = to_git_posix_path(Path::new(path));
+                    if writeln!(stdin, "{prefix}:{posix}").is_err() {
+                        break;
+                    }
                 }
                 let _ = stdin.flush();
                 drop(stdin);
@@ -203,7 +198,7 @@ impl GitRepo {
             let mut reader = BufReader::new(stdout);
             let mut header = String::new();
 
-            for path in line_paths {
+            for path in line_paths.iter().copied() {
                 header.clear();
                 let n = reader
                     .read_line(&mut header)
@@ -225,26 +220,40 @@ impl GitRepo {
                 let obj_type = parts.next();
                 let size_str = parts.next();
 
-                let Some(size) = size_str.and_then(|s| s.parse::<usize>().ok()) else {
+                let Some(size) = size_str.and_then(|s| s.parse::<u64>().ok()) else {
                     continue;
                 };
 
-                let mut buf = vec![0u8; size];
-                reader
-                    .read_exact(&mut buf)
-                    .map_err(|source| LaineError::Io {
-                        path: self.root.clone(),
-                        source,
-                    })?;
+                let io_error = |source| LaineError::Io {
+                    path: self.root.clone(),
+                    source,
+                };
+                let mut object = reader.by_ref().take(size);
+                // Reserve only a small buffer up front and grow it with bytes actually read.
+                const MAX_INITIAL_BLOB_CAPACITY: u64 = 64 * 1024;
+                let mut bytes = if obj_type == Some("blob") {
+                    let mut bytes =
+                        Vec::with_capacity(size.min(MAX_INITIAL_BLOB_CAPACITY) as usize);
+                    object.read_to_end(&mut bytes).map_err(io_error)?;
+                    bytes
+                } else {
+                    io::copy(&mut object, &mut io::sink()).map_err(io_error)?;
+                    Vec::new()
+                };
+                if object.limit() != 0 {
+                    return Err(io_error(io::Error::from(io::ErrorKind::UnexpectedEof)));
+                }
 
                 // Consume the single trailing LF written by `git cat-file --batch`.
                 let mut trailing = [0u8; 1];
                 let _ = reader.read_exact(&mut trailing);
 
-                if obj_type == Some("blob")
-                    && let Ok(source) = decode_source(buf, Path::new(path))
-                {
-                    results.insert(path.clone(), source);
+                if obj_type == Some("blob") {
+                    // Retain only the source text's capacity for the rest of the snapshot.
+                    bytes.shrink_to_fit();
+                    if let Ok(source) = decode_source(bytes, Path::new(path)) {
+                        results.insert(path.clone(), source);
+                    }
                 }
             }
 
@@ -465,6 +474,31 @@ mod tests {
 
     use super::*;
     use crate::fixtures::create_demo_workspace;
+
+    // Check that streaming over a large blob and a tree keeps subsequent objects aligned.
+    #[test]
+    fn batch_reads_large_blobs_verbatim_and_skips_non_blobs() {
+        let tmp = std::env::temp_dir().join(format!("laine-git-large-blob-{}", std::process::id()));
+        let paths = create_demo_workspace(&tmp).unwrap();
+        let repo = GitRepo::new(&paths.customer_service);
+        let source = format!("\u{feff}{}", "data\0é\n".repeat(20_000));
+        fs::write(repo.root().join("large.ts"), &source).unwrap();
+        repo.run_git_utf8(&["add", "large.ts"]).unwrap();
+        repo.run_git_utf8(&["commit", "-m", "test: add large blob"])
+            .unwrap();
+        let revision = repo.resolve_revision("HEAD").unwrap();
+
+        let requested = ["large.ts", "src", "openapi.yaml"].map(str::to_owned);
+        let batch = repo.read_files_batch(&revision, &requested).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch["large.ts"], source);
+        assert_eq!(
+            batch["openapi.yaml"],
+            repo.read_file(&revision, Path::new("openapi.yaml"))
+                .unwrap()
+        );
+        fs::remove_dir_all(&tmp).unwrap();
+    }
 
     // Verifica que commits, índice y disco rechacen bytes y entradas de enlace no analizables.
     #[test]

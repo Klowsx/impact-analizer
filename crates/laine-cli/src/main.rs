@@ -7,12 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use laine_cli::engine::{
-    AnalyzeRequest, ConsumerRevision, catalog_workspace_routes, index_workspace,
-    run_analysis_with_consumer_revision,
+    AnalyzeRequest, ConsumerRevision, ConsumersRequest, catalog_workspace_routes, index_workspace,
+    query_endpoint_consumers, run_analysis_with_consumer_revision,
 };
-use laine_cli::report::{omit_snippets, render_json, render_markdown, render_terminal};
+use laine_cli::report::{
+    omit_consumers_snippets, omit_snippets, render_consumers_json, render_consumers_markdown,
+    render_consumers_terminal, render_json, render_markdown, render_terminal,
+};
 use laine_core::config::{
     CustomClientConfig, PolicyConfig, RouteFramework, RouteSourceConfig, ServiceConfig,
     WorkspaceConfig, lock_config_update, write_config_atomically,
@@ -20,8 +23,9 @@ use laine_core::config::{
 use laine_core::error::LaineError;
 use laine_core::fixtures::create_demo_workspace;
 use laine_core::git::{GitRepo, STAGED_REV};
+use laine_core::model::HttpMethod;
 use laine_core::workspace::{
-    ClientAmbiguity, DiscoveredRepo, WorkspaceRegistry, build_workspace_config,
+    ClientAmbiguity, DiscoveredRepo, ResolvedContext, WorkspaceRegistry, build_workspace_config,
     discover_workspace_clients_with, infer_workspace_scan_dir, inspect_repo_path,
     merge_workspace_config, normalize_absolute_path, resolve_context_from_cwd,
     same_repository_path, scan_directory, validate_workspace_name, workspace_service_path,
@@ -120,6 +124,8 @@ enum Commands {
         #[arg(long, value_enum, ignore_case = true, default_value_t = ConsumerRevision::Head)]
         consumer_revision: ConsumerRevision,
     },
+    /// List direct and indirect consumers of a service endpoint
+    Consumers(ConsumersArgs),
     /// Analyze cross-repository impact between two Git revisions
     Analyze {
         /// Path to laine.toml
@@ -150,6 +156,46 @@ enum Commands {
         #[arg(long, value_enum, ignore_case = true, default_value_t = ConsumerRevision::Head)]
         consumer_revision: ConsumerRevision,
     },
+}
+
+#[derive(Debug, Args)]
+struct ConsumersArgs {
+    /// Path to laine.toml, discovered from the current directory when omitted
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Named workspace from the local workspace registry
+    #[arg(long)]
+    workspace: Option<String>,
+    /// Producer service name, inferred from the current directory when omitted
+    #[arg(long)]
+    service: Option<String>,
+    /// HTTP method (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, TRACE)
+    #[arg(long, value_parser = parse_http_method)]
+    method: HttpMethod,
+    /// Route template or concrete path, such as /customers/:id or /customers/42
+    #[arg(long)]
+    path: String,
+    /// Response field path, such as fullName or address.city
+    #[arg(long)]
+    field: Option<String>,
+    /// Producer catalog revision (commit, branch, tag, STAGED, or WORKTREE)
+    #[arg(long, default_value = "HEAD")]
+    producer_revision: String,
+    /// Output format
+    #[arg(long, value_enum, default_value_t = OutputFormat::Terminal)]
+    format: OutputFormat,
+    /// Bypass the SQLite incremental extraction cache
+    #[arg(long)]
+    no_cache: bool,
+    /// Suppress evidence snippets and detailed errors
+    #[arg(long)]
+    no_snippets: bool,
+    /// Include local checkout roots in the JSON report
+    #[arg(long)]
+    include_repo_roots: bool,
+    /// Revision of consumer checkouts, including client code in the producer repo
+    #[arg(long, value_enum, ignore_case = true, default_value_t = ConsumerRevision::Head)]
+    consumer_revision: ConsumerRevision,
 }
 
 #[derive(Debug, Subcommand)]
@@ -271,7 +317,7 @@ version = 1
 # target_service = "customer-service"
 "#;
 
-// Interpreta los argumentos y ejecuta el comando seleccionado.
+// Parse CLI arguments and dispatch to the selected command.
 fn main() -> ExitCode {
     let cli = match parse_cli() {
         Ok(cli) => cli,
@@ -356,33 +402,10 @@ fn main() -> ExitCode {
                 include_repo_roots,
                 consumer_revision,
             };
-            let cwd = match env::current_dir() {
-                Ok(dir) => dir,
-                Err(err) => {
-                    print_analysis_error(
-                        "Check",
-                        &LaineError::Io {
-                            path: PathBuf::from("."),
-                            source: err,
-                        },
-                        output,
-                    );
-                    return ExitCode::FAILURE;
-                }
-            };
-            let registry_path = match WorkspaceRegistry::default_path() {
-                Ok(p) => p,
-                Err(err) => {
-                    print_analysis_error("Check", &err, output);
-                    return ExitCode::FAILURE;
-                }
-            };
-            let resolved = match resolve_context_from_cwd(
-                &cwd,
+            let resolved = match resolve_command_context(
                 config.as_deref(),
                 workspace.as_deref(),
                 repo.as_deref(),
-                &registry_path,
             ) {
                 Ok(ctx) => ctx,
                 Err(err) => {
@@ -402,6 +425,7 @@ fn main() -> ExitCode {
                 output,
             )
         }
+        Commands::Consumers(args) => execute_consumers(args),
         Commands::Analyze {
             config,
             repo,
@@ -430,16 +454,14 @@ fn main() -> ExitCode {
     }
 }
 
-// Conserva la ayuda normal de Clap y distingue el uso inválido del bloqueo de política.
+// Preserve Clap help and render structured usage errors for report commands.
 fn parse_cli() -> Result<Cli, ExitCode> {
     let args = env::args_os().collect::<Vec<_>>();
     match Cli::try_parse_from(&args) {
         Ok(cli) => Ok(cli),
         Err(error) => {
-            let analysis = args
-                .get(1)
-                .is_some_and(|command| command == "analyze" || command == "check");
-            if !analysis || !error.use_stderr() {
+            let command = args.get(1).and_then(|command| command.to_str());
+            if !matches!(command, Some("analyze" | "check" | "consumers")) || !error.use_stderr() {
                 let _ = error.print();
                 return Err(ExitCode::from(error.exit_code() as u8));
             }
@@ -455,11 +477,16 @@ fn parse_cli() -> Result<Cli, ExitCode> {
                 }
             }
             if json {
+                let message = if command == Some("consumers") {
+                    "Invalid consumers arguments. Run the command with --help."
+                } else {
+                    "Invalid analysis arguments. Run the command with --help."
+                };
                 print_json_error(
                     USAGE_EXIT_CODE,
                     "invalid_arguments",
                     "check_command_help",
-                    "Invalid analysis arguments. Run the command with --help.",
+                    message,
                 );
             } else {
                 let _ = error.print();
@@ -467,6 +494,26 @@ fn parse_cli() -> Result<Cli, ExitCode> {
             Err(ExitCode::from(USAGE_EXIT_CODE))
         }
     }
+}
+
+// Validate the method during CLI parsing so invalid values use the same error protocol.
+fn parse_http_method(value: &str) -> Result<HttpMethod, String> {
+    HttpMethod::parse(value)
+        .ok_or_else(|| "expected GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS, or TRACE".to_owned())
+}
+
+// Resolve the current workspace and service from flags or the checkout directory.
+fn resolve_command_context(
+    config: Option<&Path>,
+    workspace: Option<&str>,
+    service: Option<&str>,
+) -> Result<ResolvedContext, LaineError> {
+    let cwd = env::current_dir().map_err(|source| LaineError::Io {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    let registry = WorkspaceRegistry::default_path()?;
+    resolve_context_from_cwd(&cwd, config, workspace, service, &registry)
 }
 
 /// Initialize the workspace, checking terminal support before interactive selection.
@@ -1209,7 +1256,65 @@ fn execute_analysis(req: AnalyzeRequest, output: AnalysisOutput) -> ExitCode {
     }
 }
 
-// Traduce los errores de análisis a un código y una acción estables sin filtrar texto de entrada.
+// Resolve the service, run the endpoint lookup, and print the requested report format.
+fn execute_consumers(args: ConsumersArgs) -> ExitCode {
+    let output = AnalysisOutput {
+        format: args.format,
+        no_cache: args.no_cache,
+        no_snippets: args.no_snippets,
+        include_repo_roots: args.include_repo_roots,
+        consumer_revision: args.consumer_revision,
+    };
+    let result = resolve_command_context(
+        args.config.as_deref(),
+        args.workspace.as_deref(),
+        args.service.as_deref(),
+    )
+    .and_then(|context| {
+        query_endpoint_consumers(
+            &ConsumersRequest {
+                config_path: context.config_path,
+                service: context.repo_name,
+                method: args.method,
+                path: args.path,
+                field: args.field,
+                producer_rev: args.producer_revision,
+            },
+            output.no_cache,
+            output.include_repo_roots && matches!(output.format, OutputFormat::Json),
+            output.consumer_revision,
+        )
+    });
+    let mut report = match result {
+        Ok(report) => report,
+        Err(error) => {
+            print_analysis_error("Consumers", &error, output);
+            return ExitCode::FAILURE;
+        }
+    };
+    if output.no_snippets {
+        omit_consumers_snippets(&mut report);
+    }
+    match output.format {
+        OutputFormat::Terminal => print!("{}", render_consumers_terminal(&report)),
+        OutputFormat::Markdown => print!("{}", render_consumers_markdown(&report)),
+        OutputFormat::Json => match render_consumers_json(&report) {
+            Ok(json) => println!("{json}"),
+            Err(_) => {
+                print_json_error(
+                    1,
+                    "report_serialization_failed",
+                    "verify_laine_installation",
+                    "The consumers report could not be serialized to JSON.",
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    }
+    ExitCode::from(report.exit_code)
+}
+
+// Translate report failures to stable error codes without including raw input in JSON.
 fn print_analysis_error(command: &str, error: &LaineError, output: AnalysisOutput) {
     if matches!(output.format, OutputFormat::Json) {
         let (code, remediation, message) = match error {
@@ -1222,6 +1327,11 @@ fn print_analysis_error(command: &str, error: &LaineError, output: AnalysisOutpu
                 "invalid_config_syntax",
                 "repair_workspace_toml",
                 "The workspace TOML could not be parsed.",
+            ),
+            LaineError::ConfigInvalid(_) if command == "Consumers" => (
+                "invalid_workspace_config",
+                "check_workspace_selection",
+                "Verify the workspace configuration and choose a configured producer with --service.",
             ),
             LaineError::ConfigInvalid(_) => (
                 "invalid_workspace_config",

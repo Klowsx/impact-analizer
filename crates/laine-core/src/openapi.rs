@@ -66,6 +66,13 @@ pub struct EndpointContract {
     pub parameters: BTreeMap<(String, String), ParameterSchema>,
 }
 
+impl EndpointContract {
+    /// Locate the operation in the OpenAPI document that declares it.
+    pub fn source(&self) -> Option<&ContractSource> {
+        self.source.as_ref()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ApiContract {
     /// Ordered map guarantees deterministic diff output across runs.
@@ -112,7 +119,7 @@ impl ApiContract {
     pub fn source_for_change(&self, change: &ContractChange) -> Option<&ContractSource> {
         let endpoint = find_matching_endpoint(self, change.endpoint())?;
         match change {
-            ContractChange::EndpointRemoved { .. } => endpoint.source.as_ref(),
+            ContractChange::EndpointRemoved { .. } => endpoint.source(),
             ContractChange::ResponseFieldRemoved {
                 status_code,
                 field_path,

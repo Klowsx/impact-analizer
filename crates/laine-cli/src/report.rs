@@ -1,9 +1,172 @@
 use std::fmt::Write;
 
 use laine_core::model::{
-    AnalysisCoverage, AnalysisReport, Confidence, ContractChange, ExtractionDiagnostic,
-    ProducerEvidence, Severity,
+    AnalysisCoverage, AnalysisReport, Confidence, ContractChange, EndpointConsumersReport,
+    ExtractionDiagnostic, ProducerEvidence, Severity,
 };
+
+/// Clear evidence snippets while preserving locations and confidence.
+pub fn omit_consumers_snippets(report: &mut EndpointConsumersReport) {
+    if let Some(producer) = &mut report.producer_evidence {
+        producer.snippet.clear();
+    }
+    for consumer in &mut report.consumers {
+        consumer.evidence.snippet.clear();
+    }
+    for call in &mut report.unresolved_calls {
+        call.evidence.snippet.clear();
+    }
+}
+
+/// Render an endpoint query for a terminal.
+pub fn render_consumers_terminal(report: &EndpointConsumersReport) -> String {
+    render_consumers_text(report, false)
+}
+
+/// Render an endpoint query as GitHub-flavored Markdown.
+pub fn render_consumers_markdown(report: &EndpointConsumersReport) -> String {
+    render_consumers_text(report, true)
+}
+
+/// Serialize the endpoint query as a versioned JSON document.
+pub fn render_consumers_json(
+    report: &EndpointConsumersReport,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(report)
+}
+
+// Share the wording and evidence across terminal and Markdown reports.
+fn render_consumers_text(report: &EndpointConsumersReport, markdown: bool) -> String {
+    let mut out = String::new();
+    let title = if markdown { "# " } else { "" };
+    let section = if markdown { "## " } else { "" };
+    let code = |text: &str| {
+        if markdown {
+            format!("`{}`", escape_inline_code(text))
+        } else {
+            text.to_owned()
+        }
+    };
+    let query = format!("{} {}", report.method.as_str(), report.normalized_path);
+    let _ = writeln!(out, "{title}Endpoint Consumers\n");
+    let _ = writeln!(
+        out,
+        "{} in {} at {}\n",
+        code(&query),
+        code(&report.service),
+        code(short_sha(&report.producer_revision)),
+    );
+    if let Some(field) = &report.field {
+        let _ = writeln!(out, "- Response field: {}", code(field));
+    }
+    if report.in_catalog {
+        let paths = report
+            .matched_endpoints
+            .iter()
+            .map(|endpoint| code(&endpoint.normalized_path))
+            .collect::<Vec<_>>();
+        let _ = writeln!(out, "- Catalog matches: {}", paths.join(", "));
+    } else {
+        let _ = writeln!(out, "- Catalog matches: 0");
+    }
+    if let Some(producer) = &report.producer_evidence {
+        let _ = writeln!(
+            out,
+            "- Producer source: {}",
+            code(&producer_location(producer))
+        );
+    }
+    if !report.fields_read.is_empty() {
+        let fields = report
+            .fields_read
+            .iter()
+            .map(|field| code(field))
+            .collect::<Vec<_>>();
+        let _ = writeln!(out, "- Fields read: {}", fields.join(", "));
+    }
+    let coverage = if report.coverage.complete {
+        "COMPLETE"
+    } else {
+        "INCOMPLETE"
+    };
+    let _ = writeln!(
+        out,
+        "- Coverage: {coverage} (producer {}/{}, consumers {}/{} files analyzed)",
+        report.coverage.producer.analyzed,
+        report.coverage.producer.discovered,
+        report.coverage.consumers.analyzed,
+        report.coverage.consumers.discovered,
+    );
+    for diagnostic in &report.diagnostics {
+        let _ = writeln!(
+            out,
+            "- {}",
+            code(&describe_extraction_diagnostic(diagnostic))
+        );
+    }
+
+    let _ = writeln!(
+        out,
+        "\n{section}Direct Consumers ({})\n",
+        report.consumers.len()
+    );
+    for consumer in &report.consumers {
+        let evidence = &consumer.evidence;
+        let location = format!("{}/{}:{}", evidence.repo, evidence.file, evidence.line);
+        let _ = writeln!(
+            out,
+            "- {} [{}] at {}",
+            code(&location),
+            confidence_label(consumer.confidence),
+            code(short_sha(&evidence.revision)),
+        );
+        if !evidence.snippet.is_empty() {
+            let _ = writeln!(out, "  - Evidence: {}", code(&evidence.snippet));
+        }
+        let _ = writeln!(
+            out,
+            "  - Path: {}",
+            code(&consumer.dependency_path.join(" -> "))
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\n{section}Indirect Consumers ({})\n",
+        report.indirect_consumers.len(),
+    );
+    for consumer in &report.indirect_consumers {
+        let _ = writeln!(
+            out,
+            "- {} [{}] via {} ({})",
+            code(&consumer.repo),
+            confidence_label(consumer.confidence),
+            code(&consumer.via_repo),
+            code(&consumer.dependency_chain.join(" -> ")),
+        );
+    }
+    if !report.unresolved_calls.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{section}Unresolved Calls ({})\n",
+            report.unresolved_calls.len(),
+        );
+        for call in &report.unresolved_calls {
+            let evidence = &call.evidence;
+            let location = format!("{}/{}:{}", evidence.repo, evidence.file, evidence.line);
+            let _ = write!(
+                out,
+                "- {} [UNKNOWN] {}",
+                code(&location),
+                code(&call.reason)
+            );
+            if !evidence.snippet.is_empty() {
+                let _ = write!(out, " ({})", code(&evidence.snippet));
+            }
+            let _ = writeln!(out);
+        }
+    }
+    out
+}
 
 // Quita las descripciones de evidencia conservando sus ubicaciones y el contrato JSON.
 pub fn omit_snippets(report: &mut AnalysisReport) {

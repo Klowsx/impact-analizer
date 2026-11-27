@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use clap::ValueEnum;
@@ -6,20 +6,26 @@ use laine_core::cache::{IndexCache, compute_config_hash, stable_fingerprint};
 use laine_core::config::{RouteFramework, RouteSourceConfig, ServiceConfig, WorkspaceConfig};
 use laine_core::error::{LaineError, Result};
 use laine_core::git::{GitRepo, STAGED_REV, WORKTREE_REV, to_git_posix_path};
-use laine_core::graph::DependencyGraph;
-use laine_core::impact::{ImpactInput, analyze_impact};
+use laine_core::graph::{DependencyGraph, routes_match};
+use laine_core::impact::{
+    ImpactInput, analyze_impact, compute_indirect_consumers, consumers_for_endpoint,
+    consumers_for_field,
+};
 use laine_core::laravel::analyze_laravel_routes;
 use laine_core::model::{
-    AnalysisCoverage, AnalysisReport, AnalysisStats, Confidence, ContractChange,
-    ContractDiscrepancy, Evidence, ExtractionDiagnostic, ExtractionFailure, ExtractionStage,
-    FileCoverage, HttpMethod, UnresolvedCall, WorkspaceIdentity,
+    AffectedConsumer, AnalysisCoverage, AnalysisReport, AnalysisStats, Confidence,
+    ConsumersCoverage, ContractChange, ContractDiscrepancy, EndpointConsumersReport, EndpointId,
+    Evidence, ExtractionDiagnostic, ExtractionFailure, ExtractionStage, FileCoverage, HttpMethod,
+    ProducerEvidence, UnresolvedCall, WorkspaceIdentity,
 };
 use laine_core::openapi::{
     OpenApiExtraction, OpenApiSnapshot, canonical_route_key, diff_contracts,
 };
 use laine_core::policy::{evaluate_policy, filter_ignored_findings};
 use laine_core::request::HttpRequestEvidence;
-use laine_core::routes::{ExtractedRoute, detect_openapi_discrepancies, diff_routes};
+use laine_core::routes::{
+    ExtractedRoute, detect_openapi_discrepancies, diff_routes, normalize_route_path,
+};
 use laine_core::workspace::{WorkspaceRegistry, normalize_absolute_path};
 use laine_py::{
     PyExtractContext, extract_fastapi_snapshot, extract_flask_routes, extract_python_file,
@@ -38,6 +44,15 @@ pub struct AnalyzeRequest {
     pub target_repo: String,
     pub base_rev: String,
     pub head_rev: String,
+}
+
+pub struct ConsumersRequest {
+    pub config_path: PathBuf,
+    pub service: String,
+    pub method: HttpMethod,
+    pub path: String,
+    pub field: Option<String>,
+    pub producer_rev: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -312,7 +327,6 @@ pub fn run_analysis_with_consumer_revision(
     let mut files_analyzed = 0usize;
     let mut producer_base = FileCoverage::default();
     let mut producer_head = FileCoverage::default();
-    let mut consumers = FileCoverage::default();
     let mut diagnostics = Vec::new();
     let mut contract_changes: Vec<ContractChange> = Vec::new();
     let mut discrepancies: Vec<ContractDiscrepancy> = Vec::new();
@@ -451,18 +465,332 @@ pub fn run_analysis_with_consumer_revision(
         }
     }
 
-    // 3. Consumer repository analysis (TypeScript / Vue / JavaScript / Python) with Rayon + SQLite cache
-    let config_hash = compute_config_hash(&config);
+    let ConsumerGraphExtraction {
+        coverage: consumers,
+        diagnostics: consumer_diagnostics,
+        unresolved_calls,
+        revisions: consumer_revisions,
+    } = populate_consumers_into_graph(
+        &config,
+        &req.config_path,
+        consumer_revision,
+        no_cache,
+        &mut graph,
+    )?;
+    files_analyzed += consumers.analyzed;
+    diagnostics.extend(consumer_diagnostics);
+
+    let stats = AnalysisStats {
+        repositories: config.services.len(),
+        files_analyzed,
+        graph_nodes: graph.node_count(),
+        graph_edges: graph.edge_count(),
+    };
+
+    let mut report = analyze_impact(
+        &graph,
+        ImpactInput {
+            target_repo: &target_service.name,
+            base_rev: &base_sha,
+            head_rev: &head_sha,
+            base_source_file: &base_source_file,
+            head_source_file: &head_source_file,
+            base_contract: base_openapi_contract.as_ref(),
+            head_contract: head_openapi_contract.as_ref(),
+            route_locations,
+            changes: contract_changes,
+            unresolved_calls,
+            discrepancies,
+            stats,
+        },
+    );
+
+    filter_ignored_findings(&mut report, &config.policy);
+    diagnostics.sort();
+    report.coverage = Some(AnalysisCoverage {
+        complete: diagnostics.is_empty(),
+        producer_base,
+        producer_head,
+        consumers,
+    });
+    report.diagnostics = diagnostics;
+    let policy = evaluate_policy(&report, &config.policy);
+    report.exit_code = Some(policy.exit_code);
+    report.policy = Some(policy);
+    report.workspace = Some(workspace_identity(
+        &config,
+        &req.config_path,
+        include_repo_roots,
+    ));
+    report.consumer_revisions = consumer_revisions;
+
+    Ok(report)
+}
+
+#[derive(Default)]
+struct ProducerCatalog {
+    endpoints: BTreeMap<(HttpMethod, String), (EndpointId, ProducerEvidence)>,
+    coverage: FileCoverage,
+    diagnostics: Vec<ExtractionDiagnostic>,
+}
+
+// Load producer declarations from the requested snapshot and prefer OpenAPI for shared routes.
+fn load_producer_catalog(
+    git: &GitRepo,
+    revision: &str,
+    service: &ServiceConfig,
+) -> Result<ProducerCatalog> {
+    let mut catalog = ProducerCatalog::default();
+    if let Some(openapi) = &service.openapi {
+        let snapshot = OpenApiSnapshot::read(git, revision, &to_git_posix_path(openapi))?;
+        let extraction = snapshot.extract(git, revision, &service.name)?;
+        catalog.coverage = record_openapi_coverage(
+            &extraction,
+            &mut catalog.diagnostics,
+            &service.name,
+            revision,
+            ExtractionStage::ProducerHead,
+        );
+        for (endpoint, contract) in extraction.contract.endpoints {
+            let mut evidence = ProducerEvidence {
+                file: snapshot.file.clone(),
+                ..ProducerEvidence::default()
+            };
+            if let Some(source) = contract.source() {
+                evidence.file.clone_from(&source.file);
+                evidence.json_pointer = Some(source.pointer.clone());
+                evidence.span = source.span.clone();
+                evidence.line = source.span.as_ref().map(|span| span.line);
+            }
+            catalog.register(endpoint, evidence);
+        }
+    }
+
+    if let Some(routes) = &service.routes {
+        let (routes, extraction) = extract_producer_routes(git, &service.name, revision, routes)?;
+        catalog.coverage.accumulate(extraction.coverage);
+        extraction.append_diagnostics(
+            &mut catalog.diagnostics,
+            &service.name,
+            revision,
+            ExtractionStage::ProducerHead,
+        );
+        for route in routes {
+            catalog.register(
+                route.endpoint,
+                ProducerEvidence {
+                    file: route.file,
+                    line: Some(route.line),
+                    ..ProducerEvidence::default()
+                },
+            );
+        }
+    }
+    Ok(catalog)
+}
+
+impl ProducerCatalog {
+    // Store the first declaration of each canonical route identity.
+    fn register(&mut self, endpoint: EndpointId, evidence: ProducerEvidence) {
+        let key = (
+            endpoint.method,
+            canonical_route_key(&endpoint.normalized_path),
+        );
+        self.endpoints.entry(key).or_insert((endpoint, evidence));
+    }
+}
+
+/// Query consumer dependencies without comparing producer revisions or evaluating impact policy.
+pub fn query_endpoint_consumers(
+    req: &ConsumersRequest,
+    no_cache: bool,
+    include_repo_roots: bool,
+    consumer_revision: ConsumerRevision,
+) -> Result<EndpointConsumersReport> {
+    let config = WorkspaceConfig::load_from_path(&req.config_path)?;
+    let service = config.find_service(&req.service).ok_or_else(|| {
+        LaineError::ConfigInvalid(format!(
+            "service '{}' not found in {}",
+            req.service,
+            req.config_path.display()
+        ))
+    })?;
+    let config_dir = config_directory(&req.config_path);
+    let git = GitRepo::new(resolve_repo_path(config_dir, &service.path));
+    let producer_revision = git.resolve_revision(&req.producer_rev)?;
+    let ProducerCatalog {
+        endpoints,
+        coverage: producer,
+        mut diagnostics,
+    } = load_producer_catalog(&git, &producer_revision, service)?;
+
+    // Register the entire catalog so calls bind to their most specific route.
+    let mut graph = DependencyGraph::new();
+    for (endpoint, _) in endpoints.values() {
+        graph.add_endpoint(
+            &endpoint.service,
+            endpoint.method,
+            &endpoint.normalized_path,
+        );
+    }
+    let normalized_path = normalize_route_path(&[], &req.path);
+    let canonical_query = canonical_route_key(&normalized_path);
+    let matches = if let Some(exact) = endpoints.get(&(req.method, canonical_query.clone())) {
+        vec![exact]
+    } else {
+        endpoints
+            .iter()
+            .filter(|((method, path), _)| {
+                *method == req.method && routes_match(path, &canonical_query)
+            })
+            .map(|(_, entry)| entry)
+            .collect::<Vec<_>>()
+    };
+    let matched_endpoints = matches
+        .iter()
+        .map(|(endpoint, _)| endpoint.clone())
+        .collect::<Vec<_>>();
+    let producer_evidence = matches
+        .first()
+        .map(|(endpoint, evidence)| ProducerEvidence {
+            repo: endpoint.service.clone(),
+            revision: producer_revision.clone(),
+            description: format!("{} {}", endpoint.method.as_str(), endpoint.normalized_path),
+            ..evidence.clone()
+        });
+    let in_catalog = !matched_endpoints.is_empty();
+    let fallback = EndpointId {
+        service: req.service.clone(),
+        method: req.method,
+        normalized_path: normalized_path.clone(),
+    };
+    let queried_endpoints = if in_catalog {
+        matched_endpoints.as_slice()
+    } else {
+        graph.add_endpoint(&req.service, req.method, &normalized_path);
+        std::slice::from_ref(&fallback)
+    };
+
+    let ConsumerGraphExtraction {
+        coverage: consumers,
+        diagnostics: consumer_diagnostics,
+        mut unresolved_calls,
+        revisions: consumer_revisions,
+    } = populate_consumers_into_graph(
+        &config,
+        &req.config_path,
+        consumer_revision,
+        no_cache,
+        &mut graph,
+    )?;
+    diagnostics.extend(consumer_diagnostics);
+    diagnostics.sort();
+    unresolved_calls.sort_by(|a, b| {
+        (&a.repo, &a.evidence.file, a.evidence.line, &a.reason).cmp(&(
+            &b.repo,
+            &b.evidence.file,
+            b.evidence.line,
+            &b.reason,
+        ))
+    });
+
+    // Merge evidence assigned to several routes while retaining distinct field reads on one line.
+    let mut direct = BTreeMap::new();
+    let mut fields_read = BTreeSet::new();
+    for endpoint in queried_endpoints {
+        let hits = if let Some(field) = &req.field {
+            consumers_for_field(&graph, endpoint, field)
+        } else {
+            fields_read.extend(graph.fields_read_on_endpoint(
+                &endpoint.service,
+                endpoint.method,
+                &endpoint.normalized_path,
+            ));
+            consumers_for_endpoint(&graph, endpoint)
+        };
+        for hit in hits {
+            let key = (
+                hit.repo.clone(),
+                hit.evidence.file.clone(),
+                hit.evidence.line,
+                hit.evidence.snippet.clone(),
+            );
+            if direct
+                .get(&key)
+                .is_none_or(|prev: &AffectedConsumer| prev.confidence < hit.confidence)
+            {
+                direct.insert(key, hit);
+            }
+        }
+    }
+    let consumers_found: Vec<_> = direct.into_values().collect();
+    let direct_repos = consumers_found.iter().map(|hit| hit.repo.clone()).collect();
+    let indirect_consumers = compute_indirect_consumers(&graph, &req.service, &direct_repos);
+
+    Ok(EndpointConsumersReport {
+        schema_version: 1,
+        service: req.service.clone(),
+        method: req.method,
+        queried_path: req.path.clone(),
+        normalized_path,
+        field: req.field.clone(),
+        producer_revision,
+        in_catalog,
+        matched_endpoints,
+        producer_evidence,
+        coverage: ConsumersCoverage {
+            complete: diagnostics.is_empty(),
+            producer,
+            consumers,
+        },
+        diagnostics,
+        exit_code: 0,
+        workspace: Some(workspace_identity(
+            &config,
+            &req.config_path,
+            include_repo_roots,
+        )),
+        consumer_revisions,
+        stats: AnalysisStats {
+            repositories: config.services.len(),
+            files_analyzed: producer.analyzed + consumers.analyzed,
+            graph_nodes: graph.node_count(),
+            graph_edges: graph.edge_count(),
+        },
+        consumers: consumers_found,
+        indirect_consumers,
+        fields_read: fields_read.into_iter().collect(),
+        unresolved_calls,
+    })
+}
+
+#[derive(Default)]
+struct ConsumerGraphExtraction {
+    coverage: FileCoverage,
+    diagnostics: Vec<ExtractionDiagnostic>,
+    unresolved_calls: Vec<UnresolvedCall>,
+    revisions: BTreeMap<String, String>,
+}
+
+// Apply consumer snapshots in bounded batches using the shared extraction cache.
+fn populate_consumers_into_graph(
+    config: &WorkspaceConfig,
+    config_path: &Path,
+    consumer_revision: ConsumerRevision,
+    no_cache: bool,
+    graph: &mut DependencyGraph,
+) -> Result<ConsumerGraphExtraction> {
+    let config_dir = config_directory(config_path);
+    let config_hash = compute_config_hash(config);
     let cache = if no_cache {
         None
     } else {
-        resolve_cache_path(&req.config_path, config.cache_path.as_deref())
+        resolve_cache_path(config_path, config.cache_path.as_deref())
             .and_then(|path| IndexCache::open(&path))
             .ok()
     };
 
-    let mut unresolved_calls = Vec::new();
-    let mut consumer_revisions = BTreeMap::new();
+    let mut extraction = ConsumerGraphExtraction::default();
     for services in config.services.chunks(CONSUMER_REPO_BATCH_SIZE) {
         // Read cache entries on this thread. Mutable snapshots reuse the inputs hashed for their key.
         let jobs: Vec<_> = services
@@ -514,7 +842,7 @@ pub fn run_analysis_with_consumer_revision(
                         Some(inputs) => inputs,
                         None => load_consumer_inputs(&git, &revision)?,
                     };
-                    (extract_consumer_repo(inputs, &config, &service.name), true)
+                    (extract_consumer_repo(inputs, config, &service.name), true)
                 }
             };
             Ok((revision, cache_key, snapshot, cache_miss))
@@ -551,59 +879,30 @@ pub fn run_analysis_with_consumer_revision(
                 &service.name,
                 &revision,
                 &snapshot,
-                &mut graph,
-                &mut unresolved_calls,
+                graph,
+                &mut extraction.unresolved_calls,
             );
-            files_analyzed += snapshot.extraction.coverage.analyzed;
-            consumers.accumulate(snapshot.extraction.coverage);
+            extraction.coverage.accumulate(snapshot.extraction.coverage);
             snapshot.extraction.append_diagnostics(
-                &mut diagnostics,
+                &mut extraction.diagnostics,
                 &service.name,
                 &revision,
                 ExtractionStage::Consumer,
             );
-            consumer_revisions.insert(service.name.clone(), revision);
+            extraction.revisions.insert(service.name.clone(), revision);
         }
     }
+    Ok(extraction)
+}
 
-    let stats = AnalysisStats {
-        repositories: config.services.len(),
-        files_analyzed,
-        graph_nodes: graph.node_count(),
-        graph_edges: graph.edge_count(),
-    };
-
-    let mut report = analyze_impact(
-        &graph,
-        ImpactInput {
-            target_repo: &target_service.name,
-            base_rev: &base_sha,
-            head_rev: &head_sha,
-            base_source_file: &base_source_file,
-            head_source_file: &head_source_file,
-            base_contract: base_openapi_contract.as_ref(),
-            head_contract: head_openapi_contract.as_ref(),
-            route_locations,
-            changes: contract_changes,
-            unresolved_calls,
-            discrepancies,
-            stats,
-        },
-    );
-
-    filter_ignored_findings(&mut report, &config.policy);
-    diagnostics.sort();
-    report.coverage = Some(AnalysisCoverage {
-        complete: diagnostics.is_empty(),
-        producer_base,
-        producer_head,
-        consumers,
-    });
-    report.diagnostics = diagnostics;
-    let policy = evaluate_policy(&report, &config.policy);
-    report.exit_code = Some(policy.exit_code);
-    report.policy = Some(policy);
-    let id = workspace_identifier(&req.config_path);
+// Describe the workspace and optionally expose the absolute repository roots.
+fn workspace_identity(
+    config: &WorkspaceConfig,
+    config_path: &Path,
+    include_repo_roots: bool,
+) -> WorkspaceIdentity {
+    let config_dir = config_directory(config_path);
+    let id = workspace_identifier(config_path);
     let repo_roots = if include_repo_roots {
         config
             .services
@@ -616,10 +915,7 @@ pub fn run_analysis_with_consumer_revision(
     } else {
         BTreeMap::new()
     };
-    report.workspace = Some(WorkspaceIdentity { id, repo_roots });
-    report.consumer_revisions = consumer_revisions;
-
-    Ok(report)
+    WorkspaceIdentity { id, repo_roots }
 }
 
 /// Pre-computes and persists consumer AST extraction snapshots for every repository declared

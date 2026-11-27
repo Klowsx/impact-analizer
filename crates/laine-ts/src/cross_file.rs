@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use laine_core::model::{Confidence, HttpMethod};
-use laine_core::url::{resolve_custom_client_url, resolve_url_with_base};
+use laine_core::url::{matching_http_url, resolve_custom_client_url, resolve_url_with_base};
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, ArrowFunctionBody, ArrowFunctionExpression, AssignmentExpression, AssignmentOperator,
@@ -134,19 +134,19 @@ type ParamReadMap = BTreeMap<(String, String), Vec<ResolvedParamRead>>;
 type LocalObjMethodsMap = BTreeMap<String, BTreeMap<String, Vec<ExportReturnSummary>>>;
 type LocalObjParamReadsMap = BTreeMap<String, BTreeMap<String, Vec<ParamFieldRead>>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ImportBinding {
     Named { specifier: String, imported: String },
     Namespace { specifier: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ReExportTarget {
     Named { specifier: String, imported: String },
     Namespace { specifier: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 enum PayloadProjection {
     /// Returned value is the JSON payload directly (or a Vue ref wrapping it).
     Direct { is_vue_ref: bool },
@@ -157,7 +157,7 @@ enum PayloadProjection {
     FetchResponse,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct DirectEndpointInfo {
     service: String,
     method: HttpMethod,
@@ -165,7 +165,7 @@ struct DirectEndpointInfo {
     origin_line: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum DelegationTarget {
     Import {
         import_local: String,
@@ -176,7 +176,7 @@ enum DelegationTarget {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum ExportReturnSummary {
     Direct {
         endpoint: DirectEndpointInfo,
@@ -195,7 +195,7 @@ enum ExportReturnSummary {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ParamFieldRead {
     param_index: usize,
     prop_name: Option<String>,
@@ -204,8 +204,8 @@ struct ParamFieldRead {
     snippet: String,
 }
 
-#[derive(Debug, Clone, Default)]
-struct ModuleSummary {
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModuleSummary {
     axios_imports: FileAxiosImports,
     imports: BTreeMap<String, ImportBinding>,
     reexports: BTreeMap<String, ReExportTarget>,
@@ -216,8 +216,8 @@ struct ModuleSummary {
 }
 
 /// Imported Axios instances available in a source file, including instances with dynamic base URLs.
-#[derive(Debug, Clone, Default)]
-pub struct FileAxiosImports(BTreeMap<ImportedSymbol, Option<String>>);
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FileAxiosImports(Vec<(ImportedSymbol, Option<String>)>);
 
 impl FileAxiosImports {
     /// Maps the resolved instance to each local import spelling in this script block.
@@ -230,12 +230,15 @@ impl FileAxiosImports {
         symbols
             .imports
             .into_iter()
-            .filter_map(|(local, import)| Some((local, self.0.get(&import)?.clone())))
+            .filter_map(|(local, import)| {
+                let index = self.0.binary_search_by(|(key, _)| key.cmp(&import)).ok()?;
+                Some((local, self.0[index].1.clone()))
+            })
             .collect()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ResolvedExportEndpoint {
     service: String,
     method: HttpMethod,
@@ -249,7 +252,7 @@ struct ResolvedExportEndpoint {
     hops: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct ResolvedParamRead {
     def_file: String,
     param_index: usize,
@@ -259,11 +262,109 @@ struct ResolvedParamRead {
     snippet: String,
 }
 
-struct PropagatedSummaries {
+pub struct PropagatedSummaries {
     resolved_exports: EndpointMap,
     resolved_internal: EndpointMap,
     resolved_param_reads: ParamReadMap,
     limited_files: BTreeSet<String>,
+}
+
+impl ModuleSummary {
+    /// Removes original source lines from exported parameter field reads.
+    pub fn clear_snippets(&mut self) {
+        for read in self.export_param_reads.values_mut().flatten() {
+            read.snippet.clear();
+        }
+    }
+
+    /// Indicates whether this file can consume an imported value.
+    pub fn has_imports(&self) -> bool {
+        !self.imports.is_empty()
+    }
+}
+
+impl FileAxiosImports {
+    /// Fingerprints the effective imported instances in deterministic symbol order.
+    pub fn fingerprint(&self) -> String {
+        extraction_fingerprint(&self.0)
+    }
+}
+
+impl PropagatedSummaries {
+    /// Fingerprints exactly the import resolutions and propagated facts consulted by this file.
+    pub fn consumer_fingerprint(
+        &self,
+        file: &str,
+        summary: &ModuleSummary,
+        axios_hash: &str,
+        resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+    ) -> String {
+        let targets: BTreeMap<_, _> = summary
+            .imports
+            .values()
+            .map(|import| match import {
+                ImportBinding::Named { specifier, .. } | ImportBinding::Namespace { specifier } => {
+                    specifier
+                }
+            })
+            .map(|specifier| (specifier, resolve_import(file, specifier)))
+            .collect();
+        let affected_files: BTreeSet<_> = targets
+            .values()
+            .filter_map(Option::as_deref)
+            .chain(std::iter::once(file))
+            .collect();
+        extraction_fingerprint(&(
+            axios_hash,
+            &targets,
+            dependency_slice(&self.resolved_exports, &affected_files),
+            dependency_slice(&self.resolved_internal, &BTreeSet::from([file])),
+            dependency_slice(&self.resolved_param_reads, &affected_files),
+        ))
+    }
+
+    /// Runs the source-dependent consumer pass for an individual cache miss.
+    pub fn consumer_reads(
+        &self,
+        file: &str,
+        source: &str,
+        ctx: ExtractContext<'_>,
+        summary: &ModuleSummary,
+        resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+    ) -> Vec<CrossFileFieldRead> {
+        let mut reads = Vec::new();
+        collect_consumer_reads(file, source, ctx, summary, self, resolve_import, &mut reads);
+        reads
+    }
+
+    /// Merges independent consumer passes in the same order as full analysis.
+    pub fn finish(self, reads: Vec<CrossFileFieldRead>) -> CrossFileAnalysis {
+        CrossFileAnalysis {
+            field_reads: dedup_and_sort_reads(reads),
+            limited_files: self.limited_files,
+        }
+    }
+}
+
+// Visits only the contiguous map range belonging to each dependency.
+fn dependency_slice<'a, T>(
+    entries: &'a BTreeMap<(String, String), Vec<T>>,
+    files: &BTreeSet<&str>,
+) -> Vec<(&'a (String, String), &'a Vec<T>)> {
+    files
+        .iter()
+        .flat_map(|&file| {
+            entries
+                .range((file.to_owned(), String::new())..)
+                .take_while(move |((owner, _), _)| owner == file)
+        })
+        .collect()
+}
+
+// Hashes structured fields whose JSON representation preserves map and vector order.
+fn extraction_fingerprint(value: &impl Serialize) -> String {
+    laine_core::cache::fingerprint_json(value)
+        .expect("structured extraction facts serialize to JSON")
 }
 
 #[derive(Debug, Clone)]
@@ -397,49 +498,83 @@ pub fn collect_imported_axios_clients(
     ctx: ExtractContext<'_>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
 ) -> BTreeMap<String, FileAxiosImports> {
-    let mut modules = BTreeMap::new();
-    let mut instances = BTreeMap::new();
-    for (file, source) in files {
-        let file = file.as_ref();
+    let modules = files
+        .iter()
+        .map(|(file, source)| {
+            let file = file.as_ref();
+            (
+                file.to_owned(),
+                AxiosModuleFacts::extract(file, source.as_ref(), ctx),
+            )
+        })
+        .collect();
+    resolve_axios_imports(&modules, resolve_import)
+}
+
+/// Per-file imported symbols and locally declared Axios clients.
+#[derive(Serialize, Deserialize)]
+pub struct AxiosModuleFacts {
+    symbols: ModuleSymbols,
+    instances: BTreeMap<String, Option<String>>,
+}
+
+impl AxiosModuleFacts {
+    /// Extracts Axios bindings independently of the rest of the repository.
+    pub fn extract(file: &str, source: &str, ctx: ExtractContext<'_>) -> Self {
         let mut symbols = ModuleSymbols::default();
-        for block in extract_parse_blocks(file, source.as_ref()) {
+        let mut instances = BTreeMap::new();
+        for block in extract_parse_blocks(file, source) {
             let allocator = Allocator::default();
             let Some(program) = parse_program(&allocator, &block.code, block.source_type) else {
                 continue;
             };
             symbols.collect(&program, false);
-            collect_axios_instances(file, &program, ctx, &mut instances);
+            collect_axios_instances(&program, ctx, &mut instances);
         }
-        modules.insert(file, symbols);
+        Self { symbols, instances }
     }
+}
 
+/// Resolves Axios imports across the current module graph from extracted facts.
+pub fn resolve_axios_imports(
+    modules: &BTreeMap<String, AxiosModuleFacts>,
+    resolve_import: &dyn Fn(&str, &str) -> Option<String>,
+) -> BTreeMap<String, FileAxiosImports> {
     modules
         .iter()
-        .filter_map(|(&file, symbols)| {
-            let imports: BTreeMap<_, _> = symbols
+        .filter_map(|(file, facts)| {
+            let imports: BTreeMap<_, _> = facts
+                .symbols
                 .imports
                 .values()
                 .filter_map(|import| {
-                    let origin = module_resolver::resolve_imported_symbol(
+                    let (module, name) = module_resolver::resolve_imported_symbol(
                         file,
                         import,
-                        &|path| modules.get(path),
+                        &|path| modules.get(path).map(|facts| &facts.symbols),
                         resolve_import,
                     )?;
-                    Some((import.clone(), instances.get(&origin)?.clone()))
+                    Some((
+                        import.clone(),
+                        modules.get(&module)?.instances.get(&name)?.clone(),
+                    ))
                 })
                 .collect();
-            (!imports.is_empty()).then(|| (file.to_owned(), FileAxiosImports(imports)))
+            (!imports.is_empty()).then(|| {
+                (
+                    file.clone(),
+                    FileAxiosImports(imports.into_iter().collect()),
+                )
+            })
         })
         .collect()
 }
 
 /// Records top-level Axios constructors and evaluates their base URL in the declaring module.
 fn collect_axios_instances(
-    file: &str,
     program: &Program<'_>,
     ctx: ExtractContext<'_>,
-    instances: &mut BTreeMap<(String, String), Option<String>>,
+    instances: &mut BTreeMap<String, Option<String>>,
 ) {
     let mut env = BTreeMap::new();
     for stmt in &program.body {
@@ -456,10 +591,7 @@ fn collect_axios_instances(
                     decl.declaration.as_expression().map(unwrap_expr)
                     && is_axios_create(call)
                 {
-                    instances.insert(
-                        (file.into(), "default".into()),
-                        detect_axios_create_base_url(call, ctx, &env),
-                    );
+                    instances.insert("default".into(), cacheable_axios_base(call, ctx, &env));
                 }
                 continue;
             }
@@ -471,8 +603,8 @@ fn collect_axios_instances(
             };
             match unwrap_expr(init) {
                 Expression::CallExpression(call) if is_axios_create(call) => {
-                    let base_url = detect_axios_create_base_url(call, ctx, &env);
-                    instances.insert((file.into(), id.name.to_string()), base_url);
+                    let base_url = cacheable_axios_base(call, ctx, &env);
+                    instances.insert(id.name.to_string(), base_url);
                 }
                 expr => {
                     if let Some(value) = eval_static_url_expr(expr, ctx, &env) {
@@ -484,8 +616,18 @@ fn collect_axios_instances(
     }
 }
 
+// Keeps the matching origin and path while distinguishing invalid static URLs from dynamic ones.
+fn cacheable_axios_base(
+    call: &CallExpression<'_>,
+    ctx: ExtractContext<'_>,
+    env: &BTreeMap<String, ModuleEnvVal>,
+) -> Option<String> {
+    detect_axios_create_base_url(call, ctx, env)
+        .map(|base| matching_http_url(&base).unwrap_or_default())
+}
+
 /// Builds a summary with imported instances available to local functions and hooks.
-fn extract_module_summary(
+pub fn extract_module_summary(
     file_path: &str,
     source: &str,
     ctx: ExtractContext<'_>,
@@ -2998,7 +3140,8 @@ impl<'a> Visit<'a> for ParamReadScanner<'_> {
 // ---------------------------------------------------------------------------
 
 // Propaga hasta seis saltos y reserva una pasada de verificación para detectar trabajo pendiente.
-fn propagate_summaries(
+/// Resolves cross-file summaries to a bounded fixed point without parsing any source.
+pub fn propagate_summaries(
     summaries: &BTreeMap<String, ModuleSummary>,
     resolve_import: &dyn Fn(&str, &str) -> Option<String>,
 ) -> PropagatedSummaries {
